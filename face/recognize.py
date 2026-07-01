@@ -50,6 +50,8 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=5, help="sliding window size")
     ap.add_argument("--no-liveness", action="store_true",
                     help="skip the liveness challenge (NOT for login; testing only)")
+    ap.add_argument("--debug", action="store_true",
+                    help="print per-frame detector readings (face/eyes/yaw) to stderr")
     args = ap.parse_args()
 
     try:
@@ -80,6 +82,7 @@ def main() -> int:
 
     saw_face = False
     start = time.time()
+    last_dbg = 0.0
     try:
         while time.time() - start < args.timeout:
             ok, frame = cap.read()
@@ -89,6 +92,13 @@ def main() -> int:
 
             obs = engine.measure(frame)
             saw_face = saw_face or obs.face_found
+
+            if args.debug and t - last_dbg >= 0.25:
+                last_dbg = t
+                step = live.current.value if live.current else "-"
+                yaw = f"{obs.yaw:+.2f}" if obs.yaw is not None else "  ?  "
+                print(f"  t={t:5.1f} face={int(obs.face_found)} "
+                      f"eyes={obs.eyes_open} yaw={yaw} step={step}", file=sys.stderr)
 
             # Phase 1: prove liveness.
             if not liveness_done:

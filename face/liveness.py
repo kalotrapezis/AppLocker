@@ -60,9 +60,11 @@ class FrameObservation:
 
 @dataclass
 class Config:
-    per_step_timeout: float = 5.0  # seconds allowed to complete each step
+    per_step_timeout: float = 8.0  # seconds allowed to complete each step
     yaw_threshold: float = 0.30  # |yaw| past this counts as a deliberate turn
-    max_face_gap: float = 1.0  # seconds the face may vanish before we fail
+    # Seconds the face may vanish before we fail. Generous, because Haar loses
+    # the face mid-turn on a plain webcam — a real removal still exceeds this.
+    max_face_gap: float = 2.5
 
 
 def random_challenge(rng: Optional[random.Random] = None) -> List[Action]:

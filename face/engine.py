@@ -149,18 +149,21 @@ class HaarPixelEngine(FaceEngine):
         return max(rects, key=lambda r: r[2] * r[3]) if len(rects) else None
 
     def _detect_frontal(self, gray):
-        faces = self._face.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
-                                             minSize=(80, 80))
+        # Lenient params: smaller minSize and fewer neighbours catch faces that
+        # are tilted (camera above / user looking down) or partially turned.
+        faces = self._face.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4,
+                                             minSize=(60, 60))
         return self._largest(faces)
 
     def _detect_profile_yaw(self, gray):
         """Coarse yaw from the profile cascade: it fires on left-facing profiles;
-        flip the image to catch right-facing ones. Returns -1.0 / +1.0 / None."""
-        left = self._profile.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
+        flip the image to catch right-facing ones. Returns -1.0 / +1.0 / None.
+        Profile detection is flaky, so params are lenient."""
+        left = self._profile.detectMultiScale(gray, 1.1, 3, minSize=(60, 60))
         if len(left):
             return -1.0
         flipped = self.cv2.flip(gray, 1)
-        right = self._profile.detectMultiScale(flipped, 1.1, 5, minSize=(80, 80))
+        right = self._profile.detectMultiScale(flipped, 1.1, 3, minSize=(60, 60))
         if len(right):
             return 1.0
         return None
