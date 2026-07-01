@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Download the YuNet + SFace ONNX models for the strong recognition backend.
+"""Download the SFace ONNX model for the strong recognition backend.
 
 Run once, on a machine with network:
 
     python3 face/fetch_models.py
 
-Saves both models into $APPLOCKER_MODELS (default ~/.config/applocker/models/).
+Saves the model into $APPLOCKER_MODELS (default ~/.config/applocker/models/).
 Once present, `engine.build_engine()` auto-selects the SFace backend; until then
 it falls back to the Haar-pixel v0. This only affects *unlock* recognition — the
 presence/attention tier is lenient and identity-blind regardless.
+
+Detection is Haar, not YuNet, so we only need SFace: the current OpenCV-Zoo YuNet
+model needs OpenCV ≥ 4.7 and fails to load on Ubuntu's 4.6.
 
 Note: OpenCV Zoo stores models with git-LFS, so we fetch from the `media.`
 GitHub host (the `raw.` host returns a tiny LFS *pointer*, not the model). We
@@ -21,11 +24,10 @@ import os
 import sys
 import urllib.request
 
-from engine import SFACE_MODEL, YUNET_MODEL, model_dir
+from engine import SFACE_MODEL, model_dir
 
 BASE = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models"
 SOURCES = {
-    YUNET_MODEL: f"{BASE}/face_detection_yunet/{YUNET_MODEL}",
     SFACE_MODEL: f"{BASE}/face_recognition_sface/{SFACE_MODEL}",
 }
 MIN_BYTES = 50_000  # both models are >>50 KB; smaller means we got an LFS pointer

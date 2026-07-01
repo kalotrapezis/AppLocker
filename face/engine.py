@@ -51,8 +51,8 @@ class FaceEngine(abc.ABC):
 
 import os
 
-#: ONNX model filenames (OpenCV Zoo) for the strong YuNet+SFace backend.
-YUNET_MODEL = "face_detection_yunet_2023mar.onnx"
+#: SFace ONNX model (OpenCV Zoo) for the strong embedding backend. Detection is
+#: Haar, not YuNet — the current YuNet model needs OpenCV ≥ 4.7 (see SFaceEngine).
 SFACE_MODEL = "face_recognition_sface_2021dec.onnx"
 
 
@@ -83,16 +83,10 @@ def build_engine() -> FaceEngine:
         )
 
     md = model_dir()
-    yn = os.path.join(md, YUNET_MODEL)
     sf = os.path.join(md, SFACE_MODEL)
-    if (
-        hasattr(cv2, "FaceDetectorYN")
-        and hasattr(cv2, "FaceRecognizerSF")
-        and os.path.exists(yn)
-        and os.path.exists(sf)
-    ):
+    if hasattr(cv2, "FaceRecognizerSF") and os.path.exists(sf):
         try:
-            return SFaceEngine(yn, sf)
+            return SFaceEngine(sf)
         except Exception as e:  # bad model file, API mismatch — fall back loudly
             import sys
             sys.stderr.write(f"SFace unavailable ({e}); falling back to Haar-pixel v0.\n")
@@ -194,6 +188,11 @@ class HaarPixelEngine(FaceEngine):
 
         return FrameObservation(face_found=False)
 
+    def face_box(self, frame):
+        """The largest frontal-face bounding box (x, y, w, h), or None. Shared
+        with SFaceEngine so both backends detect the same way."""
+        return self._detect_frontal(self._gray(frame))
+
     def embed(self, frame) -> Optional[List[float]]:
         gray = self._gray(frame)
         face = self._detect_frontal(gray)
@@ -210,42 +209,41 @@ class HaarPixelEngine(FaceEngine):
 class SFaceEngine(FaceEngine):
     """Strong recognition backend — the recommended unlock model.
 
-    - Detection + alignment: **YuNet** (`cv2.FaceDetectorYN`) — robust to pose,
-      so it aligns the face well before embedding.
-    - Embedding: **SFace** (`cv2.FaceRecognizerSF`) — a 128-d face descriptor.
-      SFace's canonical cosine match threshold is ~0.363.
+    - Detection: **Haar** (via an internal `HaarPixelEngine`). We *don't* use
+      YuNet: the current OpenCV-Zoo YuNet (2023mar) needs OpenCV ≥ 4.7, but
+      Ubuntu ships 4.6, where it fails to load. Haar detection works everywhere.
+    - Embedding: **SFace** (`cv2.FaceRecognizerSF`) — a 128-d face descriptor,
+      fed a 112×112 face crop. SFace's canonical cosine threshold is ~0.363.
+      (Without YuNet's 5-point alignment the crop is unaligned, so accuracy is a
+      touch lower than a fully-aligned pipeline — but enrollment and matching use
+      the same crop, and it's far stronger than the pixel-template v0.)
 
-    Presence/liveness (`measure`) is delegated to a Haar engine — the attention
-    tier stays cheap and identity-blind on purpose (see attention.py). Only the
-    *unlock* embedding is strong.
+    Presence/liveness (`measure`) is delegated to Haar too — the attention tier
+    stays cheap and identity-blind on purpose (see attention.py).
     """
 
-    name = "yunet-sface"
+    name = "sface"
     dim = 128
     default_threshold = 0.363  # SFace's recommended cosine threshold
 
-    def __init__(self, yunet_path: str, sface_path: str):
+    def __init__(self, sface_path: str):
         import cv2
 
         self.cv2 = cv2
-        self._haar = HaarPixelEngine()  # lenient presence + liveness signals
-        self._detector = cv2.FaceDetectorYN.create(
-            yunet_path, "", (320, 320), 0.7, 0.3, 5000
-        )
+        self._haar = HaarPixelEngine()  # detection + lenient presence/liveness
         self._recognizer = cv2.FaceRecognizerSF.create(sface_path, "")
 
     def measure(self, frame) -> FrameObservation:
-        # Presence/liveness use the cheap, identity-blind Haar path.
         return self._haar.measure(frame)
 
     def embed(self, frame) -> Optional[List[float]]:
-        h, w = frame.shape[:2]
-        self._detector.setInputSize((w, h))
-        _, faces = self._detector.detect(frame)
-        if faces is None or len(faces) == 0:
+        box = self._haar.face_box(frame)
+        if box is None:
             return None
-        # Largest detected face (cols 2,3 are width,height of the bbox).
-        face = max(faces, key=lambda f: float(f[2]) * float(f[3]))
-        aligned = self._recognizer.alignCrop(frame, face)
-        feat = self._recognizer.feature(aligned)  # shape (1, 128)
-        return [float(x) for x in feat.flatten()]
+        x, y, w, h = box
+        crop = frame[y:y + h, x:x + w]  # colour crop (SFace wants BGR)
+        if crop.size == 0:
+            return None
+        crop = self.cv2.resize(crop, (112, 112))
+        feat = self._recognizer.feature(crop)  # shape (1, 128)
+        return [float(v) for v in feat.flatten()]

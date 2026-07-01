@@ -63,13 +63,12 @@ def main() -> int:
     # contrib LBPH, the other possible recognizer.
     line("cv2.face (contrib LBPH)", hasattr(cv2, "face"))
 
-    # Look for the ONNX model files the YuNet/SFace path needs (not bundled).
-    from engine import SFACE_MODEL, YUNET_MODEL, model_dir
+    # Look for the SFace model (Haar handles detection, so no YuNet needed).
+    from engine import SFACE_MODEL, model_dir
 
     mdir = model_dir()
-    for m in (YUNET_MODEL, SFACE_MODEL):
-        line(f"model {m}", os.path.exists(os.path.join(mdir, m)),
-             f"run fetch_models.py to enable the SFace backend (into {mdir}/)")
+    line(f"model {SFACE_MODEL}", os.path.exists(os.path.join(mdir, SFACE_MODEL)),
+         f"run fetch_models.py to enable the SFace backend (into {mdir}/)")
 
     # Camera.
     idx = int(os.environ.get("APPLOCKER_CAMERA", "0"))
