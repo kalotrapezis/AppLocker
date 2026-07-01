@@ -70,31 +70,42 @@ stderr is human progress text (safe to log). The Rust side
 (`daemon/src/face.rs`) treats only `match` as success; everything else falls
 through to the PIN/sudo prompt, so a broken camera never locks you out.
 
-## Recognition backend, honestly
+## Two tiers, two strengths (important)
 
-- **Liveness** is fully supported today with Haar cascades (`opencv-data`), no
-  downloads. It's coarse — eyes-open via the eye cascade, yaw via the profile
-  cascade — but enough to drive blink + turn.
-- **Recognition** is the weak spot without dlib/MediaPipe. The shipped engine
-  (`HaarPixelEngine`, `haar-pixel-v0`) uses a **pixel-template** embedding
-  (aligned, equalised, flattened grayscale crop). It runs with zero downloads
-  and is fine as a first cut behind liveness + PIN/sudo, but it is
-  lighting/pose-sensitive and **not** a strong recognizer.
+Recognition and presence are **deliberately different strengths**:
 
-### Upgrading recognition (recommended when network is available)
+- **Recognition (unlock) — strong.** "Is this *me*?" Runs only when you unlock.
+- **Presence (attention) — lenient, identity-blind.** "Is *a* face there?" Runs
+  continuously while unlocked (`attention.py`). It never checks *who* — so it
+  doesn't react to a passer-by, and a glance down at the screen doesn't lock you
+  (any detected frame resets the absence clock). Using the strong identity model
+  here would fight you constantly; that's the whole point of the split.
 
-OpenCV 4.6 exposes `cv2.FaceDetectorYN` (YuNet) and `cv2.FaceRecognizerSF`
-(SFace) — a proper 128-d face embedder. It needs two ONNX model files that
-aren't bundled:
+## Recognition backends
 
-- `face_detection_yunet_2023mar.onnx`
-- `face_recognition_sface_2021dec.onnx`
+Two, auto-selected by `build_engine()`:
 
-Place them in `~/.config/applocker/models/` (probe_env.py checks for them) and we
-add an `SFaceEngine` to `engine.py`. **Nothing else changes** — the enrollment
-format, matcher, liveness, and daemon protocol are all backend-agnostic; only the
-engine and the stored `backend` tag differ. Re-enroll after switching backends
-(embeddings aren't comparable across engines).
+1. **`yunet-sface` (strong, recommended)** — YuNet detection + SFace 128-d
+   embeddings, built into apt OpenCV 4.6 (`cv2.FaceDetectorYN` /
+   `cv2.FaceRecognizerSF`). Needs two ONNX models; fetch them once:
+
+   ```bash
+   python3 face/fetch_models.py      # into ~/.config/applocker/models/
+   ```
+
+   Selected automatically when the models are present.
+
+2. **`haar-pixel-v0` (fallback)** — a pixel-template embedding (flattened
+   grayscale crop). Zero downloads, but lighting/pose-sensitive. Used until the
+   SFace models are in place.
+
+Switching backends only changes the engine and the enrollment's `backend` tag —
+liveness, the matcher, and the daemon protocol are all backend-agnostic.
+**Re-enroll after switching** (`enroll.py`); embeddings aren't comparable across
+backends, and `recognize.py` warns on a mismatch.
+
+**Liveness** is Haar-based (`opencv-data`) in both backends — eyes-open via the
+eye cascade, yaw via the profile cascade — enough to drive blink + turn.
 
 ## Security note
 

@@ -64,10 +64,12 @@ def main() -> int:
     line("cv2.face (contrib LBPH)", hasattr(cv2, "face"))
 
     # Look for the ONNX model files the YuNet/SFace path needs (not bundled).
-    model_dir = os.path.expanduser("~/.config/applocker/models")
-    for m in ("face_detection_yunet_2023mar.onnx", "face_recognition_sface_2021dec.onnx"):
-        line(f"model {m}", os.path.exists(os.path.join(model_dir, m)),
-             f"place in {model_dir}/ to enable the SFace backend")
+    from engine import SFACE_MODEL, YUNET_MODEL, model_dir
+
+    mdir = model_dir()
+    for m in (YUNET_MODEL, SFACE_MODEL):
+        line(f"model {m}", os.path.exists(os.path.join(mdir, m)),
+             f"run fetch_models.py to enable the SFace backend (into {mdir}/)")
 
     # Camera.
     idx = int(os.environ.get("APPLOCKER_CAMERA", "0"))

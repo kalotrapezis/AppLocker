@@ -49,9 +49,30 @@ class FaceEngine(abc.ABC):
         """Return an embedding for the primary face, or None if no usable face."""
 
 
+import os
+
+#: ONNX model filenames (OpenCV Zoo) for the strong YuNet+SFace backend.
+YUNET_MODEL = "face_detection_yunet_2023mar.onnx"
+SFACE_MODEL = "face_recognition_sface_2021dec.onnx"
+
+
+def model_dir() -> str:
+    """Where the YuNet/SFace ONNX models live ($APPLOCKER_MODELS or the default)."""
+    return os.path.expanduser(
+        os.environ.get("APPLOCKER_MODELS", "~/.config/applocker/models")
+    )
+
+
 def build_engine() -> FaceEngine:
-    """Construct the best engine the environment supports. Raises RuntimeError
-    with actionable text if OpenCV/cascades are missing."""
+    """Construct the best engine the environment supports:
+
+      1. **SFace** (strong 128-d embeddings) if OpenCV has the YuNet+SFace APIs
+         AND both ONNX models are present — this is the recommended unlock model.
+      2. **Haar-pixel v0** otherwise (works with zero downloads, but weak).
+
+    Recognition strength only affects *unlocking*; the presence/attention tier is
+    intentionally lenient and identity-blind regardless (see attention.py).
+    """
     try:
         import cv2  # noqa: F401
     except ImportError as e:
@@ -60,6 +81,21 @@ def build_engine() -> FaceEngine:
             "  sudo apt install python3-opencv python3-numpy opencv-data\n"
             f"(import error: {e})"
         )
+
+    md = model_dir()
+    yn = os.path.join(md, YUNET_MODEL)
+    sf = os.path.join(md, SFACE_MODEL)
+    if (
+        hasattr(cv2, "FaceDetectorYN")
+        and hasattr(cv2, "FaceRecognizerSF")
+        and os.path.exists(yn)
+        and os.path.exists(sf)
+    ):
+        try:
+            return SFaceEngine(yn, sf)
+        except Exception as e:  # bad model file, API mismatch — fall back loudly
+            import sys
+            sys.stderr.write(f"SFace unavailable ({e}); falling back to Haar-pixel v0.\n")
     return HaarPixelEngine()
 
 
@@ -169,3 +205,47 @@ class HaarPixelEngine(FaceEngine):
         crop = self.cv2.equalizeHist(crop)
         # Flatten to a plain Python float list; matcher.l2_normalize handles scale.
         return [float(px) for px in crop.flatten()]
+
+
+class SFaceEngine(FaceEngine):
+    """Strong recognition backend — the recommended unlock model.
+
+    - Detection + alignment: **YuNet** (`cv2.FaceDetectorYN`) — robust to pose,
+      so it aligns the face well before embedding.
+    - Embedding: **SFace** (`cv2.FaceRecognizerSF`) — a 128-d face descriptor.
+      SFace's canonical cosine match threshold is ~0.363.
+
+    Presence/liveness (`measure`) is delegated to a Haar engine — the attention
+    tier stays cheap and identity-blind on purpose (see attention.py). Only the
+    *unlock* embedding is strong.
+    """
+
+    name = "yunet-sface"
+    dim = 128
+    default_threshold = 0.363  # SFace's recommended cosine threshold
+
+    def __init__(self, yunet_path: str, sface_path: str):
+        import cv2
+
+        self.cv2 = cv2
+        self._haar = HaarPixelEngine()  # lenient presence + liveness signals
+        self._detector = cv2.FaceDetectorYN.create(
+            yunet_path, "", (320, 320), 0.7, 0.3, 5000
+        )
+        self._recognizer = cv2.FaceRecognizerSF.create(sface_path, "")
+
+    def measure(self, frame) -> FrameObservation:
+        # Presence/liveness use the cheap, identity-blind Haar path.
+        return self._haar.measure(frame)
+
+    def embed(self, frame) -> Optional[List[float]]:
+        h, w = frame.shape[:2]
+        self._detector.setInputSize((w, h))
+        _, faces = self._detector.detect(frame)
+        if faces is None or len(faces) == 0:
+            return None
+        # Largest detected face (cols 2,3 are width,height of the bbox).
+        face = max(faces, key=lambda f: float(f[2]) * float(f[3]))
+        aligned = self._recognizer.alignCrop(frame, face)
+        feat = self._recognizer.feature(aligned)  # shape (1, 128)
+        return [float(x) for x in feat.flatten()]
