@@ -51,6 +51,15 @@ impl FaceVerifier for SubprocessFace {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()); // progress/challenge text goes to our log
 
+        // App/file unlock is **recognition only** — fast and frictionless, no
+        // gesture. Liveness is reserved for the login/sudo/screen-unlock tier
+        // (the future PAM path sets APPLOCKER_FACE_LIVENESS=1). See the tier note
+        // in ../../face/README.md: a photo opening an app is low-stakes for a
+        // casual fence, and PIN/sudo remain as fallback.
+        if std::env::var("APPLOCKER_FACE_LIVENESS").ok().as_deref() != Some("1") {
+            cmd.arg("--no-liveness");
+        }
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
