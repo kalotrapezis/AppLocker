@@ -420,7 +420,10 @@ class AppPicker(Gtk.Dialog):
 
 
 def main():
-    if not authorize():
+    # --no-auth skips the open-time authentication gate. DEV ONLY — for iterating
+    # on the layout without re-authing each launch. Production always gates.
+    dev_no_auth = "--no-auth" in sys.argv
+    if not dev_no_auth and not authorize():
         sys.stderr.write("AppLocker: authentication required to open settings.\n")
         return 1
     win = SettingsWindow()
