@@ -1,0 +1,11 @@
+# Rust
+daemon/target/
+
+# Python (later steps)
+__pycache__/
+*.pyc
+.venv/
+
+# Enrolled face data — never commit
+*.face
+faces/
