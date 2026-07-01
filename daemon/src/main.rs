@@ -292,18 +292,23 @@ fn cmd_list_apps() {
     }
 }
 
-/// Find an installed app by desktop id or name (case-insensitive) and add it to
-/// the locked list.
+/// Find an installed app by desktop id, name, or key (the value `list-installed`
+/// prints) — case-insensitive — and add it to the locked list.
 fn cmd_lock_app(query: Option<String>) {
     let Some(query) = query else {
-        eprintln!("usage: applockerd lock-app <app name or desktop id>");
+        eprintln!("usage: applockerd lock-app <app name, key, or desktop id>");
         process::exit(2);
     };
     let q = query.to_lowercase();
     let installed = desktop::installed();
     let hits: Vec<_> = installed
         .iter()
-        .filter(|a| a.id.to_lowercase() == q || a.name.to_lowercase().contains(&q))
+        .filter(|a| {
+            a.id.to_lowercase() == q
+                || a.key.to_lowercase() == q
+                || desktop::base(&a.key).to_lowercase() == q
+                || a.name.to_lowercase().contains(&q)
+        })
         .collect();
 
     let app = match hits.len() {
