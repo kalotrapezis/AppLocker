@@ -722,6 +722,16 @@ fn handle_event(
         return false;
     };
 
+    // Never gate our own helpers. The auth stack (recognize.py, the prompt, the
+    // feedback window) runs as our children and opens scripts/enrollment files —
+    // if those live under a locked folder, gating them deadlocks the unlock
+    // itself. A descendant of the daemon is always allowed through.
+    if pid_is_our_descendant(pid) {
+        respond(fan_fd, event_fd, FAN_ALLOW, write_lock);
+        println!("allow  pid={pid:<7} {app_name} ({path}, own helper)");
+        return false;
+    }
+
     // Re-read the policy per locked exec so changes apply live.
     let cache_policy = if policy::load_default().reauth_every_time {
         CachePolicy::EveryTime
@@ -781,6 +791,37 @@ fn handle_event(
             true
         }
     }
+}
+
+/// Is `pid` this daemon or one of its descendants? Walks the PPid chain in
+/// /proc (a handful of small reads; only runs for events that hit a lock). A
+/// vanished process reads as "not ours" — fail closed to the normal auth path.
+fn pid_is_our_descendant(pid: libc::c_int) -> bool {
+    let me = std::process::id() as libc::c_int;
+    let mut cur = pid;
+    for _ in 0..64 {
+        if cur == me {
+            return true;
+        }
+        if cur <= 1 {
+            return false;
+        }
+        // /proc/<pid>/stat: "pid (comm) state ppid ..." — comm may contain
+        // spaces/parens, so parse after the LAST ')'.
+        let stat = match fs::read_to_string(format!("/proc/{cur}/stat")) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let after = match stat.rfind(')') {
+            Some(i) => &stat[i + 1..],
+            None => return false,
+        };
+        cur = match after.split_whitespace().nth(1).and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => return false,
+        };
+    }
+    false
 }
 
 fn respond(fan_fd: RawFd, event_fd: libc::c_int, response: u32, write_lock: &Arc<Mutex<()>>) {
