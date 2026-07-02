@@ -115,6 +115,11 @@ class LivenessVerifier:
         self._turn_armed = False
 
     @property
+    def completed(self) -> int:
+        """How many challenge steps have been completed so far."""
+        return len(self.steps) if self.status is Status.PASSED else self._i
+
+    @property
     def current(self) -> Optional[Action]:
         if self.status is Status.PENDING and self._i < len(self.steps):
             return self.steps[self._i]

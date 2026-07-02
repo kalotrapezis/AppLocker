@@ -51,11 +51,10 @@ class HeadlessNotify:
     """Progress on stderr — the daemon/PAM log surface."""
 
     def __call__(self, kind: str, **kw):
-        if kind == "step":
-            print(f"Step {kw['n']}/{kw['total']}: {kw['text']} "
-                  "(start facing the camera)", file=sys.stderr)
+        if kind == "challenge":
+            print(f"Liveness: {kw['text']}", file=sys.stderr)
         elif kind == "step_done":
-            print("  ✓", file=sys.stderr)
+            print(f"  ✓ {kw['n']}/{kw['total']}", file=sys.stderr)
         elif kind == "status":
             print(kw["text"], file=sys.stderr)
         # 'frame' and 'result' need no headless output
@@ -94,7 +93,8 @@ def routine(args, notify) -> tuple:
     challenge = turn_challenge(random.Random())
     live = LivenessVerifier(challenge)
     liveness_done = args.no_liveness
-    announced_step = None  # each step is announced as it becomes current
+    announced = False
+    steps_done = 0
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -122,15 +122,20 @@ def routine(args, notify) -> tuple:
                 print(f"  t={t:5.1f} face={int(obs.face_found)} "
                       f"eyes={obs.eyes_open} yaw={yaw} step={step}", file=sys.stderr)
 
-            # Phase 1: prove liveness — one instruction at a time, ✓ per step.
+            # Phase 1: prove liveness. One human instruction ("side to side")
+            # covers the whole randomized challenge — users wiggle rather than
+            # read (real-hardware feedback), and wiggling is valid proof: a
+            # photo can't do it, and each step still arms from centre.
             if not liveness_done:
-                if live.current is not announced_step and live.current is not None:
-                    notify("step", text=live.current.human(),
-                           n=challenge.index(live.current) + 1, total=len(challenge))
-                    announced_step = live.current
+                if not announced:
+                    notify("challenge",
+                           text="slowly turn your head side to side",
+                           total=len(challenge))
+                    announced = True
                 st = live.update(obs, t)
-                if live.current is not announced_step and announced_step is not None:
-                    notify("step_done")
+                if st is not Status.FAILED and live.completed > steps_done:
+                    steps_done = live.completed
+                    notify("step_done", n=steps_done, total=len(challenge))
                 if st is Status.PASSED:
                     liveness_done = True
                     notify("status", text="liveness: passed")
@@ -228,11 +233,14 @@ def run_with_ui(args) -> int:
             rgb = cv2.cvtColor(cv2.flip(kw["frame"], 1), cv2.COLOR_BGR2RGB)
             win._frame = rgb
             GLib.idle_add(win.video.queue_draw)
-        elif kind == "step":
+        elif kind == "challenge":
             GLib.idle_add(win.instruction.set_text,
-                          f"{kw['n']}/{kw['total']}  {kw['text']}")
+                          "↔  Slowly turn your head side to side")
         elif kind == "step_done":
-            GLib.idle_add(win.instruction.set_text, "✓  Hold still…")
+            ticks = "✓" * kw["n"] + "·" * (kw["total"] - kw["n"])
+            text = (f"{ticks}  Hold still…" if kw["n"] == kw["total"]
+                    else f"{ticks}  keep going…")
+            GLib.idle_add(win.instruction.set_text, text)
         elif kind == "result":
             ok = kw["word"] == "match"
             GLib.idle_add(win.instruction.set_text,
