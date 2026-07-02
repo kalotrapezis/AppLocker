@@ -52,6 +52,11 @@ impl FaceVerifier for SubprocessFace {
             .arg(&self.faces_dir)
             .arg("--enrollment") // legacy single-file profile, if present
             .arg(&self.legacy)
+            // Short per-run budget: the daemon retries the whole run (3×, 1s
+            // apart — see build()), so each run can give up quickly instead of
+            // camping on the camera for 15s.
+            .arg("--timeout")
+            .arg("5")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()); // progress/challenge text goes to our log
 
@@ -96,7 +101,9 @@ pub fn build() -> (Box<dyn FaceVerifier>, u32, bool) {
         _ => crate::policy::load_default().face_enabled,
     };
     if enabled && has_enrollment() {
-        (Box::new(SubprocessFace::new()), 1, true)
+        // 3 subprocess runs, 1s apart (user: one miss shouldn't end it) — each
+        // run is a 5s camera window, so worst case ≈ 17s before PIN/sudo.
+        (Box::new(SubprocessFace::new()), 3, true)
     } else {
         if enabled {
             eprintln!(
@@ -129,6 +136,7 @@ fn has_enrollment() -> bool {
 pub fn config_for(attempts: u32) -> Config {
     Config {
         face_attempts: attempts,
+        face_gap: std::time::Duration::from_secs(1),
         ..Config::default()
     }
 }
