@@ -265,9 +265,7 @@ class SettingsWindow(Gtk.Window):
         self._refresh_faces()
 
     def _on_add_face(self, _btn):
-        name = self._ask_text("Name this face", "e.g. me, with glasses, new haircut")
-        if not name:
-            return
+        # The enrollment window asks for the name itself (one dialog, one owner).
         here = os.path.dirname(os.path.abspath(__file__))
         enroll = os.path.join(here, "enroll_window.py")
 
@@ -275,7 +273,7 @@ class SettingsWindow(Gtk.Window):
             proc.wait()
             GLib.idle_add(self._refresh_faces)
 
-        proc = subprocess.Popen([sys.executable, enroll, "--name", name])
+        proc = subprocess.Popen([sys.executable, enroll])
         threading.Thread(target=wait_and_refresh, args=(proc,), daemon=True).start()
 
     def _ask_text(self, title: str, placeholder: str):
