@@ -210,6 +210,27 @@ class EnrollWindow(Gtk.Window):
         GLib.idle_add(self._finish, f"Saved — “{self.label}” can now unlock.", True)
 
 
+def ask_name():
+    """Small dialog for the profile name when --name wasn't given."""
+    dlg = Gtk.Dialog(title="Name this face")
+    dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
+    dlg.set_default_response(Gtk.ResponseType.OK)
+    dlg.set_position(Gtk.WindowPosition.CENTER)
+    entry = Gtk.Entry()
+    entry.set_placeholder_text("e.g. me, with glasses, new haircut")
+    entry.set_activates_default(True)
+    entry.set_margin_top(8)
+    entry.set_margin_bottom(8)
+    entry.set_margin_start(10)
+    entry.set_margin_end(10)
+    dlg.get_content_area().add(entry)
+    dlg.show_all()
+    resp = dlg.run()
+    text = entry.get_text().strip()
+    dlg.destroy()
+    return text if resp == Gtk.ResponseType.OK else ""
+
+
 def matcher_escape(text):
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
@@ -217,20 +238,25 @@ def matcher_escape(text):
 def main():
     global ARGS
     ap = argparse.ArgumentParser(description="AppLocker guided face enrollment")
-    ap.add_argument("--name", required=True, help="profile display name")
+    ap.add_argument("--name", default=None,
+                    help="profile display name (asked in a dialog if omitted)")
     ap.add_argument("--faces-dir", default=None)
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--threshold", type=float, default=None)
     ARGS = ap.parse_args()
 
+    name = ARGS.name or ask_name()
+    if not name:
+        return 1
+
     faces_dir = ARGS.faces_dir or matcher.default_faces_dir()
-    out = os.path.join(faces_dir, matcher.slugify(ARGS.name) + ".face")
+    out = os.path.join(faces_dir, matcher.slugify(name) + ".face")
     existing = matcher.list_profiles(faces_dir=faces_dir, legacy="")
     if len(existing) >= matcher.MAX_FACES and not os.path.exists(out):
         print(f"error: already {matcher.MAX_FACES} faces enrolled", file=sys.stderr)
         return 1
 
-    win = EnrollWindow(ARGS.name, out)
+    win = EnrollWindow(name, out)
     win.show_all()
     Gtk.main()
     return 0 if win.saved else 1
