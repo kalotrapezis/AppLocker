@@ -133,6 +133,9 @@ impl Prompter for GuiPrompter {
         // Secret comes back on stdout; keep stderr for our own logging.
         cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
+        // When we're the root service, show the prompt in the user's session.
+        crate::session::attach(&mut cmd);
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {

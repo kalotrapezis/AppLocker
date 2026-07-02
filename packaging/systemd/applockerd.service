@@ -9,12 +9,11 @@ ExecStart=/usr/lib/applocker/applockerd gate
 Restart=on-failure
 RestartSec=2
 
-# NOTE: the gate spawns a GTK auth prompt, which needs a user session's DISPLAY.
-# As a bare system service it has none yet (known gap — see the top-level README),
-# so this unit is installed *disabled*. For now run the gate inside your session
-# (`sudo applockerd`). To use the service, point it at your session first:
-#   Environment=DISPLAY=:0
-#   Environment=XAUTHORITY=/home/YOU/.Xauthority
+# The gate runs as root (fanotify needs it) and drops its GTK prompt + camera
+# recognizer into the active user's graphical session automatically (see
+# daemon/src/session.rs), so it works as a boot service. Enable it with
+# `applocker on` (or `systemctl enable --now applockerd.service`). If it starts
+# before anyone logs in, enforcement simply begins once a session exists.
 
 [Install]
 WantedBy=multi-user.target

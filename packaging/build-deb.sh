@@ -44,6 +44,7 @@ install -m 0644 "$REPO/pam/target/release/libpam_applocker.so" \
 # CLI entry point on PATH (so `pkexec applockerd …` and the GUI work).
 ln -s ../lib/applocker/applockerd "$STAGE/usr/bin/applockerd"
 install -m 0755 "$REPO/packaging/bin/applocker-pam" "$STAGE/usr/bin/applocker-pam"
+install -m 0755 "$REPO/packaging/bin/applocker" "$STAGE/usr/bin/applocker"
 
 # System integration (service ships disabled; autostart is per-user & self-gating).
 install -m 0644 "$REPO/packaging/systemd/applockerd.service" "$STAGE/lib/systemd/system/"
@@ -87,13 +88,11 @@ AppLocker installed. Next steps (nothing is enforced until you opt in):
        python3 /usr/lib/applocker/enroll.py --name me
   2. Lock some apps/folders:
        sudo applockerd lock-app "Calculator"
-  3. Run the gate in your session (needs your DISPLAY):
-       sudo applockerd
-     (The applockerd.service unit is installed but DISABLED — it has no DISPLAY
-      as a boot service yet; see /usr/share/doc/applocker/README.md.)
-  4. Optional face login (reversible, back up first):
-       sudo applocker-pam enable sudo         # test, then screensaver, then lightdm
-     Keep a root shell on a TTY before touching lightdm.
+  3. Turn everything on (gate service + sudo + lockscreen):
+       sudo applocker on
+     Check anytime with `applocker status`; undo with `sudo applocker off`.
+     Add the login greeter last (keep a root TTY open):
+       sudo applocker-pam enable lightdm
 
 MSG
 exit 0

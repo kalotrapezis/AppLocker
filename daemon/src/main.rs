@@ -98,6 +98,7 @@ fn main() {
         Some("set-pin") => cmd_set_pin(),
         Some("config") => cmd_config_show(),
         Some("set-face") => cmd_set_face(std::env::args().nth(2)),
+        Some("session-probe") => cmd_session_probe(),
         Some("set-attention") => cmd_set_attention(std::env::args().nth(2)),
         Some("set-attention-interval") => cmd_set_attention_interval(std::env::args().nth(2)),
         Some("set-attention-ac-only") => cmd_set_attention_ac_only(std::env::args().nth(2)),
@@ -155,6 +156,29 @@ fn cmd_set_face(arg: Option<String>) {
     println!("face {} — {}", if on { "enabled" } else { "disabled" }, pol.summary());
     if on && !pin::is_set(&auth::default_pin_path()) {
         eprintln!("note: face still needs enrollment (face/enroll.py) to actually run.");
+    }
+}
+
+/// Debug: show which graphical session the root daemon would drop prompts into.
+/// Run as root (`sudo applockerd session-probe`) to see the real result.
+fn cmd_session_probe() {
+    let euid = unsafe { libc::geteuid() };
+    println!("euid: {euid} ({})", if euid == 0 { "root" } else { "not root — run with sudo" });
+    match applockerd::session::SessionCtx::discover() {
+        Some(c) => {
+            println!("active session found:");
+            println!("  user:            {} (uid {}, gid {})", c.user, c.uid, c.gid);
+            println!("  home:            {}", c.home.display());
+            println!("  DISPLAY:         {}", c.display);
+            println!("  XAUTHORITY:      {}", c.xauthority.as_deref().unwrap_or("(none found)"));
+            println!("  XDG_RUNTIME_DIR: {}", c.xdg_runtime_dir);
+            println!("\nGUI prompts + the camera recognizer will run as this user.");
+        }
+        None => println!(
+            "no active graphical session found — prompts would inherit the daemon's \
+             environment (fine for `sudo applockerd` in your session; a boot service \
+             would have no DISPLAY until someone logs in)."
+        ),
     }
 }
 

@@ -15,3 +15,4 @@ pub mod locklist;
 pub mod pam;
 pub mod pin;
 pub mod policy;
+pub mod session;

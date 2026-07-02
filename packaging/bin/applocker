@@ -1,0 +1,59 @@
+#!/bin/sh
+# applocker — one command to turn AppLocker on or off.
+#
+#   sudo applocker on       # enforce locked apps + folders, face/PIN/sudo on
+#                           # the lockscreen and for `sudo`
+#   sudo applocker off      # stop everything and remove the PAM hooks
+#   applocker status        # what's currently active
+#
+# "on" enables the gate service (apps + files) and the sudo + screensaver PAM
+# tiers. The login greeter (LightDM) is left out on purpose — enable it
+# separately once you've confirmed the rest, keeping a root TTY open:
+#   sudo applocker-pam enable lightdm
+set -eu
+
+need_root() {
+	[ "$(id -u)" -eq 0 ] || { echo "applocker: run as root (use sudo)" >&2; exit 1; }
+}
+
+case "${1:-}" in
+on)
+	need_root
+	echo "==> gate service (locked apps + folders)"
+	systemctl enable --now applockerd.service
+	echo "==> face/PIN/sudo for the terminal and the lockscreen"
+	applocker-pam enable sudo
+	applocker-pam enable screensaver
+	# Turn on the walk-away lock too; it starts at the next login (autostart) or
+	# immediately from the AppLocker settings window.
+	applockerd set-attention on >/dev/null || true
+	cat <<'MSG'
+
+AppLocker is ON: locked apps/folders are enforced, and the lockscreen + sudo
+accept your face (falling back to the password). Test `sudo true` in a NEW
+terminal.
+
+Optional — the login greeter too (do this last, keep a root TTY open):
+    sudo applocker-pam enable lightdm
+
+Undo everything:  sudo applocker off
+MSG
+	;;
+off)
+	need_root
+	systemctl disable --now applockerd.service 2>/dev/null || true
+	applocker-pam disable all
+	applockerd set-attention off >/dev/null || true
+	echo "AppLocker is OFF (gate stopped, PAM hooks removed, watcher disabled)."
+	;;
+status)
+	printf 'gate service: '
+	systemctl is-active applockerd.service 2>/dev/null || echo inactive
+	echo "policy: $(applockerd config 2>/dev/null | sed -n '2p' | sed 's/^ *//')"
+	applocker-pam status
+	;;
+*)
+	echo "usage: applocker on|off|status" >&2
+	exit 2
+	;;
+esac
