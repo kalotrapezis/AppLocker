@@ -24,14 +24,16 @@ use crate::auth::{Config, FaceVerifier, NoFace};
 /// so the routine falls through to the PIN/sudo prompt rather than failing open.
 pub struct SubprocessFace {
     script: PathBuf,
-    enrollment: PathBuf,
+    faces_dir: PathBuf,
+    legacy: PathBuf,
 }
 
 impl SubprocessFace {
     pub fn new() -> SubprocessFace {
         SubprocessFace {
             script: locate_recognize_script(),
-            enrollment: enrollment_path(),
+            faces_dir: faces_dir(),
+            legacy: legacy_enrollment_path(),
         }
     }
 }
@@ -46,8 +48,10 @@ impl FaceVerifier for SubprocessFace {
     fn try_match(&mut self) -> bool {
         let mut cmd = Command::new("python3");
         cmd.arg(&self.script)
-            .arg("--enrollment")
-            .arg(&self.enrollment)
+            .arg("--faces-dir")
+            .arg(&self.faces_dir)
+            .arg("--enrollment") // legacy single-file profile, if present
+            .arg(&self.legacy)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()); // progress/challenge text goes to our log
 
@@ -89,17 +93,34 @@ pub fn build() -> (Box<dyn FaceVerifier>, u32) {
         Some("0") => false,
         _ => crate::policy::load_default().face_enabled,
     };
-    if enabled && enrollment_path().is_file() {
+    if enabled && has_enrollment() {
         (Box::new(SubprocessFace::new()), 1)
     } else {
         if enabled {
             eprintln!(
-                "applockerd: face enabled but no enrollment at {} — using PIN/sudo only",
-                enrollment_path().display()
+                "applockerd: face enabled but no enrolled faces in {} — using PIN/sudo only",
+                faces_dir().display()
             );
         }
         (Box::new(NoFace), 1)
     }
+}
+
+/// True if the user has at least one enrolled face (a `*.face` in the faces dir,
+/// or the legacy single-file profile).
+fn has_enrollment() -> bool {
+    if legacy_enrollment_path().is_file() {
+        return true;
+    }
+    std::fs::read_dir(faces_dir())
+        .map(|mut d| {
+            d.any(|e| {
+                e.ok()
+                    .map(|e| e.path().extension().and_then(|x| x.to_str()) == Some("face"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// A [`Config`] with the face-attempt count set for the chosen verifier.
@@ -110,10 +131,20 @@ pub fn config_for(attempts: u32) -> Config {
     }
 }
 
-/// `$APPLOCKER_FACE_ENROLLMENT`, else the invoking user's
-/// `~/.config/applocker/owner.face`. The daemon runs as root, so we resolve the
-/// *invoking* user's home (via `SUDO_USER`) rather than root's.
-fn enrollment_path() -> PathBuf {
+/// The invoking user's named-profiles directory (`$APPLOCKER_FACES_DIR`, else
+/// `~/.config/applocker/faces`). The daemon runs as root, so we resolve the
+/// *invoking* user's home (via `SUDO_USER`), not root's.
+fn faces_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("APPLOCKER_FACES_DIR") {
+        return PathBuf::from(p);
+    }
+    let home = invoking_user_home().unwrap_or_else(|| PathBuf::from("/root"));
+    home.join(".config/applocker/faces")
+}
+
+/// The legacy single-file profile (`$APPLOCKER_FACE_ENROLLMENT`, else
+/// `~/.config/applocker/owner.face`).
+fn legacy_enrollment_path() -> PathBuf {
     if let Some(p) = std::env::var_os("APPLOCKER_FACE_ENROLLMENT") {
         return PathBuf::from(p);
     }

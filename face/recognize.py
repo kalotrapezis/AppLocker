@@ -32,7 +32,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from engine import build_engine  # noqa: E402
 from liveness import LivenessVerifier, Status, random_challenge  # noqa: E402
-from matcher import Enrollment, Matcher, MatchAccumulator  # noqa: E402
+from matcher import (  # noqa: E402
+    MatchAccumulator, Matcher, default_faces_dir, list_profiles, pooled,
+)
 
 
 def emit(result: str, code: int) -> int:
@@ -43,7 +45,10 @@ def emit(result: str, code: int) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="AppLocker face recognition + liveness")
-    ap.add_argument("--enrollment", default=os.path.expanduser("~/.config/applocker/owner.face"))
+    ap.add_argument("--faces-dir", default=None,
+                    help="directory of named face profiles (matches against any)")
+    ap.add_argument("--enrollment", default=None,
+                    help="also include this single profile file (legacy)")
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--timeout", type=float, default=15.0, help="overall budget (s)")
     ap.add_argument("--k", type=int, default=3, help="matching frames required")
@@ -54,20 +59,29 @@ def main() -> int:
                     help="print per-frame detector readings (face/eyes/yaw) to stderr")
     args = ap.parse_args()
 
-    try:
-        enrollment = Enrollment.load(args.enrollment)
-    except (OSError, ValueError) as e:
-        print(f"error: cannot load enrollment {args.enrollment}: {e}", file=sys.stderr)
-        return emit("noface", 3)
-
     import cv2
 
     engine = build_engine()
-    if engine.name != enrollment.backend:
-        print(f"warning: enrollment backend {enrollment.backend!r} != engine "
-              f"{engine.name!r}; embeddings may not compare well", file=sys.stderr)
 
-    matcher = Matcher(enrollment)
+    # Load every enrolled profile (faces dir + optional legacy file) and pool the
+    # ones matching this engine's backend, so we match against ANY enrolled face.
+    faces_dir = args.faces_dir or default_faces_dir()
+    legacy = args.enrollment if args.enrollment is not None else ""
+    profiles = list_profiles(faces_dir=faces_dir, legacy=legacy)
+    if not profiles:
+        print(f"error: no enrolled faces in {faces_dir}", file=sys.stderr)
+        return emit("noface", 3)
+    try:
+        combined = pooled([e for _, e in profiles], backend=engine.name)
+    except ValueError:
+        names = ", ".join(e.backend for _, e in profiles)
+        print(f"error: no profiles match engine {engine.name!r} (have: {names}); "
+              "re-enrol after switching backends", file=sys.stderr)
+        return emit("noface", 3)
+    print(f"matching against {len(profiles)} profile(s): "
+          + ", ".join(e.display_name() for _, e in profiles), file=sys.stderr)
+
+    mtch = Matcher(combined)
     acc = MatchAccumulator(k=args.k, n=args.n)
     challenge = random_challenge(random.Random())
     live = LivenessVerifier(challenge)
@@ -116,7 +130,7 @@ def main() -> int:
             emb = engine.embed(frame)
             if emb is None:
                 continue
-            matched = matcher.matches(emb)
+            matched = mtch.matches(emb)
             if acc.feed(matched):
                 return emit("match", 0)
             if acc.rejected:
