@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Presence watcher — dim when you leave, lock when you're gone (roadmap step 5).
+"""Presence watcher — lock when you walk away, without a camera light staring at
+you all day (roadmap step 5, **idle-triggered snapshot** model).
 
-Runs in *your* session (not the daemon): watches the camera for **any** face
-(identity-blind, lenient — see attention.py's look-down debounce), and:
+Runs in *your* session (not the daemon). The camera stays OFF while you use the
+PC. Only once the session goes idle (no keyboard/mouse for `--idle-after`s) does
+it periodically wake the camera for a SINGLE frame, check for *any* face
+(identity-blind — see attention.py), then release the camera:
 
-    gone ~3s  → dims the screen (translucent overlay, reversible)
-    gone ~10s → `loginctl lock-session`
+    active (typing/mouse)   → camera off
+    idle, face seen         → you're reading/watching; re-check every --interval
+    idle, no face (once)    → dim the screen (warn) + a quick confirming snapshot
+    idle, no face (--misses in a row) → `loginctl lock-session`
 
 Locking goes through logind, so the daemon's lock listener wipes the app-unlock
 cache — manual lock, lid-close, and this watcher all behave identically.
@@ -13,14 +18,17 @@ cache — manual lock, lid-close, and this watcher all behave identically.
     python3 face/watch_presence.py            # honours `attention` in the config
     python3 face/watch_presence.py --force    # run even if the config says off
 
-Being blind never locks you out of your desk by mistake:
+Being blind never locks you out by mistake:
   - camera unavailable (a video call has it) → treated as PRESENT, retry later
   - after LOCK, it waits for the session to unlock (LockedHint) and resumes
+  - if idle time can't be detected, it degrades to plain periodic snapshots
+    (still one frame at a time, camera never held open)
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import subprocess
 import sys
@@ -29,7 +37,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from attention import AttentionWatcher, Config, Phase  # noqa: E402
+from attention import Config, Phase, SnapshotPresence  # noqa: E402
 
 import gi  # noqa: E402
 
@@ -65,6 +73,122 @@ def session_locked() -> bool:
         return False
 
 
+# ── idle detection ───────────────────────────────────────────────────────────
+
+class _XSSInfo(ctypes.Structure):
+    _fields_ = [
+        ("window", ctypes.c_ulong),
+        ("state", ctypes.c_int),
+        ("kind", ctypes.c_int),
+        ("til_or_since", ctypes.c_ulong),
+        ("idle", ctypes.c_ulong),  # milliseconds since last input
+        ("event_mask", ctypes.c_ulong),
+    ]
+
+
+class IdleMonitor:
+    """Seconds since the last keyboard/mouse input, via the X11 ScreenSaver
+    extension (ctypes → libXss, no external process). Falls back to the
+    `xprintidle` binary, then reports "unknown" (None) if neither works."""
+
+    def __init__(self):
+        self._backend = None
+        self._xss = self._x11 = self._dpy = self._root = self._info = None
+        if self._init_xss():
+            self._backend = "xss"
+        elif self._have_xprintidle():
+            self._backend = "xprintidle"
+
+    def _init_xss(self) -> bool:
+        try:
+            self._x11 = ctypes.CDLL("libX11.so.6")
+            self._xss = ctypes.CDLL("libXss.so.1")
+            self._x11.XOpenDisplay.restype = ctypes.c_void_p
+            self._x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            self._x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            self._x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            self._xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(_XSSInfo)
+            self._xss.XScreenSaverQueryInfo.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(_XSSInfo)]
+            self._dpy = self._x11.XOpenDisplay(None)
+            if not self._dpy:
+                return False
+            self._root = self._x11.XDefaultRootWindow(self._dpy)
+            self._info = self._xss.XScreenSaverAllocInfo()
+            return bool(self._info)
+        except (OSError, AttributeError):
+            return False
+
+    @staticmethod
+    def _have_xprintidle() -> bool:
+        try:
+            subprocess.run(["xprintidle"], capture_output=True, timeout=5)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    @property
+    def available(self) -> bool:
+        return self._backend is not None
+
+    def seconds(self):
+        """Idle seconds, or None if it can't be determined right now."""
+        if self._backend == "xss":
+            try:
+                if self._xss.XScreenSaverQueryInfo(
+                        self._dpy, self._root, self._info) == 0:
+                    return None
+                return self._info.contents.idle / 1000.0
+            except OSError:
+                return None
+        if self._backend == "xprintidle":
+            try:
+                out = subprocess.run(["xprintidle"], capture_output=True,
+                                     text=True, timeout=5).stdout.strip()
+                return int(out) / 1000.0
+            except (OSError, subprocess.SubprocessError, ValueError):
+                return None
+        return None
+
+
+# ── one-shot snapshot ────────────────────────────────────────────────────────
+
+# Below this mean luma (0-255) a frame is essentially black — a covered lens or
+# an unlit room. The YuNet detector false-positives on pure black, so we refuse
+# to judge presence from such frames (treat as blind → never lock, retry later).
+DARK_FLOOR = 8.0
+
+
+def snapshot_face_found(engine, cam_index, warmup=3, samples=4):
+    """Open the camera, grab a few frames (discarding the first `warmup` while
+    the sensor auto-exposes), report whether ANY face was seen, then release.
+    Returns True/False, or None when we're *blind* (camera busy, no readable
+    frame, or too dark to tell) — the caller must treat None as "present" and
+    never lock on it."""
+    import cv2
+
+    cap = cv2.VideoCapture(cam_index)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    try:
+        usable = False  # saw at least one readable, bright-enough frame
+        for i in range(warmup + samples):
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            if i < warmup:
+                continue
+            if float(frame.mean()) < DARK_FLOOR:
+                continue  # too dark to trust the detector
+            usable = True
+            if engine.measure(frame).face_found:
+                return True
+        return False if usable else None
+    finally:
+        cap.release()
+
+
 class DimOverlay(Gtk.Window):
     """A fullscreen translucent black window — the "are you still there?" warn.
     Click-through and focus-free, so it never interferes; it just darkens."""
@@ -76,7 +200,6 @@ class DimOverlay(Gtk.Window):
         screen = Gdk.Screen.get_default()
         self.set_default_size(screen.get_width(), screen.get_height())
         self.move(0, 0)
-        # Real transparency when a compositor is running (Cinnamon: always).
         visual = screen.get_rgba_visual()
         if visual:
             self.set_visual(visual)
@@ -102,9 +225,16 @@ class DimOverlay(Gtk.Window):
 def main() -> int:
     ap = argparse.ArgumentParser(description="AppLocker presence watcher")
     ap.add_argument("--camera", type=int, default=0)
-    ap.add_argument("--dim-after", type=float, default=3.0)
-    ap.add_argument("--lock-after", type=float, default=10.0)
-    ap.add_argument("--fps", type=float, default=2.0, help="camera poll rate")
+    ap.add_argument("--idle-after", type=float, default=60.0,
+                    help="seconds of no keyboard/mouse before checks start")
+    ap.add_argument("--interval", type=float, default=120.0,
+                    help="seconds between snapshots while present-but-idle")
+    ap.add_argument("--confirm-after", type=float, default=20.0,
+                    help="seconds to the confirming snapshot after an empty one")
+    ap.add_argument("--misses", type=int, default=2,
+                    help="consecutive empty snapshots before locking")
+    ap.add_argument("--poll", type=float, default=3.0,
+                    help="how often to sample idle time (cheap, no camera)")
     ap.add_argument("--force", action="store_true",
                     help="run even if the config has attention off")
     args = ap.parse_args()
@@ -114,13 +244,13 @@ def main() -> int:
               "or run with --force)", file=sys.stderr)
         return 2
 
-    import cv2
-
     from engine import build_engine
 
     engine = build_engine()
-    watcher = AttentionWatcher(Config(dim_after=args.dim_after,
-                                      lock_after=args.lock_after))
+    cfg = Config(idle_after=args.idle_after, interval=args.interval,
+                 confirm_after=args.confirm_after, misses_to_lock=args.misses)
+    presence = SnapshotPresence(cfg)
+    idle = IdleMonitor()
     overlay = DimOverlay()
     state = {"phase": Phase.PRESENT}
 
@@ -136,50 +266,59 @@ def main() -> int:
             print("presence lost — locking session", file=sys.stderr)
             subprocess.run(["loginctl", "lock-session"], timeout=10)
 
-    def camera_loop():
-        cap = None
-        period = 1.0 / max(args.fps, 0.2)
+    def go_present():
+        presence.reset()
+        GLib.idle_add(set_phase, Phase.PRESENT)
+
+    def loop():
+        next_snapshot_at = None  # monotonic deadline; None = not scheduled yet
         while True:
-            # After a lock, idle until the session is unlocked again.
-            if state["phase"] is Phase.LOCKED:
-                if cap is not None:
-                    cap.release()  # free the camera while locked
-                    cap = None
+            # After a lock, sit idle until the session unlocks, then resume.
+            if presence.locked or state["phase"] is Phase.LOCKED:
                 if not session_locked():
-                    watcher.reset()
-                    GLib.idle_add(set_phase, Phase.PRESENT)
-                else:
-                    time.sleep(2.0)
-                    continue
-
-            if cap is None:
-                cap = cv2.VideoCapture(args.camera)
-                if not cap.isOpened():
-                    # Camera busy (video call?) or absent: we're blind — NEVER
-                    # lock blind. Count as present and retry in a bit.
-                    cap.release()
-                    cap = None
-                    watcher.reset()
-                    time.sleep(5.0)
-                    continue
-
-            ok, frame = cap.read()
-            now = time.monotonic()
-            if not ok:
-                cap.release()
-                cap = None
-                watcher.reset()  # blind — same rule as above
-                time.sleep(5.0)
+                    go_present()
+                    next_snapshot_at = None
+                time.sleep(max(args.poll, 2.0))
                 continue
 
-            found = engine.measure(frame).face_found
-            phase = watcher.update(found, now)
-            GLib.idle_add(set_phase, phase)
-            time.sleep(period)
+            idle_s = idle.seconds()
+            now = time.monotonic()
 
-    threading.Thread(target=camera_loop, daemon=True).start()
-    print(f"presence watcher: dim {args.dim_after}s, lock {args.lock_after}s, "
-          f"{args.fps} fps", file=sys.stderr)
+            # Active (or idle unknown but recent activity): camera off, present.
+            # When idle can't be measured at all we skip the gate and just poll
+            # on the interval below (still one frame at a time).
+            if idle.available and idle_s is not None and idle_s < cfg.idle_after:
+                if state["phase"] is not Phase.PRESENT or next_snapshot_at:
+                    go_present()
+                next_snapshot_at = None
+                time.sleep(args.poll)
+                continue
+
+            # Idle → checking mode. First snapshot fires immediately on entry.
+            if next_snapshot_at is None:
+                next_snapshot_at = now
+            if now < next_snapshot_at:
+                # Wake at least every --poll so returning activity is noticed
+                # quickly (cancels a pending dim without waiting for a snapshot).
+                time.sleep(min(args.poll, next_snapshot_at - now))
+                continue
+
+            found = snapshot_face_found(engine, args.camera)
+            now = time.monotonic()
+            if found is None:
+                # Blind (camera busy / no frame): never lock — count as present.
+                go_present()
+                next_snapshot_at = now + cfg.interval
+                continue
+
+            phase = presence.record(found)
+            GLib.idle_add(set_phase, phase)
+            next_snapshot_at = now + presence.next_delay(phase)
+
+    threading.Thread(target=loop, daemon=True).start()
+    how = idle._backend or "none (periodic fallback)"
+    print(f"presence watcher: idle-after {args.idle_after}s, every {args.interval}s, "
+          f"lock after {args.misses} empty (idle backend: {how})", file=sys.stderr)
     Gtk.main()
     return 0
 
