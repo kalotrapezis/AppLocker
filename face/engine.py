@@ -288,11 +288,10 @@ class SFaceEngine(FaceEngine):
     @staticmethod
     def _landmark_yaw(face) -> Optional[float]:
         """Continuous yaw from YuNet's landmarks: how far the nose sits from the
-        eye midpoint, normalised by the inter-eye distance. 0 ≈ frontal; the
-        sign convention matches liveness.py (turn to *your* left → negative:
-        in the un-mirrored camera image your nose moves image-right, so we
-        negate). A solid deliberate turn reads ~±0.4-0.8; the liveness
-        threshold is 0.30."""
+        eye midpoint, normalised by the inter-eye distance. 0 ≈ frontal; sign
+        calibrated on real hardware (2026-07-02 debug trace): turning to *your*
+        left reads negative, matching liveness.py's TURN_LEFT. A deliberate
+        turn reads ~±0.4-1.1; the liveness threshold is 0.30."""
         re_x, re_y = float(face[4]), float(face[5])   # right eye
         le_x, le_y = float(face[6]), float(face[7])   # left eye
         nose_x = float(face[8])
@@ -300,7 +299,7 @@ class SFaceEngine(FaceEngine):
         if eye_dist < 1.0:
             return None
         mid_x = (re_x + le_x) / 2.0
-        return (mid_x - nose_x) / eye_dist
+        return (nose_x - mid_x) / eye_dist
 
     def measure(self, frame) -> FrameObservation:
         # YuNet first: robust detection AND a real yaw signal from landmarks

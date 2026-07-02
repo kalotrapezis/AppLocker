@@ -88,8 +88,7 @@ def main() -> int:
     challenge = turn_challenge(random.Random())
     live = LivenessVerifier(challenge)
     liveness_done = args.no_liveness
-    if not args.no_liveness:
-        print("Liveness: " + " then ".join(a.human() for a in challenge), file=sys.stderr)
+    announced_step = None  # each step is announced as it becomes current
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -116,9 +115,16 @@ def main() -> int:
                 print(f"  t={t:5.1f} face={int(obs.face_found)} "
                       f"eyes={obs.eyes_open} yaw={yaw} step={step}", file=sys.stderr)
 
-            # Phase 1: prove liveness.
+            # Phase 1: prove liveness — one instruction at a time, ✓ per step.
             if not liveness_done:
+                if live.current is not announced_step and live.current is not None:
+                    n = challenge.index(live.current) + 1
+                    print(f"Step {n}/{len(challenge)}: {live.current.human()} "
+                          "(start facing the camera)", file=sys.stderr)
+                    announced_step = live.current
                 st = live.update(obs, t)
+                if live.current is not announced_step and announced_step is not None:
+                    print("  ✓", file=sys.stderr)
                 if st is Status.PASSED:
                     liveness_done = True
                     print("liveness: passed", file=sys.stderr)
