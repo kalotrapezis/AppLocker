@@ -49,6 +49,7 @@ use std::thread;
 use applockerd::auth::{self, Outcome, SystemFallback};
 use applockerd::desktop::{self, AppKind};
 use applockerd::face;
+use applockerd::feedback::{ClosingPrompter, FaceWithFeedback, Feedback};
 use applockerd::folderlist::{self, FolderList, LockedFolder};
 use applockerd::gate::{CachePolicy, Decision, GuiPrompter, UnlockCache};
 use applockerd::locklist::{self, LockList, LockedApp};
@@ -474,9 +475,15 @@ fn signal_daemon_reload() {
 /// prompt + PIN + PAM end to end: `applockerd auth-test [app-name]`.
 fn cmd_auth_test(app: Option<String>) {
     let app = app.unwrap_or_else(|| "auth-test".to_string());
-    let (mut face, attempts) = face::build();
+    let (face, attempts, face_live) = face::build();
     let cfg = face::config_for(attempts);
-    let mut prompter = GuiPrompter::new(&app);
+    let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+        Feedback::spawn(&app)
+    } else {
+        Feedback::none()
+    }));
+    let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
+    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app), fb);
     let fallback = SystemFallback::system();
     let pol = policy::load_default();
 
@@ -486,7 +493,7 @@ fn cmd_auth_test(app: Option<String>) {
         pol.summary(),
     );
 
-    match auth::run(&cfg, face.as_mut(), &mut prompter, &fallback) {
+    match auth::run(&cfg, &mut face, &mut prompter, &fallback) {
         Outcome::Allowed => println!("ALLOWED"),
         Outcome::Denied => {
             println!("DENIED");
@@ -715,6 +722,16 @@ fn handle_event(
         return false;
     };
 
+    // Never gate our own helpers. The auth stack (recognize.py, the prompt, the
+    // feedback window) runs as our children and opens scripts/enrollment files —
+    // if those live under a locked folder, gating them deadlocks the unlock
+    // itself. A descendant of the daemon is always allowed through.
+    if pid_is_our_descendant(pid) {
+        respond(fan_fd, event_fd, FAN_ALLOW, write_lock);
+        println!("allow  pid={pid:<7} {app_name} ({path}, own helper)");
+        return false;
+    }
+
     // Re-read the policy per locked exec so changes apply live.
     let cache_policy = if policy::load_default().reauth_every_time {
         CachePolicy::EveryTime
@@ -744,11 +761,17 @@ fn handle_event(
             println!("auth   pid={pid:<7} {app_name} (prompting)");
 
             thread::spawn(move || {
-                let (mut face, attempts) = face::build();
+                let (face, attempts, face_live) = face::build();
                 let cfg = face::config_for(attempts);
-                let mut prompter = GuiPrompter::new(&app);
+                let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+                    Feedback::spawn(&app)
+                } else {
+                    Feedback::none()
+                }));
+                let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
+                let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app), fb);
                 let fallback = SystemFallback::system();
-                let outcome = auth::run(&cfg, face.as_mut(), &mut prompter, &fallback);
+                let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
 
                 let allowed = matches!(outcome, Outcome::Allowed);
                 cache.finish(&target, allowed, cache_policy);
@@ -768,6 +791,37 @@ fn handle_event(
             true
         }
     }
+}
+
+/// Is `pid` this daemon or one of its descendants? Walks the PPid chain in
+/// /proc (a handful of small reads; only runs for events that hit a lock). A
+/// vanished process reads as "not ours" — fail closed to the normal auth path.
+fn pid_is_our_descendant(pid: libc::c_int) -> bool {
+    let me = std::process::id() as libc::c_int;
+    let mut cur = pid;
+    for _ in 0..64 {
+        if cur == me {
+            return true;
+        }
+        if cur <= 1 {
+            return false;
+        }
+        // /proc/<pid>/stat: "pid (comm) state ppid ..." — comm may contain
+        // spaces/parens, so parse after the LAST ')'.
+        let stat = match fs::read_to_string(format!("/proc/{cur}/stat")) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let after = match stat.rfind(')') {
+            Some(i) => &stat[i + 1..],
+            None => return false,
+        };
+        cur = match after.split_whitespace().nth(1).and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => return false,
+        };
+    }
+    false
 }
 
 fn respond(fan_fd: RawFd, event_fd: libc::c_int, response: u32, write_lock: &Arc<Mutex<()>>) {

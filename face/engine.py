@@ -51,16 +51,33 @@ class FaceEngine(abc.ABC):
 
 import os
 
-#: SFace ONNX model (OpenCV Zoo) for the strong embedding backend. Detection is
-#: Haar, not YuNet — the current YuNet model needs OpenCV ≥ 4.7 (see SFaceEngine).
+#: SFace ONNX model (OpenCV Zoo) for the strong embedding backend.
 SFACE_MODEL = "face_recognition_sface_2021dec.onnx"
+#: YuNet face detector, the **2022mar** version — the 2023mar one needs
+#: OpenCV ≥ 4.7, but 2022mar loads and runs on Ubuntu's 4.6. YuNet handles
+#: tilted / partially occluded faces that Haar misses completely (e.g. head
+#: resting on a hand), and its landmarks enable SFace's proper alignCrop.
+YUNET_MODEL = "face_detection_yunet_2022mar.onnx"
 
 
 def model_dir() -> str:
-    """Where the YuNet/SFace ONNX models live ($APPLOCKER_MODELS or the default)."""
-    return os.path.expanduser(
-        os.environ.get("APPLOCKER_MODELS", "~/.config/applocker/models")
-    )
+    """Where the YuNet/SFace ONNX models live ($APPLOCKER_MODELS or the default).
+
+    When running as root (the daemon), "~" is /root — but the models live in the
+    *invoking* user's home, so prefer $SUDO_USER's home when the default path
+    doesn't exist. Otherwise SFace silently degrades to the weak haar backend.
+    """
+    env = os.environ.get("APPLOCKER_MODELS")
+    if env:
+        return os.path.expanduser(env)
+    default = os.path.expanduser("~/.config/applocker/models")
+    if not os.path.isdir(default):
+        user = os.environ.get("SUDO_USER")
+        if user:
+            sudo_path = f"/home/{user}/.config/applocker/models"
+            if os.path.isdir(sudo_path):
+                return sudo_path
+    return default
 
 
 def build_engine() -> FaceEngine:
@@ -212,17 +229,19 @@ class HaarPixelEngine(FaceEngine):
 class SFaceEngine(FaceEngine):
     """Strong recognition backend — the recommended unlock model.
 
-    - Detection: **Haar** (via an internal `HaarPixelEngine`). We *don't* use
-      YuNet: the current OpenCV-Zoo YuNet (2023mar) needs OpenCV ≥ 4.7, but
-      Ubuntu ships 4.6, where it fails to load. Haar detection works everywhere.
-    - Embedding: **SFace** (`cv2.FaceRecognizerSF`) — a 128-d face descriptor,
-      fed a 112×112 face crop. SFace's canonical cosine threshold is ~0.363.
-      (Without YuNet's 5-point alignment the crop is unaligned, so accuracy is a
-      touch lower than a fully-aligned pipeline — but enrollment and matching use
-      the same crop, and it's far stronger than the pixel-template v0.)
+    - Detection: **YuNet 2022mar** when its model file is present (loads on
+      OpenCV 4.6, robust to tilt/occlusion, provides landmarks for alignment),
+      else **Haar** (via an internal `HaarPixelEngine`), which works with zero
+      downloads but only on upright frontal faces.
+    - Embedding: **SFace** (`cv2.FaceRecognizerSF`) — a 128-d face descriptor.
+      With YuNet the crop is properly 5-point aligned (`alignCrop`); with Haar
+      it's a plain resized crop. SFace's canonical cosine threshold is ~0.363.
 
-    Presence/liveness (`measure`) is delegated to Haar too — the attention tier
-    stays cheap and identity-blind on purpose (see attention.py).
+    ⚠️ The two detection paths produce *different* embeddings for the same face
+    (aligned vs unaligned crop) — after the YuNet model is added, re-enrol.
+
+    Presence/liveness (`measure`) is delegated to Haar signals, with YuNet
+    backing up `face_found` — the attention tier stays identity-blind.
     """
 
     name = "sface"
@@ -233,20 +252,59 @@ class SFaceEngine(FaceEngine):
         import cv2
 
         self.cv2 = cv2
-        self._haar = HaarPixelEngine()  # detection + lenient presence/liveness
+        self._haar = HaarPixelEngine()  # eyes/yaw signals + no-download fallback
         self._recognizer = cv2.FaceRecognizerSF.create(sface_path, "")
+        self._yunet = self._try_yunet()
+
+    def _try_yunet(self):
+        """Load YuNet if its model exists AND actually runs on this OpenCV
+        (verified with a dummy detect — 4.6 rejects newer models at run time)."""
+        import numpy as np
+
+        path = os.path.join(model_dir(), YUNET_MODEL)
+        if not (hasattr(self.cv2, "FaceDetectorYN") and os.path.exists(path)):
+            return None
+        try:
+            det = self.cv2.FaceDetectorYN.create(path, "", (320, 240), 0.7)
+            det.setInputSize((320, 240))
+            det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
+            return det
+        except self.cv2.error as e:
+            import sys
+            sys.stderr.write(f"YuNet unavailable ({e}); detecting with Haar.\n")
+            return None
+
+    def _yunet_face(self, frame):
+        """Best YuNet detection row (box + landmarks) for the frame, or None."""
+        if self._yunet is None:
+            return None
+        h, w = frame.shape[:2]
+        self._yunet.setInputSize((w, h))
+        _, faces = self._yunet.detect(frame)
+        if faces is None or len(faces) == 0:
+            return None
+        return max(faces, key=lambda f: float(f[-1]))
 
     def measure(self, frame) -> FrameObservation:
-        return self._haar.measure(frame)
+        obs = self._haar.measure(frame)
+        # Haar misses tilted/occluded faces; if YuNet sees one, trust it for
+        # presence (eyes/yaw stay unknown — Haar couldn't read them).
+        if not obs.face_found and self._yunet_face(frame) is not None:
+            return FrameObservation(face_found=True, eyes_open=None, yaw=None)
+        return obs
 
     def embed(self, frame) -> Optional[List[float]]:
-        box = self._haar.face_box(frame)
-        if box is None:
-            return None
-        x, y, w, h = box
-        crop = frame[y:y + h, x:x + w]  # colour crop (SFace wants BGR)
-        if crop.size == 0:
-            return None
-        crop = self.cv2.resize(crop, (112, 112))
+        face = self._yunet_face(frame)
+        if face is not None:
+            crop = self._recognizer.alignCrop(frame, face)  # 5-point aligned
+        else:
+            box = self._haar.face_box(frame)
+            if box is None:
+                return None
+            x, y, w, h = box
+            crop = frame[y:y + h, x:x + w]  # colour crop (SFace wants BGR)
+            if crop.size == 0:
+                return None
+            crop = self.cv2.resize(crop, (112, 112))
         feat = self._recognizer.feature(crop)  # shape (1, 128)
         return [float(v) for v in feat.flatten()]

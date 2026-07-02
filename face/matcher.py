@@ -19,14 +19,17 @@ mirroring the daemon-side "up to 3×" retry but at frame granularity.
 
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 ENROLL_VERSION = 1
+MAX_FACES = 5  # how many named face profiles a user may enrol
 
 
 def l2_normalize(v: List[float]) -> List[float]:
@@ -50,22 +53,29 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
 
 @dataclass
 class Enrollment:
-    """The persisted enrolled identity. Written to a `*.face` file (gitignored —
-    enrolled biometrics must never be committed)."""
+    """One enrolled face profile. Written to a `*.face` file (gitignored — enrolled
+    biometrics must never be committed). `label` is the human name shown in the
+    settings list ("me", "with glasses", "new haircut", …); several profiles can
+    belong to the same person, and recognition matches against any of them."""
 
     user: str
     dim: int
     threshold: float
     embeddings: List[List[float]]
     backend: str = "unknown"  # which engine produced these (they aren't portable)
+    label: str = ""  # display name; defaults to `user` if empty
     created: float = field(default_factory=time.time)
     version: int = ENROLL_VERSION
+
+    def display_name(self) -> str:
+        return self.label or self.user
 
     def to_json(self) -> str:
         return json.dumps(
             {
                 "version": self.version,
                 "user": self.user,
+                "label": self.label,
                 "backend": self.backend,
                 "dim": self.dim,
                 "threshold": self.threshold,
@@ -92,6 +102,7 @@ class Enrollment:
             threshold=d["threshold"],
             embeddings=emb,
             backend=d.get("backend", "unknown"),
+            label=d.get("label", ""),
             created=d.get("created", 0.0),
             version=d["version"],
         )
@@ -127,6 +138,73 @@ class Matcher:
 
     def matches(self, probe: List[float]) -> bool:
         return self.best_similarity(probe) >= self.enrollment.threshold
+
+
+# ── multiple named face profiles ─────────────────────────────────────────────
+
+def default_faces_dir() -> str:
+    """Where named face profiles live ($APPLOCKER_FACES_DIR or the default)."""
+    return os.path.expanduser(
+        os.environ.get("APPLOCKER_FACES_DIR", "~/.config/applocker/faces")
+    )
+
+
+def legacy_enrollment_path() -> str:
+    """The single-profile path from before multi-face — still honoured."""
+    return os.path.expanduser(
+        os.environ.get("APPLOCKER_FACE_ENROLLMENT", "~/.config/applocker/owner.face")
+    )
+
+
+def slugify(name: str) -> str:
+    """A safe `*.face` filename stem from a display name."""
+    s = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return s or "face"
+
+
+def list_profiles(faces_dir: Optional[str] = None,
+                  legacy: Optional[str] = None) -> List[Tuple[str, "Enrollment"]]:
+    """All enrolled profiles as (path, Enrollment), from the faces dir plus the
+    legacy single-file location. Unreadable files are skipped, not fatal."""
+    faces_dir = faces_dir if faces_dir is not None else default_faces_dir()
+    legacy = legacy if legacy is not None else legacy_enrollment_path()
+    out: List[Tuple[str, Enrollment]] = []
+    if legacy and os.path.exists(legacy):
+        try:
+            out.append((legacy, Enrollment.load(legacy)))
+        except (OSError, ValueError):
+            pass
+    if os.path.isdir(faces_dir):
+        for p in sorted(glob.glob(os.path.join(faces_dir, "*.face"))):
+            try:
+                out.append((p, Enrollment.load(p)))
+            except (OSError, ValueError):
+                pass
+    return out
+
+
+def pooled(enrollments: List["Enrollment"], backend: Optional[str] = None) -> "Enrollment":
+    """Pool several profiles' embeddings into one Enrollment so a single Matcher
+    matches against *any* enrolled face. Only profiles matching `backend` (and its
+    dim) are pooled — embeddings from different engines aren't comparable."""
+    usable = [e for e in enrollments if e.embeddings]
+    if backend is not None:
+        usable = [e for e in usable if e.backend == backend]
+    if not usable:
+        raise ValueError("no usable enrolled faces for this backend")
+    dim = usable[0].dim
+    emb: List[List[float]] = []
+    for e in usable:
+        if e.dim == dim:
+            emb.extend(e.embeddings)
+    return Enrollment(
+        user="*",
+        label="pooled",
+        dim=dim,
+        threshold=min(e.threshold for e in usable),
+        embeddings=emb,
+        backend=usable[0].backend,
+    )
 
 
 @dataclass
@@ -200,17 +278,35 @@ def _selftest() -> int:
     except ValueError:
         check("bad dim rejected", True)
 
-    # File save/load with 0600.
+    # File save/load with 0600, and the label survives the round-trip.
     import tempfile
     path = os.path.join(tempfile.gettempdir(), f"applocker_selftest_{os.getpid()}.face")
     try:
+        enr.label = "new haircut"
         enr.save(path)
         mode = os.stat(path).st_mode & 0o777
         check("enrollment file is 0600", mode == 0o600)
-        check("enrollment reloads", Matcher(Enrollment.load(path)).matches([1, 0, 0, 0.1]))
+        reloaded = Enrollment.load(path)
+        check("label round-trips", reloaded.display_name() == "new haircut")
+        check("enrollment reloads", Matcher(reloaded).matches([1, 0, 0, 0.1]))
     finally:
         if os.path.exists(path):
             os.remove(path)
+
+    # Multi-profile helpers: slugify + match-against-any via pooling.
+    check("slugify", slugify("New Haircut!") == "new-haircut")
+    check("slugify empty", slugify("  ") == "face")
+    me2 = Enrollment(user="teo", label="glasses", dim=4, threshold=0.9,
+                     embeddings=[l2_normalize([0, 1, 0, 0.1])], backend="test")
+    pool = Matcher(pooled([enr, me2], backend="test"))
+    check("pooled matches profile A", pool.matches([1, 0, 0, 0.1]))
+    check("pooled matches profile B", pool.matches([0, 1, 0, 0.1]))
+    check("pooled rejects stranger", not pool.matches([0, 0, 1, 0]))
+    try:
+        pooled([enr], backend="different-backend")
+        check("pooled needs matching backend", False)
+    except ValueError:
+        check("pooled needs matching backend", True)
 
     # K-of-N accumulator.
     acc = MatchAccumulator(k=3, n=5)

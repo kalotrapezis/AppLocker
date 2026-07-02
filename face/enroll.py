@@ -23,6 +23,7 @@ import time
 # Allow running as `python3 face/enroll.py` from the repo root.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import matcher  # noqa: E402
 from engine import build_engine  # noqa: E402
 from matcher import Enrollment  # noqa: E402
 
@@ -30,12 +31,28 @@ from matcher import Enrollment  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser(description="AppLocker face enrollment")
     ap.add_argument("--user", default=os.environ.get("USER", "owner"))
-    ap.add_argument("--out", default=os.path.expanduser("~/.config/applocker/owner.face"))
+    ap.add_argument("--name", default=None,
+                    help="profile display name (e.g. 'me', 'with glasses')")
+    ap.add_argument("--faces-dir", default=None,
+                    help="directory of named profiles (default ~/.config/applocker/faces)")
+    ap.add_argument("--out", default=None,
+                    help="explicit output path (overrides --name/--faces-dir)")
     ap.add_argument("--samples", type=int, default=8, help="embeddings to capture")
     ap.add_argument("--camera", type=int, default=0, help="/dev/videoN index")
     ap.add_argument("--threshold", type=float, default=None,
                     help="override the backend's default match threshold")
     args = ap.parse_args()
+
+    label = args.name or args.user
+    faces_dir = args.faces_dir or matcher.default_faces_dir()
+    out = args.out or os.path.join(faces_dir, matcher.slugify(label) + ".face")
+
+    # Cap the number of profiles, unless overwriting an existing one.
+    existing = matcher.list_profiles(faces_dir=faces_dir, legacy="")
+    if len(existing) >= matcher.MAX_FACES and not os.path.exists(out):
+        print(f"error: already {matcher.MAX_FACES} faces enrolled; delete one first",
+              file=sys.stderr)
+        return 2
 
     import cv2
 
@@ -76,13 +93,14 @@ def main() -> int:
     threshold = args.threshold if args.threshold is not None else engine.default_threshold
     enr = Enrollment(
         user=args.user,
+        label=label,
         dim=engine.dim,
         threshold=threshold,
         embeddings=embeddings,
         backend=engine.name,
     )
-    enr.save(args.out)
-    print(f"enrolled {len(embeddings)} samples for {args.user!r} -> {args.out} "
+    enr.save(out)
+    print(f"enrolled {len(embeddings)} samples as {label!r} -> {out} "
           f"(threshold={threshold}, backend={engine.name})")
     return 0
 

@@ -131,13 +131,42 @@ pub fn is_safe_to_lock(input: &str) -> Result<String, String> {
     if REFUSED.iter().any(|r| canon_str == *r) {
         return Err(format!("{canon_str} is a system directory and can't be locked"));
     }
-    // Refuse anything that would contain the daemon's own config (self-gate).
-    if Path::new("/etc/applocker").starts_with(&canon) {
-        return Err(format!(
-            "{canon_str} contains AppLocker's own config — locking it would gate the daemon"
-        ));
+    // Refuse anything that would contain AppLocker's own moving parts. Locking
+    // such a folder gates the very tools needed to unlock it (recognize.py, the
+    // prompt, enrolled faces) — a guaranteed self-gating wedge that can freeze
+    // the whole desktop (learned the hard way: user locked ~/Documents, which
+    // contained this repo, and had to power-cycle).
+    for (what, p) in self_paths() {
+        if p.starts_with(&canon) {
+            return Err(format!(
+                "{canon_str} contains {what} ({}) — locking it would gate AppLocker itself",
+                p.display()
+            ));
+        }
     }
     Ok(canon_str)
+}
+
+/// Paths that must never end up inside a locked folder.
+fn self_paths() -> Vec<(&'static str, PathBuf)> {
+    let mut v: Vec<(&'static str, PathBuf)> = vec![
+        ("AppLocker's config", PathBuf::from("/etc/applocker")),
+    ];
+    // The daemon binary — in the repo layout the GUI helper scripts live in the
+    // same tree (<repo>/daemon/target/... vs <repo>/gui), so refusing the exe's
+    // path covers them too; the installed layout is under /usr (already refused).
+    if let Ok(exe) = std::env::current_exe() {
+        v.push(("the AppLocker daemon", exe));
+    }
+    // The invoking user's enrolled faces / models.
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() {
+            v.push(("your enrolled faces", PathBuf::from(format!("/home/{user}/.config/applocker"))));
+        }
+    } else if let Some(home) = std::env::var_os("HOME") {
+        v.push(("your enrolled faces", PathBuf::from(home).join(".config/applocker")));
+    }
+    v
 }
 
 fn base_name(p: &str) -> String {

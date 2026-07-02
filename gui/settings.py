@@ -23,11 +23,18 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
+
+# Face profiles are the user's own data (in ~/.config/applocker/faces), so we
+# read/manage them directly via the face-pipeline's matcher helpers — no daemon,
+# no root. matcher imports only the stdlib (no OpenCV), so this is cheap.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "face"))
+import matcher  # noqa: E402
 
 
 # ── locating the daemon + its config ─────────────────────────────────────────
@@ -209,17 +216,83 @@ class SettingsWindow(Gtk.Window):
         self.face_switch.connect("notify::active", self._on_face_toggled)
         box.pack_start(row, False, False, 0)
 
-        add_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        add_btn = Gtk.Button(label="Add a new face")
-        add_btn.connect("clicked", self._on_add_face)
-        add_row.pack_start(add_btn, False, False, 0)
-        status = "enrolled" if enrolled_face() else "not enrolled yet"
-        add_row.pack_start(Gtk.Label(label=status, xalign=0), True, True, 0)
-        box.pack_start(add_row, False, False, 0)
+        # The list of enrolled face profiles (up to MAX_FACES), each with a name
+        # and an X to delete. These are the user's own files — no root needed.
+        self.faces_list = Gtk.ListBox()
+        self.faces_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        box.pack_start(self.faces_list, False, False, 0)
 
-        hint = Gtk.Label(xalign=0, label="Liveness required — blink or turn your head.")
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.add_face_btn = Gtk.Button(label="Add a new face…")
+        self.add_face_btn.connect("clicked", self._on_add_face)
+        btns.pack_start(self.add_face_btn, False, False, 0)
+        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic",
+                                                Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text("Refresh after enrolling")
+        refresh.connect("clicked", lambda _b: self._refresh_faces())
+        btns.pack_start(refresh, False, False, 0)
+        box.pack_start(btns, False, False, 0)
+
+        hint = Gtk.Label(xalign=0, label="Add a few looks (glasses, new haircut) — "
+                         "any of them will unlock.")
         hint.get_style_context().add_class("dim-label")
         box.pack_start(hint, False, False, 0)
+        self._refresh_faces()
+
+    def _refresh_faces(self):
+        self._clear(self.faces_list)
+        try:
+            profiles = matcher.list_profiles()  # faces dir + legacy owner.face
+        except Exception:
+            profiles = []
+        if not profiles:
+            self.faces_list.add(self._info_row("No faces enrolled yet."))
+        for path, enr in profiles:
+            self.faces_list.add(self._list_row(
+                enr.display_name(), lambda _b, p=path: self._delete_face(p)))
+        # Cap at MAX_FACES.
+        full = len(profiles) >= matcher.MAX_FACES
+        self.add_face_btn.set_sensitive(not full)
+        self.add_face_btn.set_label(
+            f"Add a new face…  ({len(profiles)}/{matcher.MAX_FACES})")
+        self.faces_list.show_all()
+
+    def _delete_face(self, path: str):
+        try:
+            os.remove(path)
+        except OSError as e:
+            self._toast(f"Couldn't delete: {e}")
+        self._refresh_faces()
+
+    def _on_add_face(self, _btn):
+        # The enrollment window asks for the name itself (one dialog, one owner).
+        here = os.path.dirname(os.path.abspath(__file__))
+        enroll = os.path.join(here, "enroll_window.py")
+
+        def wait_and_refresh(proc):
+            proc.wait()
+            GLib.idle_add(self._refresh_faces)
+
+        proc = subprocess.Popen([sys.executable, enroll])
+        threading.Thread(target=wait_and_refresh, args=(proc,), daemon=True).start()
+
+    def _ask_text(self, title: str, placeholder: str):
+        dlg = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text(placeholder)
+        entry.set_activates_default(True)
+        entry.set_margin_top(8)
+        entry.set_margin_bottom(8)
+        entry.set_margin_start(10)
+        entry.set_margin_end(10)
+        dlg.get_content_area().add(entry)
+        dlg.show_all()
+        resp = dlg.run()
+        text = entry.get_text().strip()
+        dlg.destroy()
+        return text if resp == Gtk.ResponseType.OK else ""
 
     def _build_apps_section(self):
         box = self._section("Locked apps")
@@ -338,10 +411,6 @@ class SettingsWindow(Gtk.Window):
     def _on_reauth_changed(self, combo):
         run_privileged(["set-reauth", combo.get_active_id()])
 
-    def _on_add_face(self, _btn):
-        here = os.path.dirname(os.path.abspath(__file__))
-        spawn([sys.executable, os.path.join(here, "..", "face", "enroll.py")])
-
     def _on_add_app(self, _btn):
         AppPicker(self, self._add_app)
 
@@ -420,7 +489,10 @@ class AppPicker(Gtk.Dialog):
 
 
 def main():
-    if not authorize():
+    # --no-auth skips the open-time authentication gate. DEV ONLY — for iterating
+    # on the layout without re-authing each launch. Production always gates.
+    dev_no_auth = "--no-auth" in sys.argv
+    if not dev_no_auth and not authorize():
         sys.stderr.write("AppLocker: authentication required to open settings.\n")
         return 1
     win = SettingsWindow()
