@@ -413,10 +413,6 @@ class SettingsWindow(Gtk.Window):
     def _on_reauth_changed(self, combo):
         run_privileged(["set-reauth", combo.get_active_id()])
 
-    def _on_add_face(self, _btn):
-        here = os.path.dirname(os.path.abspath(__file__))
-        spawn([sys.executable, os.path.join(here, "..", "face", "enroll.py")])
-
     def _on_add_app(self, _btn):
         AppPicker(self, self._add_app)
 
