@@ -108,10 +108,15 @@ class Enrollment:
         )
 
     def save(self, path: str) -> None:
-        # 0600 and owned dir; enrolled faces are sensitive.
+        # 0600 file in a 0700 dir; enrolled faces are sensitive (an unlistable
+        # dir also hides how many profiles exist).
         d = os.path.dirname(path)
         if d:
-            os.makedirs(d, exist_ok=True)
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            try:
+                os.chmod(d, 0o700)  # tighten a dir that pre-existed looser
+            except OSError:
+                pass
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.write(fd, self.to_json().encode("utf-8"))

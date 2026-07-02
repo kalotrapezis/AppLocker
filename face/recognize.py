@@ -31,7 +31,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from engine import build_engine  # noqa: E402
-from liveness import LivenessVerifier, Status, random_challenge  # noqa: E402
+from liveness import LivenessVerifier, Status, turn_challenge  # noqa: E402
 from matcher import (  # noqa: E402
     MatchAccumulator, Matcher, default_faces_dir, list_profiles, pooled,
 )
@@ -83,7 +83,9 @@ def main() -> int:
 
     mtch = Matcher(combined)
     acc = MatchAccumulator(k=args.k, n=args.n)
-    challenge = random_challenge(random.Random())
+    # Turn-only challenge (no blink — undetectable on plain webcams); yaw comes
+    # from YuNet landmarks, see engine.SFaceEngine._landmark_yaw.
+    challenge = turn_challenge(random.Random())
     live = LivenessVerifier(challenge)
     liveness_done = args.no_liveness
     if not args.no_liveness:

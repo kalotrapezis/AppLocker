@@ -76,6 +76,17 @@ def random_challenge(rng: Optional[random.Random] = None) -> List[Action]:
     return steps
 
 
+def turn_challenge(rng: Optional[random.Random] = None) -> List[Action]:
+    """Both head turns, in random order — no blink. The login-tier challenge:
+    blink detection is unreliable on plain webcams (confirmed on real hardware),
+    while yaw from YuNet landmarks is robust. A photo can't turn either way; the
+    random order resists a pre-recorded clip."""
+    rng = rng or random.Random()
+    steps = [Action.TURN_LEFT, Action.TURN_RIGHT]
+    rng.shuffle(steps)
+    return steps
+
+
 class LivenessVerifier:
     """Drives a challenge to completion over a stream of `update()` calls.
 

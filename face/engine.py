@@ -285,13 +285,35 @@ class SFaceEngine(FaceEngine):
             return None
         return max(faces, key=lambda f: float(f[-1]))
 
+    @staticmethod
+    def _landmark_yaw(face) -> Optional[float]:
+        """Continuous yaw from YuNet's landmarks: how far the nose sits from the
+        eye midpoint, normalised by the inter-eye distance. 0 ≈ frontal; the
+        sign convention matches liveness.py (turn to *your* left → negative:
+        in the un-mirrored camera image your nose moves image-right, so we
+        negate). A solid deliberate turn reads ~±0.4-0.8; the liveness
+        threshold is 0.30."""
+        re_x, re_y = float(face[4]), float(face[5])   # right eye
+        le_x, le_y = float(face[6]), float(face[7])   # left eye
+        nose_x = float(face[8])
+        eye_dist = ((le_x - re_x) ** 2 + (le_y - re_y) ** 2) ** 0.5
+        if eye_dist < 1.0:
+            return None
+        mid_x = (re_x + le_x) / 2.0
+        return (mid_x - nose_x) / eye_dist
+
     def measure(self, frame) -> FrameObservation:
-        obs = self._haar.measure(frame)
-        # Haar misses tilted/occluded faces; if YuNet sees one, trust it for
-        # presence (eyes/yaw stay unknown — Haar couldn't read them).
-        if not obs.face_found and self._yunet_face(frame) is not None:
-            return FrameObservation(face_found=True, eyes_open=None, yaw=None)
-        return obs
+        # YuNet first: robust detection AND a real yaw signal from landmarks
+        # (Haar's profile-cascade yaw was too noisy for the turn challenge).
+        face = self._yunet_face(frame)
+        if face is not None:
+            obs = self._haar.measure(frame)  # eyes signal, if Haar also sees it
+            return FrameObservation(
+                face_found=True,
+                eyes_open=obs.eyes_open if obs.face_found else None,
+                yaw=self._landmark_yaw(face),
+            )
+        return self._haar.measure(frame)
 
     def embed(self, frame) -> Optional[List[float]]:
         face = self._yunet_face(frame)

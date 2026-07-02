@@ -139,6 +139,7 @@ pub fn run(
         match prompter.prompt(available) {
             PromptResult::Cancelled => return Outcome::Denied,
             PromptResult::Entered { method, secret } => {
+                let mut secret = secret;
                 let ok = match method {
                     Method::Pin => available.pin && fallback.verify_pin(&secret),
                     Method::Password => {
@@ -149,6 +150,9 @@ pub fn run(
                             })
                     }
                 };
+                // Best-effort: don't leave the secret sitting in freed memory.
+                // (NUL bytes are valid UTF-8, so this is safe.)
+                unsafe { secret.as_bytes_mut().fill(0) };
                 if ok {
                     return Outcome::Allowed;
                 }
