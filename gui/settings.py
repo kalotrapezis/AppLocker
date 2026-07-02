@@ -186,6 +186,41 @@ def spawn(args: list) -> None:
         pass
 
 
+# ── the gate service (start/stop/status) ─────────────────────────────────────
+
+SERVICE = "applockerd.service"
+
+
+def service_present() -> bool:
+    """Is the systemd unit installed (i.e. running from the .deb, not the repo)?"""
+    try:
+        r = subprocess.run(["systemctl", "list-unit-files", SERVICE],
+                           capture_output=True, text=True)
+        return SERVICE in r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def service_active() -> bool:
+    try:
+        out = subprocess.run(["systemctl", "is-active", SERVICE],
+                             capture_output=True, text=True).stdout.strip()
+        return out == "active"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def set_service(active: bool) -> bool:
+    """Start or stop the gate service (root, via pkexec unless dev mode)."""
+    cmd = ["systemctl", "start" if active else "stop", SERVICE]
+    if os.environ.get("APPLOCKER_NO_PKEXEC") != "1":
+        cmd = ["pkexec", *cmd]
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 # ── the window ───────────────────────────────────────────────────────────────
 
 class SettingsWindow(Gtk.Window):
@@ -199,9 +234,13 @@ class SettingsWindow(Gtk.Window):
         header.set_subtitle("unlocked — re-locks on close")
         self.set_titlebar(header)
 
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+        self._build_service_bar(outer)  # pinned at the top
+
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.add(scroller)
+        outer.pack_start(scroller, True, True, 0)
 
         self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
                            border_width=18)
@@ -211,6 +250,49 @@ class SettingsWindow(Gtk.Window):
         self._build_apps_section()
         self._build_folders_section()
         self._build_policy_section()
+
+    # -- service bar ---------------------------------------------------------
+
+    def _build_service_bar(self, container):
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10,
+                      border_width=10)
+        self.service_label = Gtk.Label(xalign=0)
+        self.service_label.set_use_markup(True)
+        bar.pack_start(self.service_label, True, True, 0)
+        self.service_btn = Gtk.Button(label="Start")
+        self.service_btn.connect("clicked", self._on_service_toggle)
+        bar.pack_start(self.service_btn, False, False, 0)
+        container.pack_start(bar, False, False, 0)
+        container.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                             False, False, 0)
+        self._refresh_service()
+        # Keep the label live if the service changes state elsewhere.
+        GLib.timeout_add_seconds(3, self._service_tick)
+
+    def _service_tick(self):
+        self._refresh_service()
+        return True  # repeat
+
+    def _refresh_service(self):
+        if not service_present():
+            self.service_label.set_markup(
+                "<b>AppLocker service</b>  —  not installed (run from a .deb to use it)")
+            self.service_btn.set_label("Start")
+            self.service_btn.set_sensitive(False)
+            return
+        self.service_btn.set_sensitive(True)
+        if service_active():
+            self.service_label.set_markup(
+                "<b>AppLocker service</b>  —  <span foreground='#27ae60'>running</span>")
+            self.service_btn.set_label("Stop")
+        else:
+            self.service_label.set_markup(
+                "<b>AppLocker service</b>  —  <span foreground='#c0392b'>stopped</span>")
+            self.service_btn.set_label("Start")
+
+    def _on_service_toggle(self, _btn):
+        set_service(not service_active())
+        self._refresh_service()
 
     # -- sections ------------------------------------------------------------
 

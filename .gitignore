@@ -13,3 +13,4 @@ pam/target/
 
 # Built packages
 dist/
+packaging/.build-round

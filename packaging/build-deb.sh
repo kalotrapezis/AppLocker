@@ -7,7 +7,22 @@
 # No root needed (uses --root-owner-group). Requires: cargo, dpkg-deb.
 set -euo pipefail
 
-VERSION="0.1.0"
+# Version is a fixed base + a testing-round letter that bumps every build:
+# 0.0.1-a, 0.0.1-b, ...  Pass an explicit letter to rebuild a round:
+#   packaging/build-deb.sh c
+VERSION_BASE="0.0.1"
+ROUND_FILE="$(dirname "$0")/.build-round"
+if [ "${1:-}" != "" ]; then
+	LETTER="$1"
+else
+	n=0
+	[ -f "$ROUND_FILE" ] && n="$(cat "$ROUND_FILE")"
+	n=$((n + 1))
+	echo "$n" > "$ROUND_FILE"
+	# 1->a, 26->z, 27->aa (bijective base-26)
+	LETTER="$(awk -v n="$n" 'BEGIN{s="";while(n>0){n--;r=n%26;s=sprintf("%c",97+r) s;n=int(n/26)}print s}')"
+fi
+VERSION="${VERSION_BASE}-${LETTER}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 TRIPLET="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || cc -print-multiarch 2>/dev/null || echo x86_64-linux-gnu)"
 
