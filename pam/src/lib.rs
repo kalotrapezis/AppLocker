@@ -75,12 +75,17 @@ unsafe fn libc_dlsym(handle: *mut c_void, name: &[u8]) -> *mut c_void {
 struct Options {
     script: PathBuf,
     timeout: Duration,
+    /// `ui` module arg: ask the recognizer to show the guided camera window
+    /// (screensaver tier — a display exists). It falls back to headless on its
+    /// own if there isn't one, so this is always safe to set.
+    ui: bool,
 }
 
 fn parse_options(argc: c_int, argv: *const *const c_char) -> Options {
     let mut opts = Options {
         script: PathBuf::from("/usr/lib/applocker/recognize.py"),
         timeout: Duration::from_secs(20),
+        ui: false,
     };
     if argv.is_null() {
         return opts;
@@ -97,6 +102,8 @@ fn parse_options(argc: c_int, argv: *const *const c_char) -> Options {
             if let Ok(s) = v.parse::<u64>() {
                 opts.timeout = Duration::from_secs(s.clamp(5, 120));
             }
+        } else if arg == "ui" {
+            opts.ui = true;
         }
     }
     opts
@@ -140,6 +147,7 @@ fn authenticate(user: &str, opts: &Options) -> c_int {
         .arg(format!("{}", opts.timeout.as_secs().saturating_sub(2).max(5)))
         .env("APPLOCKER_FACE_LIVENESS", "1") // login tier: liveness REQUIRED
         .env("APPLOCKER_MODELS", &models)
+        .env("APPLOCKER_UI", if opts.ui { "1" } else { "0" })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit()) // challenge text lands in the PAM app's log
@@ -229,6 +237,7 @@ mod tests {
         let opts = Options {
             script: PathBuf::from("/nonexistent"),
             timeout: Duration::from_secs(5),
+            ui: false,
         };
         assert_eq!(authenticate("", &opts), PAM_AUTH_ERR);
         assert_eq!(authenticate("root", &opts), PAM_AUTH_ERR);
