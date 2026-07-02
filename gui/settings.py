@@ -57,7 +57,8 @@ def cfg_path(env: str, default: str) -> str:
 
 def read_config() -> dict:
     """Parse /etc/applocker/config into {face, allow_pin, allow_sudo, reauth}."""
-    out = {"face": False, "pin": True, "sudo": True, "reauth_every": False}
+    out = {"face": False, "pin": True, "sudo": True, "reauth_every": False,
+           "attention": False}
     path = cfg_path("APPLOCKER_CONFIG", "/etc/applocker/config")
     try:
         with open(path) as f:
@@ -77,6 +78,8 @@ def read_config() -> dict:
                         out["sudo"] = "sudo" in toks or "password" in toks
                 elif k == "reauth":
                     out["reauth_every"] = v in ("always", "every", "everytime")
+                elif k == "attention":
+                    out["attention"] = v in ("on", "true", "1", "yes")
     except OSError:
         pass
     return out
@@ -345,6 +348,17 @@ class SettingsWindow(Gtk.Window):
         rrow.pack_start(self.reauth, False, False, 0)
         box.pack_start(rrow, False, False, 0)
 
+        arow, self.attention_switch = self._switch_row(
+            "Lock when I leave (presence watcher)", cfg["attention"])
+        self.attention_switch.connect("notify::active", self._on_attention_toggled)
+        box.pack_start(arow, False, False, 0)
+        anote = Gtk.Label(xalign=0, label="Dims after a few seconds away, locks "
+                          "the session soon after. Any face counts — it never "
+                          "checks who you are.")
+        anote.get_style_context().add_class("dim-label")
+        anote.set_line_wrap(True)
+        box.pack_start(anote, False, False, 0)
+
     # -- refreshers ----------------------------------------------------------
 
     def _clear(self, listbox: Gtk.ListBox):
@@ -396,6 +410,16 @@ class SettingsWindow(Gtk.Window):
 
     def _on_face_toggled(self, switch, _param):
         run_privileged(["set-face", "on" if switch.get_active() else "off"])
+
+    def _on_attention_toggled(self, switch, _param):
+        on = switch.get_active()
+        run_privileged(["set-attention", "on" if on else "off"])
+        if on:
+            # Start the watcher in this session right away; on later logins the
+            # autostart entry (packaging step) will do it.
+            here = os.path.dirname(os.path.abspath(__file__))
+            spawn([sys.executable,
+                   os.path.join(here, "..", "face", "watch_presence.py")])
 
     def _on_fallback_toggled(self, switch, _param, which):
         pin = self.pin_switch.get_active()

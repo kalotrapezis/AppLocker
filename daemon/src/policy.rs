@@ -38,6 +38,9 @@ pub struct Policy {
     /// until the next session lock. The global default; a future per-app list
     /// can override it. Maps to [`gate::CachePolicy`](crate::gate::CachePolicy).
     pub reauth_every_time: bool,
+    /// The presence watcher (dim when away, lock when gone). The watcher script
+    /// (face/watch_presence.py, run in the user session) reads this key.
+    pub attention_enabled: bool,
 }
 
 impl Default for Policy {
@@ -50,6 +53,7 @@ impl Default for Policy {
             allow_pin: true,
             allow_sudo: true,
             reauth_every_time: false,
+            attention_enabled: false,
         }
     }
 }
@@ -83,6 +87,9 @@ impl Policy {
                 }
                 // reauth = session (cache until lock) | always (every launch)
                 "reauth" => p.reauth_every_time = parse_reauth(val).unwrap_or(p.reauth_every_time),
+                "attention" => {
+                    p.attention_enabled = parse_bool(val).unwrap_or(p.attention_enabled)
+                }
                 other => eprintln!("applockerd: config:{}: unknown key {other:?}", lineno + 1),
             }
         }
@@ -118,10 +125,12 @@ impl Policy {
             "# AppLocker auth policy — edit with `applockerd set-face` / `set-fallback`\n\
              face = {}\n\
              fallback = {}\n\
-             reauth = {}\n",
+             reauth = {}\n\
+             attention = {}\n",
             if self.face_enabled { "on" } else { "off" },
             fallback.join(", "),
-            if self.reauth_every_time { "always" } else { "session" }
+            if self.reauth_every_time { "always" } else { "session" },
+            if self.attention_enabled { "on" } else { "off" }
         );
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -144,10 +153,11 @@ impl Policy {
             fb.push("sudo");
         }
         format!(
-            "face {}, fallback: {}, re-auth: {}",
+            "face {}, fallback: {}, re-auth: {}, attention {}",
             if self.face_enabled { "ON" } else { "off" },
             fb.join(" + "),
-            if self.reauth_every_time { "every launch" } else { "once per session" }
+            if self.reauth_every_time { "every launch" } else { "once per session" },
+            if self.attention_enabled { "on" } else { "off" }
         )
     }
 }
@@ -233,13 +243,14 @@ mod tests {
             allow_pin: false,
             allow_sudo: true,
             reauth_every_time: false,
+            attention_enabled: false,
         };
         pol.save(&path).unwrap();
         let loaded = Policy::load(&path);
         assert_eq!(loaded, pol);
         assert_eq!(
             loaded.summary(),
-            "face off, fallback: sudo, re-auth: once per session"
+            "face off, fallback: sudo, re-auth: once per session, attention off"
         );
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
@@ -254,11 +265,12 @@ mod tests {
             allow_pin: true,
             allow_sudo: true,
             reauth_every_time: true,
+            attention_enabled: false,
         };
         pol.save(&path).unwrap();
         let loaded = Policy::load(&path);
         assert_eq!(loaded, pol);
-        assert!(loaded.summary().ends_with("re-auth: every launch"));
+        assert!(loaded.summary().contains("re-auth: every launch"));
         fs::remove_file(&path).unwrap();
     }
 
@@ -269,6 +281,7 @@ mod tests {
             allow_pin: false,
             allow_sudo: false,
             reauth_every_time: false,
+            attention_enabled: false,
         };
         assert!(pol.save(&tmp("empty")).is_err());
     }

@@ -38,7 +38,8 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
+use std::time::Duration;
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::process;
@@ -97,6 +98,7 @@ fn main() {
         Some("set-pin") => cmd_set_pin(),
         Some("config") => cmd_config_show(),
         Some("set-face") => cmd_set_face(std::env::args().nth(2)),
+        Some("set-attention") => cmd_set_attention(std::env::args().nth(2)),
         Some("set-fallback") => cmd_set_fallback(std::env::args().nth(2)),
         Some("set-reauth") => cmd_set_reauth(std::env::args().nth(2)),
         Some("authorize") => cmd_auth_test(std::env::args().nth(2)), // alias for GUI gating
@@ -128,6 +130,7 @@ fn cmd_config_show() {
     );
     println!("\nChange with:");
     println!("  applockerd set-face on|off");
+    println!("  applockerd set-attention on|off");
     println!("  applockerd set-fallback pin|sudo|both");
     println!("  applockerd set-reauth session|always");
 }
@@ -148,6 +151,29 @@ fn cmd_set_face(arg: Option<String>) {
     println!("face {} — {}", if on { "enabled" } else { "disabled" }, pol.summary());
     if on && !pin::is_set(&auth::default_pin_path()) {
         eprintln!("note: face still needs enrollment (face/enroll.py) to actually run.");
+    }
+}
+
+fn cmd_set_attention(arg: Option<String>) {
+    let on = match arg.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!("usage: applockerd set-attention on|off");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.attention_enabled = on;
+    save_policy_or_exit(&pol, &path);
+    println!(
+        "attention {} — {}",
+        if on { "enabled" } else { "disabled" },
+        pol.summary()
+    );
+    if on {
+        println!("start the watcher in your session: python3 face/watch_presence.py");
     }
 }
 
@@ -565,7 +591,49 @@ fn cmd_gate(adhoc: Option<String>) {
     let cache = Arc::new(UnlockCache::new());
     let write_lock = Arc::new(Mutex::new(()));
 
+    // Re-lock everything when the session locks or the machine sleeps: manual
+    // lock, lid-close, and the attention watcher's `loginctl lock-session` all
+    // funnel through logind, so this one listener covers them all.
+    spawn_lock_listener(Arc::clone(&cache));
+
     event_loop(fan_fd, locks, cache, write_lock);
+}
+
+/// Watch logind for `Session.Lock` / `PrepareForSleep(true)` signals and wipe
+/// the unlock cache when they fire. Uses `gdbus monitor` (ships with GLib) so
+/// the std-only daemon needs no D-Bus crate; if gdbus is missing we log it and
+/// the cache simply lives until the daemon restarts (previous behaviour).
+fn spawn_lock_listener(cache: Arc<UnlockCache>) {
+    thread::spawn(move || loop {
+        let child = process::Command::new("gdbus")
+            .args(["monitor", "-y", "-d", "org.freedesktop.login1"])
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("applockerd: no lock listener (gdbus unavailable: {e}) — \
+                           unlocks last until the daemon restarts.");
+                return;
+            }
+        };
+        if let Some(stdout) = child.stdout.take() {
+            let reader = io::BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if line.contains(".Session.Lock (")
+                    || line.contains("PrepareForSleep (true")
+                {
+                    cache.wipe();
+                    eprintln!("applockerd: session locked — unlock cache wiped.");
+                }
+            }
+        }
+        let _ = child.wait();
+        // gdbus died (session bus restart?) — retry after a beat.
+        thread::sleep(Duration::from_secs(5));
+    });
 }
 
 fn init_fanotify() -> std::io::Result<RawFd> {
