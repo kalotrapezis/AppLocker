@@ -47,6 +47,14 @@ impl Default for SubprocessFace {
 impl FaceVerifier for SubprocessFace {
     fn try_match(&mut self) -> bool {
         let mut cmd = Command::new("python3");
+        // The daemon runs as root but the ONNX models live in the *user's*
+        // home — point the engine there explicitly, or it silently falls back
+        // to the weak haar-pixel backend (which the sface profiles refuse).
+        if std::env::var_os("APPLOCKER_MODELS").is_none() {
+            if let Some(home) = invoking_user_home() {
+                cmd.env("APPLOCKER_MODELS", home.join(".config/applocker/models"));
+            }
+        }
         cmd.arg(&self.script)
             .arg("--faces-dir")
             .arg(&self.faces_dir)

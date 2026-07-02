@@ -57,10 +57,23 @@ SFACE_MODEL = "face_recognition_sface_2021dec.onnx"
 
 
 def model_dir() -> str:
-    """Where the YuNet/SFace ONNX models live ($APPLOCKER_MODELS or the default)."""
-    return os.path.expanduser(
-        os.environ.get("APPLOCKER_MODELS", "~/.config/applocker/models")
-    )
+    """Where the YuNet/SFace ONNX models live ($APPLOCKER_MODELS or the default).
+
+    When running as root (the daemon), "~" is /root — but the models live in the
+    *invoking* user's home, so prefer $SUDO_USER's home when the default path
+    doesn't exist. Otherwise SFace silently degrades to the weak haar backend.
+    """
+    env = os.environ.get("APPLOCKER_MODELS")
+    if env:
+        return os.path.expanduser(env)
+    default = os.path.expanduser("~/.config/applocker/models")
+    if not os.path.isdir(default):
+        user = os.environ.get("SUDO_USER")
+        if user:
+            sudo_path = f"/home/{user}/.config/applocker/models"
+            if os.path.isdir(sudo_path):
+                return sudo_path
+    return default
 
 
 def build_engine() -> FaceEngine:
