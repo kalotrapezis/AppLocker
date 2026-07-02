@@ -87,14 +87,16 @@ impl FaceVerifier for SubprocessFace {
 /// quick testing (`1` forces on, `0` forces off). When on, the subprocess
 /// recognizer runs once (the Python side loops internally); otherwise the
 /// always-decline stub sends the routine straight to PIN/sudo.
-pub fn build() -> (Box<dyn FaceVerifier>, u32) {
+/// The third element is whether the *real* recognizer is in play (drives the
+/// on-screen feedback window — no window when face is off).
+pub fn build() -> (Box<dyn FaceVerifier>, u32, bool) {
     let enabled = match std::env::var("APPLOCKER_FACE").ok().as_deref() {
         Some("1") => true,
         Some("0") => false,
         _ => crate::policy::load_default().face_enabled,
     };
     if enabled && has_enrollment() {
-        (Box::new(SubprocessFace::new()), 1)
+        (Box::new(SubprocessFace::new()), 1, true)
     } else {
         if enabled {
             eprintln!(
@@ -102,7 +104,7 @@ pub fn build() -> (Box<dyn FaceVerifier>, u32) {
                 faces_dir().display()
             );
         }
-        (Box::new(NoFace), 1)
+        (Box::new(NoFace), 1, false)
     }
 }
 

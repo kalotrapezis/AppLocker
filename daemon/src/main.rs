@@ -49,6 +49,7 @@ use std::thread;
 use applockerd::auth::{self, Outcome, SystemFallback};
 use applockerd::desktop::{self, AppKind};
 use applockerd::face;
+use applockerd::feedback::{ClosingPrompter, FaceWithFeedback, Feedback};
 use applockerd::folderlist::{self, FolderList, LockedFolder};
 use applockerd::gate::{CachePolicy, Decision, GuiPrompter, UnlockCache};
 use applockerd::locklist::{self, LockList, LockedApp};
@@ -474,9 +475,15 @@ fn signal_daemon_reload() {
 /// prompt + PIN + PAM end to end: `applockerd auth-test [app-name]`.
 fn cmd_auth_test(app: Option<String>) {
     let app = app.unwrap_or_else(|| "auth-test".to_string());
-    let (mut face, attempts) = face::build();
+    let (face, attempts, face_live) = face::build();
     let cfg = face::config_for(attempts);
-    let mut prompter = GuiPrompter::new(&app);
+    let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+        Feedback::spawn(&app)
+    } else {
+        Feedback::none()
+    }));
+    let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
+    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app), fb);
     let fallback = SystemFallback::system();
     let pol = policy::load_default();
 
@@ -486,7 +493,7 @@ fn cmd_auth_test(app: Option<String>) {
         pol.summary(),
     );
 
-    match auth::run(&cfg, face.as_mut(), &mut prompter, &fallback) {
+    match auth::run(&cfg, &mut face, &mut prompter, &fallback) {
         Outcome::Allowed => println!("ALLOWED"),
         Outcome::Denied => {
             println!("DENIED");
@@ -744,11 +751,17 @@ fn handle_event(
             println!("auth   pid={pid:<7} {app_name} (prompting)");
 
             thread::spawn(move || {
-                let (mut face, attempts) = face::build();
+                let (face, attempts, face_live) = face::build();
                 let cfg = face::config_for(attempts);
-                let mut prompter = GuiPrompter::new(&app);
+                let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+                    Feedback::spawn(&app)
+                } else {
+                    Feedback::none()
+                }));
+                let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
+                let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app), fb);
                 let fallback = SystemFallback::system();
-                let outcome = auth::run(&cfg, face.as_mut(), &mut prompter, &fallback);
+                let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
 
                 let allowed = matches!(outcome, Outcome::Allowed);
                 cache.finish(&target, allowed, cache_policy);

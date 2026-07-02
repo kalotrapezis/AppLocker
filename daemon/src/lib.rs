@@ -8,6 +8,7 @@ pub mod auth;
 pub mod crypto;
 pub mod desktop;
 pub mod face;
+pub mod feedback;
 pub mod folderlist;
 pub mod gate;
 pub mod locklist;
