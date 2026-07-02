@@ -152,6 +152,9 @@ backend and cadence). **The camera light should be OFF except during a check.**
 
 - [ ] `python3 gui/settings.py` (dev: `APPLOCKER_NO_PKEXEC=1`) → opens, gated by
       an auth prompt.
+- [ ] Top bar shows "AppLocker service — running/stopped" and the Start/Stop
+      button reflects reality; clicking it starts/stops the gate (pkexec) and the
+      label flips within ~3s. From the repo (no unit) it reads "not installed".
 - [ ] Theme matches Mint-Y (dark/light + accent) — native GTK widgets.
 - [ ] Face / PIN / sudo / re-auth / attention controls reflect the config and
       writing them updates `/etc/applocker/config`.
@@ -196,7 +199,8 @@ see [pam/README.md](pam/README.md) for the manual edit.
 
 ## 10. Packaging (.deb)
 
-- [ ] `packaging/build-deb.sh` → `dist/applocker_<ver>_<arch>.deb`, no errors.
+- [ ] `packaging/build-deb.sh` → `dist/applocker_0.0.1-<round>_<arch>.deb`; each
+      run bumps the round letter (a, b, c…). Install the newest.
 - [ ] `sudo apt install ./dist/applocker_*.deb` → installs, pulls deps.
 - [ ] `which applockerd` → `/usr/bin/applockerd` (symlink resolves); `applockerd
       config` runs.
