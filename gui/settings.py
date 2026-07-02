@@ -23,11 +23,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
 
 # Face profiles are the user's own data (in ~/.config/applocker/faces), so we
 # read/manage them directly via the face-pipeline's matcher helpers — no daemon,
@@ -268,10 +269,14 @@ class SettingsWindow(Gtk.Window):
         if not name:
             return
         here = os.path.dirname(os.path.abspath(__file__))
-        enroll = os.path.join(here, "..", "face", "enroll.py")
-        spawn([sys.executable, enroll, "--name", name])
-        self._toast("Look at the camera — enrolling in a new window.\n"
-                    "Click the refresh button when it finishes.")
+        enroll = os.path.join(here, "enroll_window.py")
+
+        def wait_and_refresh(proc):
+            proc.wait()
+            GLib.idle_add(self._refresh_faces)
+
+        proc = subprocess.Popen([sys.executable, enroll, "--name", name])
+        threading.Thread(target=wait_and_refresh, args=(proc,), daemon=True).start()
 
     def _ask_text(self, title: str, placeholder: str):
         dlg = Gtk.Dialog(title=title, transient_for=self, modal=True)
