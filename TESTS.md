@@ -42,7 +42,23 @@ Conventions:
 - [ ] **Spoof check:** hold up a *photo* of your face to `recognize.py` (with
       liveness) → must **not** match (the turn challenge fails on a flat photo).
 
+## 2b. Session discovery + turning it on
+
+The gate runs as **root** but shows its prompt in *your* session. Confirm the
+daemon can find your session before relying on the service.
+
+- [ ] `sudo applockerd session-probe` → prints your user, home, `DISPLAY`,
+      `XAUTHORITY`, `XDG_RUNTIME_DIR`. If it says "no active graphical session",
+      the prompt won't show — stop and note it.
+- [ ] `sudo applocker on` → enables the gate service + sudo + screensaver PAM;
+      `applocker status` shows `gate service: active`.
+- [ ] `sudo applocker off` → stops the service and removes the PAM hooks;
+      `applocker status` shows it inactive.
+
 ## 3. App gate (lock an app)
+
+> With the service enabled (`applocker on`) the gate is always running. To test
+> without the service, run it in your session: `sudo applockerd`.
 
 - [ ] `sudo applockerd list-installed` → lists installed `.desktop` apps.
 - [ ] `sudo applockerd lock-app gnome-calculator` (or another safe app) →
