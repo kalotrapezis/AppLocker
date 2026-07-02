@@ -41,7 +41,19 @@ pub struct Policy {
     /// The presence watcher (dim when away, lock when gone). The watcher script
     /// (face/watch_presence.py, run in the user session) reads this key.
     pub attention_enabled: bool,
+    /// Minutes between presence snapshots. One of [`ATTENTION_INTERVALS`]; the
+    /// watcher polls this to space out how often it wakes the camera.
+    pub attention_interval_min: u32,
+    /// Only run the watcher while on AC power; on battery it disables itself
+    /// (the camera is the biggest drain, and a laptop on battery is usually
+    /// with you). The watcher reads this and pauses when unplugged.
+    pub attention_ac_only: bool,
 }
+
+/// The intervals the UI offers (minutes between snapshots). A hand-edited value
+/// outside this set is rejected back to the default.
+pub const ATTENTION_INTERVALS: [u32; 5] = [2, 5, 10, 15, 30];
+const ATTENTION_INTERVAL_DEFAULT: u32 = 2;
 
 impl Default for Policy {
     fn default() -> Self {
@@ -54,6 +66,8 @@ impl Default for Policy {
             allow_sudo: true,
             reauth_every_time: false,
             attention_enabled: false,
+            attention_interval_min: ATTENTION_INTERVAL_DEFAULT,
+            attention_ac_only: false,
         }
     }
 }
@@ -89,6 +103,13 @@ impl Policy {
                 "reauth" => p.reauth_every_time = parse_reauth(val).unwrap_or(p.reauth_every_time),
                 "attention" => {
                     p.attention_enabled = parse_bool(val).unwrap_or(p.attention_enabled)
+                }
+                "attention_interval" => {
+                    p.attention_interval_min =
+                        parse_interval(val).unwrap_or(p.attention_interval_min)
+                }
+                "attention_ac_only" => {
+                    p.attention_ac_only = parse_bool(val).unwrap_or(p.attention_ac_only)
                 }
                 other => eprintln!("applockerd: config:{}: unknown key {other:?}", lineno + 1),
             }
@@ -126,11 +147,15 @@ impl Policy {
              face = {}\n\
              fallback = {}\n\
              reauth = {}\n\
-             attention = {}\n",
+             attention = {}\n\
+             attention_interval = {}\n\
+             attention_ac_only = {}\n",
             if self.face_enabled { "on" } else { "off" },
             fallback.join(", "),
             if self.reauth_every_time { "always" } else { "session" },
-            if self.attention_enabled { "on" } else { "off" }
+            if self.attention_enabled { "on" } else { "off" },
+            self.attention_interval_min,
+            if self.attention_ac_only { "on" } else { "off" }
         );
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -152,14 +177,30 @@ impl Policy {
         if self.allow_sudo {
             fb.push("sudo");
         }
+        let att = if self.attention_enabled {
+            format!(
+                "on (every {}m{})",
+                self.attention_interval_min,
+                if self.attention_ac_only { ", AC only" } else { "" }
+            )
+        } else {
+            "off".to_string()
+        };
         format!(
             "face {}, fallback: {}, re-auth: {}, attention {}",
             if self.face_enabled { "ON" } else { "off" },
             fb.join(" + "),
             if self.reauth_every_time { "every launch" } else { "once per session" },
-            if self.attention_enabled { "on" } else { "off" }
+            att
         )
     }
+}
+
+/// Parse `attention_interval = <minutes>`; only the [`ATTENTION_INTERVALS`]
+/// values are accepted (anything else → None, keeping the previous value).
+fn parse_interval(v: &str) -> Option<u32> {
+    let n: u32 = v.trim().parse().ok()?;
+    ATTENTION_INTERVALS.contains(&n).then_some(n)
 }
 
 /// `always`/`every` → re-auth every launch (true); `session`/`once` → cache
@@ -244,6 +285,8 @@ mod tests {
             allow_sudo: true,
             reauth_every_time: false,
             attention_enabled: false,
+            attention_interval_min: 2,
+            attention_ac_only: false,
         };
         pol.save(&path).unwrap();
         let loaded = Policy::load(&path);
@@ -266,6 +309,8 @@ mod tests {
             allow_sudo: true,
             reauth_every_time: true,
             attention_enabled: false,
+            attention_interval_min: 2,
+            attention_ac_only: false,
         };
         pol.save(&path).unwrap();
         let loaded = Policy::load(&path);
@@ -282,6 +327,8 @@ mod tests {
             allow_sudo: false,
             reauth_every_time: false,
             attention_enabled: false,
+            attention_interval_min: 2,
+            attention_ac_only: false,
         };
         assert!(pol.save(&tmp("empty")).is_err());
     }
@@ -305,6 +352,35 @@ mod tests {
         .unwrap();
         let p = Policy::load(&path);
         assert!(p.face_enabled && p.allow_pin && !p.allow_sudo);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn attention_interval_and_ac_roundtrip() {
+        let path = tmp("attn_interval");
+        let mut pol = Policy::default();
+        pol.attention_enabled = true;
+        pol.attention_interval_min = 15;
+        pol.attention_ac_only = true;
+        pol.save(&path).unwrap();
+        let loaded = Policy::load(&path);
+        assert_eq!(loaded, pol);
+        assert_eq!(loaded.summary().contains("on (every 15m, AC only)"), true);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn attention_interval_rejects_bad_value() {
+        // A value outside the allowed set keeps the default (2), not 7.
+        let path = tmp("attn_bad");
+        fs::write(&path, "attention = on\nattention_interval = 7\n").unwrap();
+        let p = Policy::load(&path);
+        assert_eq!(p.attention_interval_min, 2);
+        for good in ATTENTION_INTERVALS {
+            assert_eq!(parse_interval(&good.to_string()), Some(good));
+        }
+        assert_eq!(parse_interval("0"), None);
+        assert_eq!(parse_interval("abc"), None);
         fs::remove_file(&path).unwrap();
     }
 

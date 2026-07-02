@@ -46,20 +46,69 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 
-def attention_enabled() -> bool:
-    """The `attention` key from the daemon's config (default: off)."""
+_TRUE = ("on", "true", "1", "yes", "enabled")
+_ALLOWED_INTERVALS = (2, 5, 10, 15, 30)
+
+
+def read_config() -> dict:
+    """The attention-related keys from the daemon's config. The watcher re-reads
+    these each loop so changes made in the settings GUI take effect live:
+      enabled      — the `attention` switch
+      interval_min — minutes between snapshots (one of _ALLOWED_INTERVALS)
+      ac_only      — pause the watcher while on battery
+    """
+    cfg = {"enabled": False, "interval_min": 2, "ac_only": False}
     path = os.environ.get("APPLOCKER_CONFIG", "/etc/applocker/config")
     try:
         with open(path) as f:
             for raw in f:
                 line = raw.split("#", 1)[0].strip()
-                if "=" in line:
-                    k, v = (p.strip().lower() for p in line.split("=", 1))
-                    if k == "attention":
-                        return v in ("on", "true", "1", "yes")
+                if "=" not in line:
+                    continue
+                k, v = (p.strip().lower() for p in line.split("=", 1))
+                if k == "attention":
+                    cfg["enabled"] = v in _TRUE
+                elif k == "attention_ac_only":
+                    cfg["ac_only"] = v in _TRUE
+                elif k == "attention_interval":
+                    try:
+                        n = int(v)
+                        if n in _ALLOWED_INTERVALS:
+                            cfg["interval_min"] = n
+                    except ValueError:
+                        pass
     except OSError:
         pass
-    return False
+    return cfg
+
+
+def on_ac_power():
+    """True on AC, False on battery, None if it can't be told (e.g. a desktop
+    with no battery — the caller then treats it as always-powered)."""
+    base = "/sys/class/power_supply"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None
+
+    def _read(name, field):
+        try:
+            with open(os.path.join(base, name, field)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    for n in names:  # an AC/Mains adapter's `online` is the clearest signal
+        if _read(n, "type") == "Mains":
+            online = _read(n, "online")
+            if online in ("0", "1"):
+                return online == "1"
+    for n in names:  # else infer from a battery that's discharging
+        if _read(n, "type") == "Battery":
+            status = _read(n, "status")
+            if status:
+                return status != "Discharging"
+    return None
 
 
 def session_locked() -> bool:
@@ -227,8 +276,9 @@ def main() -> int:
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--idle-after", type=float, default=60.0,
                     help="seconds of no keyboard/mouse before checks start")
-    ap.add_argument("--interval", type=float, default=120.0,
-                    help="seconds between snapshots while present-but-idle")
+    ap.add_argument("--interval", type=float, default=None,
+                    help="seconds between snapshots (overrides the config's "
+                         "attention_interval, which is in minutes)")
     ap.add_argument("--confirm-after", type=float, default=20.0,
                     help="seconds to the confirming snapshot after an empty one")
     ap.add_argument("--misses", type=int, default=2,
@@ -239,7 +289,8 @@ def main() -> int:
                     help="run even if the config has attention off")
     args = ap.parse_args()
 
-    if not args.force and not attention_enabled():
+    conf = read_config()
+    if not args.force and not conf["enabled"]:
         print("attention is off in the config (enable it in AppLocker settings, "
               "or run with --force)", file=sys.stderr)
         return 2
@@ -247,7 +298,9 @@ def main() -> int:
     from engine import build_engine
 
     engine = build_engine()
-    cfg = Config(idle_after=args.idle_after, interval=args.interval,
+    # --interval (seconds) overrides the config's attention_interval (minutes).
+    interval = args.interval if args.interval is not None else conf["interval_min"] * 60
+    cfg = Config(idle_after=args.idle_after, interval=interval,
                  confirm_after=args.confirm_after, misses_to_lock=args.misses)
     presence = SnapshotPresence(cfg)
     idle = IdleMonitor()
@@ -273,6 +326,25 @@ def main() -> int:
     def loop():
         next_snapshot_at = None  # monotonic deadline; None = not scheduled yet
         while True:
+            # Re-read config each tick so the settings GUI takes effect live:
+            # interval, AC-only, and the on/off switch (turning it off exits).
+            conf = read_config()
+            if not args.force and not conf["enabled"]:
+                print("attention turned off in the config — watcher exiting",
+                      file=sys.stderr)
+                GLib.idle_add(Gtk.main_quit)
+                return
+            if args.interval is None:
+                cfg.interval = conf["interval_min"] * 60  # live-adjust cadence
+
+            # AC-only: on battery, disable ourselves (camera off, no checks).
+            if conf["ac_only"] and on_ac_power() is False:
+                if state["phase"] is not Phase.PRESENT or next_snapshot_at:
+                    go_present()
+                next_snapshot_at = None
+                time.sleep(max(args.poll, 5.0))
+                continue
+
             # After a lock, sit idle until the session unlocks, then resume.
             if presence.locked or state["phase"] is Phase.LOCKED:
                 if not session_locked():
@@ -317,8 +389,9 @@ def main() -> int:
 
     threading.Thread(target=loop, daemon=True).start()
     how = idle._backend or "none (periodic fallback)"
-    print(f"presence watcher: idle-after {args.idle_after}s, every {args.interval}s, "
-          f"lock after {args.misses} empty (idle backend: {how})", file=sys.stderr)
+    ac = " [AC-only]" if conf["ac_only"] else ""
+    print(f"presence watcher: idle-after {args.idle_after}s, every {cfg.interval:.0f}s, "
+          f"lock after {args.misses} empty (idle backend: {how}){ac}", file=sys.stderr)
     Gtk.main()
     return 0
 

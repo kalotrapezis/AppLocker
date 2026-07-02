@@ -58,7 +58,7 @@ def cfg_path(env: str, default: str) -> str:
 def read_config() -> dict:
     """Parse /etc/applocker/config into {face, allow_pin, allow_sudo, reauth}."""
     out = {"face": False, "pin": True, "sudo": True, "reauth_every": False,
-           "attention": False}
+           "attention": False, "attention_interval": 2, "attention_ac_only": False}
     path = cfg_path("APPLOCKER_CONFIG", "/etc/applocker/config")
     try:
         with open(path) as f:
@@ -80,6 +80,15 @@ def read_config() -> dict:
                     out["reauth_every"] = v in ("always", "every", "everytime")
                 elif k == "attention":
                     out["attention"] = v in ("on", "true", "1", "yes")
+                elif k == "attention_ac_only":
+                    out["attention_ac_only"] = v in ("on", "true", "1", "yes")
+                elif k == "attention_interval":
+                    try:
+                        n = int(v)
+                        if n in (2, 5, 10, 15, 30):
+                            out["attention_interval"] = n
+                    except ValueError:
+                        pass
     except OSError:
         pass
     return out
@@ -352,12 +361,28 @@ class SettingsWindow(Gtk.Window):
             "Lock when I leave (presence watcher)", cfg["attention"])
         self.attention_switch.connect("notify::active", self._on_attention_toggled)
         box.pack_start(arow, False, False, 0)
-        anote = Gtk.Label(xalign=0, label="Dims after a few seconds away, locks "
-                          "the session soon after. Any face counts — it never "
-                          "checks who you are.")
+        anote = Gtk.Label(xalign=0, label="The camera stays off while you work. "
+                          "Once you're idle it takes a quick photo now and then; "
+                          "if you're gone it locks the session. Any face counts — "
+                          "it never checks who you are.")
         anote.get_style_context().add_class("dim-label")
         anote.set_line_wrap(True)
         box.pack_start(anote, False, False, 0)
+
+        irow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        irow.pack_start(Gtk.Label(label="Check every", xalign=0), True, True, 0)
+        self.attention_interval = Gtk.ComboBoxText()
+        for m in (2, 5, 10, 15, 30):
+            self.attention_interval.append(str(m), f"{m} minutes")
+        self.attention_interval.set_active_id(str(cfg["attention_interval"]))
+        self.attention_interval.connect("changed", self._on_attention_interval_changed)
+        irow.pack_start(self.attention_interval, False, False, 0)
+        box.pack_start(irow, False, False, 0)
+
+        acrow, self.attention_ac_switch = self._switch_row(
+            "Only when plugged in (pause on battery)", cfg["attention_ac_only"])
+        self.attention_ac_switch.connect("notify::active", self._on_attention_ac_toggled)
+        box.pack_start(acrow, False, False, 0)
 
     # -- refreshers ----------------------------------------------------------
 
@@ -420,6 +445,13 @@ class SettingsWindow(Gtk.Window):
             here = os.path.dirname(os.path.abspath(__file__))
             spawn([sys.executable,
                    os.path.join(here, "..", "face", "watch_presence.py")])
+
+    def _on_attention_interval_changed(self, combo):
+        run_privileged(["set-attention-interval", combo.get_active_id()])
+
+    def _on_attention_ac_toggled(self, switch, _param):
+        run_privileged(["set-attention-ac-only",
+                        "on" if switch.get_active() else "off"])
 
     def _on_fallback_toggled(self, switch, _param, which):
         pin = self.pin_switch.get_active()

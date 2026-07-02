@@ -99,6 +99,8 @@ fn main() {
         Some("config") => cmd_config_show(),
         Some("set-face") => cmd_set_face(std::env::args().nth(2)),
         Some("set-attention") => cmd_set_attention(std::env::args().nth(2)),
+        Some("set-attention-interval") => cmd_set_attention_interval(std::env::args().nth(2)),
+        Some("set-attention-ac-only") => cmd_set_attention_ac_only(std::env::args().nth(2)),
         Some("set-fallback") => cmd_set_fallback(std::env::args().nth(2)),
         Some("set-reauth") => cmd_set_reauth(std::env::args().nth(2)),
         Some("authorize") => cmd_auth_test(std::env::args().nth(2)), // alias for GUI gating
@@ -131,6 +133,8 @@ fn cmd_config_show() {
     println!("\nChange with:");
     println!("  applockerd set-face on|off");
     println!("  applockerd set-attention on|off");
+    println!("  applockerd set-attention-interval 2|5|10|15|30   (minutes between checks)");
+    println!("  applockerd set-attention-ac-only on|off          (pause on battery)");
     println!("  applockerd set-fallback pin|sudo|both");
     println!("  applockerd set-reauth session|always");
 }
@@ -175,6 +179,41 @@ fn cmd_set_attention(arg: Option<String>) {
     if on {
         println!("start the watcher in your session: python3 face/watch_presence.py");
     }
+}
+
+fn cmd_set_attention_interval(arg: Option<String>) {
+    let min = match arg.as_deref().and_then(|s| s.parse::<u32>().ok()) {
+        Some(n) if policy::ATTENTION_INTERVALS.contains(&n) => n,
+        _ => {
+            eprintln!("usage: applockerd set-attention-interval 2|5|10|15|30");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.attention_interval_min = min;
+    save_policy_or_exit(&pol, &path);
+    println!("attention interval {}m — {}", min, pol.summary());
+}
+
+fn cmd_set_attention_ac_only(arg: Option<String>) {
+    let on = match arg.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!("usage: applockerd set-attention-ac-only on|off");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.attention_ac_only = on;
+    save_policy_or_exit(&pol, &path);
+    println!(
+        "attention AC-only {} — {}",
+        if on { "enabled" } else { "disabled" },
+        pol.summary()
+    );
 }
 
 fn cmd_set_fallback(arg: Option<String>) {
