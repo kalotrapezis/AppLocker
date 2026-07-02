@@ -16,7 +16,7 @@ Conventions:
 
 ## 0. Build & unit tests (no hardware)
 
-- [ ] `cd daemon && cargo test` → all green (50+ tests, no root/camera/display).
+- [ ] `cd daemon && cargo test` → all green (49 tests, no root/camera/display).
 - [ ] `cd daemon && cargo build --release` → builds clean.
 - [ ] `python3 face/attention.py --selftest` → "all checks passed".
 - [ ] `python3 face/liveness.py --selftest` → passes.
@@ -56,6 +56,25 @@ Conventions:
 - [ ] `sudo applockerd unlock-app gnome-calculator` → launches freely again.
 - [ ] **SIGHUP live-reload:** with the gate running, `lock-app` another app →
       it becomes gated without restarting the daemon.
+
+### 3a. Flatpak gate
+
+Flatpaks are matched by their install path (`…/flatpak/app/<app-id>/…`), so a
+lock catches the real app binary even though the launcher runs `flatpak`.
+
+- [ ] `sudo applockerd lock-app "Flatseal"` (or any installed flatpak) → locks
+      with **no** "not gateable" note; `list-apps` shows it without a caveat.
+- [ ] With the gate running, launch the flatpak from the menu → auth prompt
+      appears before its window opens. Correct secret → it opens; cancel → it
+      doesn't.
+- [ ] Launch the same flatpak from a terminal (`flatpak run <app-id>`) → also
+      gated (the path match doesn't care how it was started).
+- [ ] A *different*, unlocked flatpak launches freely (no false prompt).
+- [ ] `sudo applockerd unlock-app "Flatseal"` → launches freely again.
+
+> If a flatpak launch is **not** intercepted, note it — it means the sandboxed
+> exec event isn't reaching the gate on this kernel, which we'd handle
+> differently. (Snap apps are stored but not gated yet — expected.)
 
 ## 4. File / folder gate
 
@@ -162,8 +181,8 @@ whole time, so you can undo the PAM edit.
 
 ## Not yet implemented (should currently NOT work / be absent)
 
-- [ ] **Flatpak gating** — locking a flatpak app does not gate it yet (every
-      flatpak execs the same `flatpak` binary). Expected: no gate. (task #4)
+- [ ] **Snap gating** — locking a snap app is stored but not enforced yet.
+      Expected: no gate, with a note. (flatpak now works — see 3a)
 - [ ] **Adaptive brightness** — no brightness control yet. (task #5, bonus)
 - [ ] **Autostart** — the watcher does not auto-start on login until packaging
       adds the `.desktop` autostart entry. (task #6)

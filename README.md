@@ -99,11 +99,13 @@ off — otherwise a failed camera locks you out of your own machine.
   script, so exec-gating sees the interpreter. Scripts must be gated via the
   file-gate, not the exec-gate.
 - **fanotify mark scope** — `FAN_MARK_FILESYSTEM` covers one filesystem. A
-  separate `/home` partition, flatpaks, snaps, and AppImages live elsewhere and
-  need their own marks. Flatpak/snap apps also don't exec a simple binary path.
-- **Camera contention** — the attention watcher holds the webcam, so video calls
-  can't. Need a single camera-owner service and auto-pause when another app
-  wants the camera.
+  separate `/home` partition and AppImages elsewhere need their own marks.
+  Flatpaks *are* gated now (matched by their `…/flatpak/app/<app-id>/…` install
+  path); snap apps are stored but not yet enforced.
+- **Camera contention** — the attention watcher only wakes the camera for a
+  brief snapshot while you're idle (it's off the rest of the time), so it rarely
+  collides with a video call; when the camera is busy it counts you present and
+  never locks blind. A single camera-owner service is still cleaner long-term.
 - **Lock-out recovery** — bad light, beard, broken camera. Mandatory fallback +
   a documented recovery path (boot, stop the service).
 - **The daemon waits on userspace** — every `execve` on the system pauses until
@@ -159,7 +161,8 @@ on-hardware run. Until face is enabled *and* enrolled, the daemon uses the
    Persistent locked-apps list from installed `.desktop` files
    (`lock-app`/`unlock-app`/`list-installed`), live-reloaded on SIGHUP — replaces
    the substring placeholder. Unwraps `sh -c` launchers and refuses to gate a
-   bare shell/interpreter. Flatpak/Snap stored but not yet enforced.
+   bare shell/interpreter. Flatpaks gated by install path; Snap stored but not
+   yet enforced.
 3. 🚧 Face pipeline on the webcam (enrollment + match + **liveness required**) —
    `face/`. Pure-logic core (liveness state machine, matcher) is built and
    self-tested; the OpenCV engine + camera glue need on-hardware run after

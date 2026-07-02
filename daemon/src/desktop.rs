@@ -42,9 +42,11 @@ impl AppKind {
         }
     }
 
-    /// Can the exec-gate match this kind from a binary path today?
+    /// Can the exec-gate match this kind from a binary path today? Native by
+    /// basename; Flatpak by its app-install path (the app-id is a path
+    /// component — see `LockList::matches`). Snap isn't handled yet.
     pub fn is_gateable(&self) -> bool {
-        matches!(self, AppKind::Native)
+        matches!(self, AppKind::Native | AppKind::Flatpak)
     }
 }
 
@@ -342,7 +344,8 @@ mod tests {
     #[test]
     fn kind_gateability() {
         assert!(AppKind::Native.is_gateable());
-        assert!(!AppKind::Flatpak.is_gateable());
+        assert!(AppKind::Flatpak.is_gateable()); // now matched by app-install path
+        assert!(!AppKind::Snap.is_gateable());
         assert_eq!(AppKind::from_tag(AppKind::Snap.as_str()), Some(AppKind::Snap));
     }
 

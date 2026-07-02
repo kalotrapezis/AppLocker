@@ -13,9 +13,11 @@
 //!
 //! Matching: for `native` entries we compare the **basename** of the exec'd
 //! binary to the basename of the stored key, so a lock on `steam` catches it
-//! whether it runs from `/usr/bin` or `/usr/local/bin`. Flatpak/Snap entries
-//! can't be matched from a binary path yet (every flatpak execs `flatpak`), so
-//! they're stored but skipped by the gate with a note — see `desktop.rs`.
+//! whether it runs from `/usr/bin` or `/usr/local/bin`. `flatpak` entries match
+//! by the app's install path — a flatpak's real binaries live under
+//! `…/flatpak/app/<app-id>/…`, so the app-id (the stored key) is a path
+//! component we can match on (see `LockList::matches`). `snap` isn't matched
+//! yet (stored but not enforced — the gate notes this).
 
 use std::fs;
 use std::io::Write;
@@ -112,13 +114,24 @@ impl LockList {
         before - self.apps.len()
     }
 
-    /// The locked app matching an exec'd binary path, if any. Only `native`
-    /// entries can match today (basename equality).
+    /// The locked app matching an exec'd binary path, if any.
+    ///
+    /// - `native` — basename equality (a lock on `steam` catches it from any
+    ///   `bin` dir).
+    /// - `flatpak` — the app's real binaries live under
+    ///   `…/flatpak/app/<app-id>/…` (both the system store `/var/lib/flatpak`
+    ///   and the user store `~/.local/share/flatpak`). The app-id is a path
+    ///   component, so we match any exec beneath that app's install dir — this
+    ///   catches the launch whether it came from the menu or `flatpak run`, and
+    ///   the first exec (the app's `bin/<app-id>` wrapper) is enough to prompt.
+    /// - `snap` — not handled yet.
     pub fn matches(&self, exec_path: &str) -> Option<&LockedApp> {
         let exe_base = base(exec_path);
-        self.apps
-            .iter()
-            .find(|a| a.kind.is_gateable() && base(&a.key) == exe_base)
+        self.apps.iter().find(|a| match a.kind {
+            AppKind::Native => base(&a.key) == exe_base,
+            AppKind::Flatpak => exec_path.contains(&format!("/flatpak/app/{}/", a.key)),
+            AppKind::Snap => false,
+        })
     }
 }
 
@@ -148,12 +161,32 @@ mod tests {
     }
 
     #[test]
-    fn flatpak_not_matched_but_stored() {
+    fn flatpak_matched_by_app_install_path() {
         let mut l = LockList::default();
-        l.add(LockedApp { kind: AppKind::Flatpak, key: "com.valvesoftware.Steam".into(), name: "Steam".into() });
-        // Stored, but a flatpak/bwrap exec path can't be matched yet.
-        assert_eq!(l.apps.len(), 1);
+        l.add(LockedApp { kind: AppKind::Flatpak, key: "com.github.tchx84.Flatseal".into(), name: "Flatseal".into() });
+        // The launcher/sandbox helpers execing plain `flatpak` are NOT matched…
         assert!(l.matches("/usr/bin/flatpak").is_none());
+        assert!(l.matches("/usr/bin/bwrap").is_none());
+        // …but the app's real binary under the system store IS.
+        assert!(l.matches(
+            "/var/lib/flatpak/app/com.github.tchx84.Flatseal/current/active/files/bin/com.github.tchx84.Flatseal"
+        ).is_some());
+        // …and under a per-user install too.
+        assert!(l.matches(
+            "/home/teo/.local/share/flatpak/app/com.github.tchx84.Flatseal/x86_64/stable/abc/files/bin/foo"
+        ).is_some());
+        // A different app-id must not match.
+        assert!(l.matches(
+            "/var/lib/flatpak/app/org.other.App/current/active/files/bin/org.other.App"
+        ).is_none());
+    }
+
+    #[test]
+    fn snap_stored_but_not_matched() {
+        let mut l = LockList::default();
+        l.add(LockedApp { kind: AppKind::Snap, key: "spotify".into(), name: "Spotify".into() });
+        assert_eq!(l.apps.len(), 1);
+        assert!(l.matches("/snap/spotify/current/usr/bin/spotify").is_none());
     }
 
     #[test]
