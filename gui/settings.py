@@ -21,6 +21,7 @@ Reads are unprivileged (the config files are world-readable); writes need root.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -179,6 +180,25 @@ def run_privileged(args: list) -> bool:
         return False
 
 
+def run_privileged_batch(ops: list) -> bool:
+    """Apply several mutating `applockerd` subcommands under **one** auth prompt.
+    `ops` is a list of arg-lists. Runs them as `pkexec sh -c 'cmd1 && cmd2 …'` so
+    the user authenticates once for the whole Apply, not once per change."""
+    if not ops:
+        return True
+    binp = bin_path()
+    script = " && ".join(
+        " ".join(shlex.quote(tok) for tok in [binp, *op]) for op in ops
+    )
+    cmd = ["sh", "-c", script]
+    if os.environ.get("APPLOCKER_NO_PKEXEC") != "1":
+        cmd = ["pkexec", *cmd]
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def spawn(args: list) -> None:
     try:
         subprocess.Popen(args)
@@ -234,6 +254,12 @@ class SettingsWindow(Gtk.Window):
         header.set_subtitle("unlocked — re-locks on close")
         self.set_titlebar(header)
 
+        # Policy changes are staged, not applied per-toggle. `_persisted` is the
+        # on-disk truth; `_loading` guards programmatic control updates so they
+        # don't count as edits.
+        self._persisted = read_config()
+        self._loading = False
+
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(outer)
         self._build_service_bar(outer)  # pinned at the top
@@ -250,6 +276,7 @@ class SettingsWindow(Gtk.Window):
         self._build_apps_section()
         self._build_folders_section()
         self._build_policy_section()
+        self._build_apply_bar(outer)  # pinned at the bottom
 
     # -- service bar ---------------------------------------------------------
 
@@ -318,7 +345,7 @@ class SettingsWindow(Gtk.Window):
         box = self._section("Face unlock")
 
         row, self.face_switch = self._switch_row("Use face unlock", cfg["face"])
-        self.face_switch.connect("notify::active", self._on_face_toggled)
+        self.face_switch.connect("notify::active", self._on_policy_changed)
         box.pack_start(row, False, False, 0)
 
         # The list of enrolled face profiles (up to MAX_FACES), each with a name
@@ -446,13 +473,13 @@ class SettingsWindow(Gtk.Window):
         self.reauth.append("session", "once per session")
         self.reauth.append("always", "every launch")
         self.reauth.set_active_id("always" if cfg["reauth_every"] else "session")
-        self.reauth.connect("changed", self._on_reauth_changed)
+        self.reauth.connect("changed", self._on_policy_changed)
         rrow.pack_start(self.reauth, False, False, 0)
         box.pack_start(rrow, False, False, 0)
 
         arow, self.attention_switch = self._switch_row(
             "Lock when I leave (presence watcher)", cfg["attention"])
-        self.attention_switch.connect("notify::active", self._on_attention_toggled)
+        self.attention_switch.connect("notify::active", self._on_policy_changed)
         box.pack_start(arow, False, False, 0)
         anote = Gtk.Label(xalign=0, label="The camera stays off while you work. "
                           "Once you're idle it takes a quick photo now and then; "
@@ -468,13 +495,13 @@ class SettingsWindow(Gtk.Window):
         for m in (2, 5, 10, 15, 30):
             self.attention_interval.append(str(m), f"{m} minutes")
         self.attention_interval.set_active_id(str(cfg["attention_interval"]))
-        self.attention_interval.connect("changed", self._on_attention_interval_changed)
+        self.attention_interval.connect("changed", self._on_policy_changed)
         irow.pack_start(self.attention_interval, False, False, 0)
         box.pack_start(irow, False, False, 0)
 
         acrow, self.attention_ac_switch = self._switch_row(
             "Only when plugged in (pause on battery)", cfg["attention_ac_only"])
-        self.attention_ac_switch.connect("notify::active", self._on_attention_ac_toggled)
+        self.attention_ac_switch.connect("notify::active", self._on_policy_changed)
         box.pack_start(acrow, False, False, 0)
 
     # -- refreshers ----------------------------------------------------------
@@ -524,39 +551,117 @@ class SettingsWindow(Gtk.Window):
         row.add(lbl)
         return row
 
+    # -- staged policy: Apply / Revert ---------------------------------------
+
+    def _build_apply_bar(self, container):
+        container.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                             False, False, 0)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                      border_width=10)
+        self.dirty_label = Gtk.Label(xalign=0)
+        self.dirty_label.get_style_context().add_class("dim-label")
+        bar.pack_start(self.dirty_label, True, True, 0)
+        self.revert_btn = Gtk.Button(label="Revert")
+        self.revert_btn.connect("clicked", self._revert)
+        bar.pack_start(self.revert_btn, False, False, 0)
+        self.apply_btn = Gtk.Button(label="Apply changes")
+        self.apply_btn.get_style_context().add_class("suggested-action")
+        self.apply_btn.connect("clicked", self._apply)
+        bar.pack_start(self.apply_btn, False, False, 0)
+        container.pack_start(bar, False, False, 0)
+        self._update_apply_state()
+
+    def _snapshot_ui(self) -> dict:
+        return {
+            "face": self.face_switch.get_active(),
+            "pin": self.pin_switch.get_active(),
+            "sudo": self.sudo_switch.get_active(),
+            "reauth_every": self.reauth.get_active_id() == "always",
+            "attention": self.attention_switch.get_active(),
+            "attention_interval": int(self.attention_interval.get_active_id()),
+            "attention_ac_only": self.attention_ac_switch.get_active(),
+        }
+
+    def _compute_ops(self, ui: dict, base: dict) -> list:
+        """The `applockerd` subcommands needed to turn `base` into `ui`."""
+        ops = []
+        if ui["face"] != base["face"]:
+            ops.append(["set-face", "on" if ui["face"] else "off"])
+        if ui["pin"] != base["pin"] or ui["sudo"] != base["sudo"]:
+            val = ("both" if ui["pin"] and ui["sudo"]
+                   else ("pin" if ui["pin"] else "sudo"))
+            ops.append(["set-fallback", val])
+        if ui["reauth_every"] != base["reauth_every"]:
+            ops.append(["set-reauth", "always" if ui["reauth_every"] else "session"])
+        if ui["attention"] != base["attention"]:
+            ops.append(["set-attention", "on" if ui["attention"] else "off"])
+        if ui["attention_interval"] != base["attention_interval"]:
+            ops.append(["set-attention-interval", str(ui["attention_interval"])])
+        if ui["attention_ac_only"] != base["attention_ac_only"]:
+            ops.append(["set-attention-ac-only",
+                        "on" if ui["attention_ac_only"] else "off"])
+        return ops
+
+    def _update_apply_state(self):
+        dirty = bool(self._compute_ops(self._snapshot_ui(), self._persisted))
+        self.apply_btn.set_sensitive(dirty)
+        self.revert_btn.set_sensitive(dirty)
+        self.dirty_label.set_text("Unsaved changes" if dirty else "")
+
+    def _reset_controls(self):
+        """Snap every control back to the persisted values, silently."""
+        self._loading = True
+        p = self._persisted
+        self.face_switch.set_active(p["face"])
+        self.pin_switch.set_active(p["pin"])
+        self.sudo_switch.set_active(p["sudo"])
+        self.reauth.set_active_id("always" if p["reauth_every"] else "session")
+        self.attention_switch.set_active(p["attention"])
+        self.attention_interval.set_active_id(str(p["attention_interval"]))
+        self.attention_ac_switch.set_active(p["attention_ac_only"])
+        self._loading = False
+
+    def _apply(self, _btn=None):
+        ui = self._snapshot_ui()
+        ops = self._compute_ops(ui, self._persisted)
+        if not ops:
+            return
+        started_attention = ui["attention"] and not self._persisted["attention"]
+        if run_privileged_batch(ops):
+            self._persisted = read_config()
+            self._reset_controls()  # resync to what actually saved
+            self._update_apply_state()
+            self._toast("Changes applied.")
+            if started_attention:
+                # Launch the watcher now; the autostart entry covers later logins.
+                spawn([sys.executable, script_path("watch_presence.py")])
+        else:
+            # Cancelled or failed → the UI must not keep showing the change.
+            self._revert()
+            self._toast("Changes not applied.")
+
+    def _revert(self, _btn=None):
+        self._reset_controls()
+        self._update_apply_state()
+
     # -- handlers ------------------------------------------------------------
 
-    def _on_face_toggled(self, switch, _param):
-        run_privileged(["set-face", "on" if switch.get_active() else "off"])
-
-    def _on_attention_toggled(self, switch, _param):
-        on = switch.get_active()
-        run_privileged(["set-attention", "on" if on else "off"])
-        if on:
-            # Start the watcher in this session right away; on later logins the
-            # autostart entry (packaging step) will do it.
-            spawn([sys.executable, script_path("watch_presence.py")])
-
-    def _on_attention_interval_changed(self, combo):
-        run_privileged(["set-attention-interval", combo.get_active_id()])
-
-    def _on_attention_ac_toggled(self, switch, _param):
-        run_privileged(["set-attention-ac-only",
-                        "on" if switch.get_active() else "off"])
+    def _on_policy_changed(self, *_args):
+        if self._loading:
+            return
+        self._update_apply_state()
 
     def _on_fallback_toggled(self, switch, _param, which):
-        pin = self.pin_switch.get_active()
-        sudo = self.sudo_switch.get_active()
-        if not pin and not sudo:
+        if self._loading:
+            return
+        if not self.pin_switch.get_active() and not self.sudo_switch.get_active():
             # Enforce the invariant: bounce the just-turned-off switch back on.
+            self._loading = True
             switch.set_active(True)
+            self._loading = False
             self._toast("At least one alternative must stay enabled.")
             return
-        value = "both" if pin and sudo else ("pin" if pin else "sudo")
-        run_privileged(["set-fallback", value])
-
-    def _on_reauth_changed(self, combo):
-        run_privileged(["set-reauth", combo.get_active_id()])
+        self._update_apply_state()
 
     def _on_add_app(self, _btn):
         AppPicker(self, self._add_app)

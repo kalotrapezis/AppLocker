@@ -156,10 +156,17 @@ backend and cadence). **The camera light should be OFF except during a check.**
       button reflects reality; clicking it starts/stops the gate (pkexec) and the
       label flips within ~3s. From the repo (no unit) it reads "not installed".
 - [ ] Theme matches Mint-Y (dark/light + accent) — native GTK widgets.
-- [ ] Face / PIN / sudo / re-auth / attention controls reflect the config and
-      writing them updates `/etc/applocker/config`.
+- [ ] Face / PIN / sudo / re-auth / attention controls reflect the config.
+- [ ] **Staged apply:** toggling a policy control shows "Unsaved changes" and
+      enables **Apply**/​**Revert** but does NOT prompt yet. **Apply** prompts
+      **once** for the whole batch and writes `/etc/applocker/config`.
+- [ ] **Cancel:** cancelling the Apply prompt leaves the config unchanged AND
+      snaps the controls back (no stale "on" left showing). **Revert** does the
+      same without prompting.
 - [ ] Fallback invariant: turning off both PIN and sudo bounces one back on with
-      a toast.
+      a toast (before Apply).
+- [ ] (Pending) Apply still uses the sudo/PIN prompt, not face — face-auth for
+      settings is the follow-up (daemon IPC).
 - [ ] Add / delete face profiles (up to 5) works; list shows names + counts.
 
 ## 7. sudo PAM tier  ⚠️ LOCKOUT RISK
