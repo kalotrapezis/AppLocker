@@ -1,0 +1,110 @@
+#!/bin/sh
+# applocker-pam — enable/disable pam_applocker in a PAM stack, safely.
+#
+# Adds `auth sufficient pam_applocker.so` as the FIRST auth rule of a stack, so
+# a face match can *add* a way in but never removes the password fallback.
+# Every edit backs the file up to <file>.applocker.bak first, and `disable`
+# removes only our line — so a mistake is always reversible.
+#
+#   sudo applocker-pam enable  sudo|screensaver|lightdm|all
+#   sudo applocker-pam disable sudo|screensaver|lightdm|all
+#   sudo applocker-pam status
+#
+# ⚠️  Before enabling `lightdm`, open a root shell on a TTY (Ctrl-Alt-F3) so a
+#     bad edit can be undone without a rescue disk. Enable `sudo` first.
+
+set -eu
+
+MODULE="pam_applocker.so"
+LINE="auth	sufficient	${MODULE}"
+
+file_for() {
+	case "$1" in
+	sudo)        echo /etc/pam.d/sudo ;;
+	screensaver) echo /etc/pam.d/cinnamon-screensaver ;;
+	lightdm)     echo /etc/pam.d/lightdm ;;
+	*)           echo "" ;;
+	esac
+}
+
+need_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		echo "applocker-pam: must run as root (use sudo)" >&2
+		exit 1
+	fi
+}
+
+enable_one() {
+	tier="$1"
+	f="$(file_for "$tier")"
+	if [ -z "$f" ]; then echo "unknown tier: $tier" >&2; return 1; fi
+	if [ ! -f "$f" ]; then echo "skip $tier: $f not found" >&2; return 0; fi
+	if grep -q "$MODULE" "$f"; then
+		echo "$tier: already enabled ($f)"; return 0
+	fi
+	cp -n "$f" "$f.applocker.bak"
+	# Insert our rule before the first non-comment, non-blank line so it is the
+	# first auth rule the stack evaluates.
+	awk -v line="$LINE" '
+		BEGIN { done = 0 }
+		done == 0 && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*$/ {
+			print line; done = 1
+		}
+		{ print }
+		END { if (done == 0) print line }
+	' "$f" > "$f.applocker.tmp"
+	cat "$f.applocker.tmp" > "$f"        # preserve owner/mode of $f
+	rm -f "$f.applocker.tmp"
+	echo "$tier: enabled ($f; backup at $f.applocker.bak)"
+}
+
+disable_one() {
+	tier="$1"
+	f="$(file_for "$tier")"
+	if [ -z "$f" ]; then echo "unknown tier: $tier" >&2; return 1; fi
+	if [ ! -f "$f" ]; then echo "skip $tier: $f not found" >&2; return 0; fi
+	if ! grep -q "$MODULE" "$f"; then
+		echo "$tier: not enabled"; return 0
+	fi
+	cp -n "$f" "$f.applocker.bak" 2>/dev/null || true
+	grep -v "$MODULE" "$f" > "$f.applocker.tmp"
+	cat "$f.applocker.tmp" > "$f"
+	rm -f "$f.applocker.tmp"
+	echo "$tier: disabled ($f)"
+}
+
+status() {
+	for tier in sudo screensaver lightdm; do
+		f="$(file_for "$tier")"
+		if [ ! -f "$f" ]; then
+			printf '%-12s %s\n' "$tier" "(no $f)"
+		elif grep -q "$MODULE" "$f"; then
+			printf '%-12s %s\n' "$tier" "ENABLED"
+		else
+			printf '%-12s %s\n' "$tier" "off"
+		fi
+	done
+}
+
+expand() { # "all" → the three tiers
+	if [ "$1" = "all" ]; then echo "sudo screensaver lightdm"; else echo "$1"; fi
+}
+
+cmd="${1:-}"
+case "$cmd" in
+enable)
+	need_root
+	[ $# -ge 2 ] || { echo "usage: applocker-pam enable sudo|screensaver|lightdm|all" >&2; exit 2; }
+	for t in $(expand "$2"); do enable_one "$t"; done
+	echo "Test in a NEW terminal/session before closing your root shell." ;;
+disable)
+	need_root
+	[ $# -ge 2 ] || { echo "usage: applocker-pam disable sudo|screensaver|lightdm|all" >&2; exit 2; }
+	for t in $(expand "$2"); do disable_one "$t"; done ;;
+status)
+	status ;;
+*)
+	echo "usage: applocker-pam enable|disable sudo|screensaver|lightdm|all" >&2
+	echo "       applocker-pam status" >&2
+	exit 2 ;;
+esac

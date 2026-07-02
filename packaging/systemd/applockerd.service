@@ -1,0 +1,20 @@
+[Unit]
+Description=AppLocker exec/file gate (fanotify)
+Documentation=file:/usr/share/doc/applocker/README.md
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/applocker/applockerd gate
+Restart=on-failure
+RestartSec=2
+
+# NOTE: the gate spawns a GTK auth prompt, which needs a user session's DISPLAY.
+# As a bare system service it has none yet (known gap — see the top-level README),
+# so this unit is installed *disabled*. For now run the gate inside your session
+# (`sudo applockerd`). To use the service, point it at your session first:
+#   Environment=DISPLAY=:0
+#   Environment=XAUTHORITY=/home/YOU/.Xauthority
+
+[Install]
+WantedBy=multi-user.target

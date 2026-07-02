@@ -148,34 +148,47 @@ backend and cadence). **The camera light should be OFF except during a check.**
 Escape hatch: **keep a root shell open** (`sudo -s` in another terminal) the
 whole time, so you can undo the PAM edit.
 
-- [ ] Build & place: `cd pam && cargo build --release`, then copy
-      `libpam_applocker.so` to the security dir and `face/*.py` to
-      `/usr/lib/applocker/` (see [pam/README.md](pam/README.md)).
+The `applocker-pam` helper (installed by the .deb) does the edits safely —
+backs each file up to `<file>.applocker.bak`, inserts our rule as the first auth
+rule, and `disable` removes only our line. From the repo without the package,
+see [pam/README.md](pam/README.md) for the manual edit.
+
 - [ ] `python3 face/recognize.py` passes with liveness first (step 2).
-- [ ] Add `auth sufficient pam_applocker.so` as the **first** auth line of
-      `/etc/pam.d/sudo`.
+- [ ] `sudo applocker-pam enable sudo` → prints "enabled" + backup path.
+      `sudo applocker-pam status` shows `sudo ENABLED`.
 - [ ] In a **new** terminal, `sudo true` → face challenge; on success no
       password; on failure/timeout → falls through to the password prompt.
 - [ ] Wrong face / photo → falls through to password (never a hard deny).
-- [ ] Remove the line from the root shell → `sudo` back to password-only.
+- [ ] `sudo applocker-pam disable sudo` → `sudo` back to password-only.
 
 ## 8. Screensaver PAM tier  ⚠️
 
-- [ ] Add the same line first in `/etc/pam.d/cinnamon-screensaver` (optionally
-      with `ui` for the guided window).
+- [ ] `sudo applocker-pam enable screensaver`.
 - [ ] Lock the screen, unlock → face challenge or password fallback.
-- [ ] If it misbehaves, switch to a TTY (Ctrl-Alt-F3) and remove the line — your
-      session is still alive.
+- [ ] If it misbehaves, switch to a TTY (Ctrl-Alt-F3) and
+      `sudo applocker-pam disable screensaver` — your session is still alive.
 
 ## 9. LightDM login PAM tier  ⚠️ HIGHEST RISK
 
-- [ ] **Before** logging out, log a root shell into a TTY (Ctrl-Alt-F3) so a bad
-      line can be removed without a rescue disk.
-- [ ] Add the same line first in `/etc/pam.d/lightdm`.
+- [ ] **Before** enabling, log a root shell into a TTY (Ctrl-Alt-F3) so a bad
+      edit can be undone without a rescue disk.
+- [ ] `sudo applocker-pam enable lightdm`.
 - [ ] Log out → at the greeter, face challenge unlocks, or the password still
       works as fallback.
-- [ ] Break-glass rehearsal: from the TTY root shell, remove the line and
-      confirm normal login returns.
+- [ ] Break-glass rehearsal: from the TTY root shell,
+      `sudo applocker-pam disable lightdm` and confirm normal login returns.
+
+## 10. Packaging (.deb)
+
+- [ ] `packaging/build-deb.sh` → `dist/applocker_<ver>_<arch>.deb`, no errors.
+- [ ] `sudo apt install ./dist/applocker_*.deb` → installs, pulls deps.
+- [ ] `which applockerd` → `/usr/bin/applockerd` (symlink resolves); `applockerd
+      config` runs.
+- [ ] AppLocker appears in the applications menu; launching it opens the GUI
+      (auth-gated).
+- [ ] Log out/in → the presence watcher autostarts (only acts if attention is on).
+- [ ] `sudo apt remove applocker` → clean removal; if any PAM tier was still
+      enabled, the postrm warns to run `applocker-pam disable all` first.
 
 ---
 
@@ -184,5 +197,3 @@ whole time, so you can undo the PAM edit.
 - [ ] **Snap gating** — locking a snap app is stored but not enforced yet.
       Expected: no gate, with a note. (flatpak now works — see 3a)
 - [ ] **Adaptive brightness** — no brightness control yet. (task #5, bonus)
-- [ ] **Autostart** — the watcher does not auto-start on login until packaging
-      adds the `.desktop` autostart entry. (task #6)

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AppLocker
+GenericName=App & folder lock settings
+Comment=Lock apps and folders behind face / PIN / sudo, and manage face unlock
+Exec=python3 /usr/lib/applocker/settings.py
+Icon=system-lock-screen
+Terminal=false
+Categories=Settings;Security;
+Keywords=lock;face;privacy;applocker;

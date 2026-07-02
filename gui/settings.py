@@ -51,6 +51,17 @@ def bin_path() -> str:
     return "applockerd"  # rely on PATH (installed layout)
 
 
+def script_path(name: str) -> str:
+    """Locate a bundled helper script whether we're running from the repo
+    (gui/ next to face/) or the installed flat layout (/usr/lib/applocker/)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, name),               # installed: flat
+                 os.path.join(here, "..", "face", name)):  # repo: ../face
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(here, name)
+
+
 def cfg_path(env: str, default: str) -> str:
     return os.environ.get(env, default)
 
@@ -442,9 +453,7 @@ class SettingsWindow(Gtk.Window):
         if on:
             # Start the watcher in this session right away; on later logins the
             # autostart entry (packaging step) will do it.
-            here = os.path.dirname(os.path.abspath(__file__))
-            spawn([sys.executable,
-                   os.path.join(here, "..", "face", "watch_presence.py")])
+            spawn([sys.executable, script_path("watch_presence.py")])
 
     def _on_attention_interval_changed(self, combo):
         run_privileged(["set-attention-interval", combo.get_active_id()])
