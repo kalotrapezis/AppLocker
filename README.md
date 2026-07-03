@@ -1,11 +1,34 @@
 # AppLocker
 
-Android-style app & folder locking for Linux Mint (Cinnamon), with face unlock
-on a plain webcam. Lock chosen apps and folders behind a face scan, a PIN, or
-your sudo password — checked *before* the app is allowed to launch.
+Android-style app & folder locking for Linux, with face unlock on a plain
+webcam. Lock chosen apps and folders behind a face scan, a PIN, or your sudo
+password — checked *before* the app is allowed to launch.
 
-Built for Linux Mint / Cinnamon first, with a planned port to Kubuntu / KDE.
-The portability rule below is what makes that port cheap.
+> ## ⚠️ Alpha — expect breakage
+>
+> Early and under active development. Currently targets **Kubuntu / KDE Plasma /
+> Wayland** (originally built for Linux Mint / Cinnamon; the Wayland port is
+> recent). This is **not** ready to be your real security tool yet.
+>
+> **Works today (all userspace, no risk to the OS):**
+> - 🔐 **Encrypted "Private folder"** — a `gocryptfs` vault. Locked = an empty,
+>   encrypted folder; unlocked = your files. Needs no root and cannot freeze the
+>   system.
+> - 📷 Face **enrollment & recognition** (YuNet + SFace on a plain webcam) with a
+>   liveness challenge, plus PIN / sudo-password fallback.
+> - 🗂️ Locking **configuration** for `.deb`, Flatpak and AppImage apps.
+>
+> **Deferred / off by default:**
+> - The **system-wide app-launch gate** (fanotify) is **disabled in the packaged
+>   build** — an earlier version could freeze the whole machine, so enforcement
+>   is being rebuilt to be safe. Locks you set are *recorded but not yet
+>   enforced*; test it only via the dev sandbox (`applocker-test-scope`).
+> - Login / screensaver / `sudo` **PAM** integration is parked.
+>
+> If you're trying it out: the encrypted vault and face enrollment are the solid
+> parts; everything else is a work in progress. See [`TESTS.md`](TESTS.md).
+
+The portability rule below is what keeps the KDE/Wayland work cheap.
 
 ## Threat model (read this first)
 
