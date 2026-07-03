@@ -66,14 +66,21 @@ install -m 0755 "$REPO/packaging/bin/applocker-test-scope" "$STAGE/usr/bin/applo
 # DEV MODE marker: while this file exists the daemon refuses to gate all of / (so
 # the app-gate can't freeze the machine); the app-gate only runs when explicitly
 # scoped to a sandbox mount. Remove it to allow the real system-wide gate.
-cat > "$STAGE/etc/applocker/dev-mode" <<'EOF'
+#
+# Set APPLOCKER_RELEASE=1 to build a REAL-GATE package (no marker) — for a VM,
+# never the host.  e.g.  APPLOCKER_RELEASE=1 packaging/build-deb.sh vm1
+if [ "${APPLOCKER_RELEASE:-}" = "1" ]; then
+	echo "==> RELEASE build: system-wide gate ENABLED (no dev-mode marker) — VM only!"
+else
+	cat > "$STAGE/etc/applocker/dev-mode" <<'EOF'
 AppLocker dev mode. While this file exists, `applockerd gate` will NOT mark the
 whole filesystem (the input-freeze is impossible). Test the app-gate safely with
-  sudo applocker-test-scope up && eval "$(applocker-test-scope env)"
-  sudo -E applockerd lockme
+  sudo applocker-test-scope up
+  sudo applocker-test-scope gate
 Delete this file to enable the real, system-wide gate.
 EOF
-chmod 0644 "$STAGE/etc/applocker/dev-mode"
+	chmod 0644 "$STAGE/etc/applocker/dev-mode"
+fi
 
 # System integration (service ships disabled; autostart is per-user & self-gating).
 install -m 0644 "$REPO/packaging/systemd/applockerd.service" "$STAGE/lib/systemd/system/"
@@ -101,9 +108,37 @@ Description: Android-style app & folder locking for Linux, with face unlock
  Threat model is casual local access, not high security.
 EOF
 
-# postinst — DEV MODE build: no PAM edits, no service enabled, and the gate is
-# barred from marking all of / (see /etc/applocker/dev-mode). Nothing here can
-# freeze the machine or survive a reboot on its own.
+# postinst — no PAM edits, no service auto-enabled. The dev build additionally
+# bars the gate from marking all of / (via /etc/applocker/dev-mode).
+if [ "${APPLOCKER_RELEASE:-}" = "1" ]; then
+cat > "$STAGE/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+cat <<'MSG'
+
+AppLocker installed — RELEASE build (real system-wide gate, exec-only).
+*** Intended for a throwaway VM. *** Enforcement is OFF until you enable it.
+
+  1. Enroll + set a PIN:
+       python3 /usr/lib/applocker/welcome.py
+       sudo applockerd set-pin
+  2. Lock an app (deb / flatpak / AppImage) from Settings, or:
+       sudo applockerd lock-app "<name>"
+  3. Turn the gate ON (starts enforcing app launches):
+       sudo applocker on
+     Check with `applocker status`; undo with `sudo applocker off`.
+
+The gate is exec-only (folders use encrypted vaults, not fanotify). If a launch
+ever hangs, the fail-open watchdog allows it after APPLOCKER_GATE_TIMEOUT (30s).
+See /usr/share/doc/applocker/TESTS.md.
+
+MSG
+exit 0
+EOF
+else
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
@@ -134,6 +169,7 @@ the real gate. See /usr/share/doc/applocker/TESTS.md.
 MSG
 exit 0
 EOF
+fi
 
 # prerm — turn off the service if the admin enabled it.
 cat > "$STAGE/DEBIAN/prerm" <<'EOF'
@@ -163,7 +199,9 @@ EOF
 
 # Track the dev-mode marker as a conffile so deleting it (to enable the real
 # gate) is remembered across upgrades instead of being silently restored.
-printf '/etc/applocker/dev-mode\n' > "$STAGE/DEBIAN/conffiles"
+if [ "${APPLOCKER_RELEASE:-}" != "1" ]; then
+	printf '/etc/applocker/dev-mode\n' > "$STAGE/DEBIAN/conffiles"
+fi
 
 chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm" "$STAGE/DEBIAN/postrm"
 

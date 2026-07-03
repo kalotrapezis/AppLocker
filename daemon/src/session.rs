@@ -31,7 +31,12 @@ pub struct SessionCtx {
     pub gid: u32,
     pub user: String,
     pub home: PathBuf,
-    pub display: String,
+    /// X11 / XWayland `$DISPLAY` (e.g. `:0`), if the session has one. Empty on a
+    /// pure-Wayland session, which is why it's optional now.
+    pub display: Option<String>,
+    /// Wayland `$WAYLAND_DISPLAY` (e.g. `wayland-0`). This is how GTK reaches a
+    /// KDE/Wayland compositor — the missing piece for the SDDM/Wayland port.
+    pub wayland_display: Option<String>,
     pub xauthority: Option<String>,
     pub xdg_runtime_dir: String,
 }
@@ -58,10 +63,14 @@ impl SessionCtx {
         let (uid, display0) = active_session()?;
         let (user, gid, home) = passwd(uid)?;
         let env = scan_environ(uid);
-        let display = env
-            .as_ref()
-            .and_then(|e| e.display.clone())
-            .or(display0)?;
+        let display = env.as_ref().and_then(|e| e.display.clone()).or(display0);
+        let wayland_display = env.as_ref().and_then(|e| e.wayland.clone());
+        // Need at least one path to the display server to show the prompt: X11
+        // ($DISPLAY) or Wayland ($WAYLAND_DISPLAY). A pure-Wayland session has
+        // only the latter.
+        if display.is_none() && wayland_display.is_none() {
+            return None;
+        }
         let xauthority = env.as_ref().and_then(|e| e.xauthority.clone()).or_else(|| {
             let p = home.join(".Xauthority");
             p.is_file().then(|| p.to_string_lossy().into_owned())
@@ -76,6 +85,7 @@ impl SessionCtx {
             user,
             home,
             display,
+            wayland_display,
             xauthority,
             xdg_runtime_dir,
         })
@@ -87,12 +97,20 @@ impl SessionCtx {
         cmd.env("HOME", &self.home)
             .env("USER", &self.user)
             .env("LOGNAME", &self.user)
-            .env("DISPLAY", &self.display)
             .env("XDG_RUNTIME_DIR", &self.xdg_runtime_dir)
             .env(
                 "PATH",
                 "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             );
+        // Give the child whatever the session actually has. GTK auto-selects its
+        // backend, so on Wayland WAYLAND_DISPLAY is enough; on X11 DISPLAY +
+        // XAUTHORITY. We deliberately don't force GDK_BACKEND.
+        if let Some(d) = &self.display {
+            cmd.env("DISPLAY", d);
+        }
+        if let Some(w) = &self.wayland_display {
+            cmd.env("WAYLAND_DISPLAY", w);
+        }
         if let Some(xauth) = &self.xauthority {
             cmd.env("XAUTHORITY", xauth);
         }
@@ -196,13 +214,15 @@ fn passwd(uid: u32) -> Option<(String, u32, PathBuf)> {
 
 struct Env {
     display: Option<String>,
+    wayland: Option<String>,
     xauthority: Option<String>,
     xdg: Option<String>,
 }
 
-/// Read `DISPLAY`/`XAUTHORITY`/`XDG_RUNTIME_DIR` from a live process owned by
-/// `uid` (authoritative for the real Xauthority the session uses). Prefers a
-/// process that has both DISPLAY and XAUTHORITY set.
+/// Read `DISPLAY`/`WAYLAND_DISPLAY`/`XAUTHORITY`/`XDG_RUNTIME_DIR` from a live
+/// process owned by `uid` (authoritative for the session's real display access).
+/// Prefers a fully-formed session env: Wayland (has `WAYLAND_DISPLAY`) or X11
+/// with its cookie (`DISPLAY` + `XAUTHORITY`).
 fn scan_environ(uid: u32) -> Option<Env> {
     let mut best: Option<Env> = None;
     for e in fs::read_dir("/proc").ok()?.flatten() {
@@ -216,11 +236,13 @@ fn scan_environ(uid: u32) -> Option<Env> {
         let Ok(data) = fs::read(format!("/proc/{pid}/environ")) else {
             continue;
         };
-        let mut env = Env { display: None, xauthority: None, xdg: None };
+        let mut env = Env { display: None, wayland: None, xauthority: None, xdg: None };
         for kv in data.split(|&b| b == 0) {
             if let Ok(s) = std::str::from_utf8(kv) {
                 if let Some(v) = s.strip_prefix("DISPLAY=") {
                     env.display = Some(v.to_string());
+                } else if let Some(v) = s.strip_prefix("WAYLAND_DISPLAY=") {
+                    env.wayland = Some(v.to_string());
                 } else if let Some(v) = s.strip_prefix("XAUTHORITY=") {
                     env.xauthority = Some(v.to_string());
                 } else if let Some(v) = s.strip_prefix("XDG_RUNTIME_DIR=") {
@@ -228,11 +250,12 @@ fn scan_environ(uid: u32) -> Option<Env> {
                 }
             }
         }
-        if env.display.is_some() {
-            if env.xauthority.is_some() {
-                return Some(env); // best case — take it
+        if env.display.is_some() || env.wayland.is_some() {
+            // Take a well-formed one immediately; otherwise keep as a fallback.
+            if env.wayland.is_some() || env.xauthority.is_some() {
+                return Some(env);
             }
-            best = Some(env); // keep looking for one with XAUTHORITY
+            best = Some(env);
         }
     }
     best

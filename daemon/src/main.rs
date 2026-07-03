@@ -38,11 +38,13 @@
 //! **test scope** (`$APPLOCKER_GATE_SCOPE`) marks a single mount instead of all
 //! of `/`, so gate bugs can't wedge the whole machine while developing.
 //!
-//! Still NOT here (later steps): multi-mount marks, D-Bus. Known production gap:
-//! with the file-gate on (a locked folder), the event-loop thread's own config
-//! reads (`policy::load_default`, SIGHUP list reloads) can self-deadlock under a
-//! whole-`/` mark — fine in test scope (confined), must be fixed before the
-//! system-wide file-gate ships. This is step 2, not the finished product.
+//! The gate is now **exec-only** — it never marks `FAN_OPEN_PERM`. That
+//! whole-`/` *open* gate used to intercept every file open, including the
+//! event-loop thread's own config reads, which could self-deadlock and freeze
+//! the machine. Files are protected by encrypted vaults (`vault.py`) instead.
+//!
+//! Still NOT here (later steps): multi-mount marks, D-Bus. Real system-wide
+//! enforcement (`applocker on`) is validated in a throwaway VM, not the host.
 
 use std::ffi::CString;
 use std::fs;
@@ -277,10 +279,12 @@ fn cmd_session_probe() {
             println!("active session found:");
             println!("  user:            {} (uid {}, gid {})", c.user, c.uid, c.gid);
             println!("  home:            {}", c.home.display());
-            println!("  DISPLAY:         {}", c.display);
+            println!("  DISPLAY:         {}", c.display.as_deref().unwrap_or("(none — Wayland?)"));
+            println!("  WAYLAND_DISPLAY: {}", c.wayland_display.as_deref().unwrap_or("(none)"));
             println!("  XAUTHORITY:      {}", c.xauthority.as_deref().unwrap_or("(none found)"));
             println!("  XDG_RUNTIME_DIR: {}", c.xdg_runtime_dir);
-            println!("\nGUI prompts + the camera recognizer will run as this user.");
+            let kind = if c.wayland_display.is_some() { "Wayland" } else { "X11" };
+            println!("\nGUI prompts + the camera recognizer will run as this user ({kind}).");
         }
         None => println!(
             "no active graphical session found — prompts would inherit the daemon's \
@@ -720,12 +724,17 @@ fn cmd_gate(adhoc: Option<String>) {
     if let Some(name) = adhoc {
         apps.add(LockedApp { kind: AppKind::Native, key: name.clone(), name });
     }
-    let folders = FolderList::load(&folderlist::default_path());
+    // Folder locking is handled by encrypted vaults (vault.py), NOT fanotify, so
+    // we keep an empty folder list — the file-gate is never engaged.
+    let folders = FolderList::default();
     let n_apps = apps.apps.len();
-    let n_folders = folders.folders.len();
-    let gate_files = !folders.is_empty();
-    if n_apps == 0 && n_folders == 0 {
-        eprintln!("applockerd: nothing locked yet — add with lock-app / lock-folder.");
+    let legacy_folders = FolderList::load(&folderlist::default_path()).folders.len();
+    if legacy_folders > 0 {
+        eprintln!("applockerd: note: {legacy_folders} legacy locked-folder(s) IGNORED — \
+                   folder locking now uses encrypted vaults (vault.py / Settings).");
+    }
+    if n_apps == 0 {
+        eprintln!("applockerd: no apps locked yet — add with lock-app.");
     }
     let locks = Arc::new(RwLock::new(Locks { apps, folders }));
 
@@ -734,13 +743,11 @@ fn cmd_gate(adhoc: Option<String>) {
         process::exit(1);
     });
 
-    // Always gate execs (app-gate). Add file opens (file-gate) only when folders
-    // are locked — FAN_OPEN_PERM on the whole fs intercepts *every* open, so we
-    // don't pay that cost unless the user is actually locking folders.
-    let mut mask = FAN_OPEN_EXEC_PERM;
-    if gate_files {
-        mask |= FAN_OPEN_PERM;
-    }
+    // Exec-only gate. We never mark FAN_OPEN_PERM: that whole-filesystem *open*
+    // gate intercepted EVERY file open — including the daemon's own config reads
+    // on this very event-loop thread — which could self-deadlock and freeze the
+    // machine. Files are protected by encrypted vaults instead.
+    let mask = FAN_OPEN_EXEC_PERM;
     // Test scope (a single mount) if $APPLOCKER_GATE_SCOPE is set, else all of /.
     let mark = gate_scope().unwrap_or(MarkSpec { path: "/".into(), filesystem: true });
     // Dev mode: refuse to gate the whole filesystem. This makes the input-freeze
@@ -767,13 +774,10 @@ fn cmd_gate(adhoc: Option<String>) {
 
     let fail_open = fail_open_timeout();
     if mark.filesystem {
-        eprintln!("applockerd: gating {n_apps} app(s) + {n_folders} folder(s) on / (WHOLE SYSTEM).");
+        eprintln!("applockerd: gating {n_apps} app(s) on / (WHOLE SYSTEM, exec-only).");
     } else {
         eprintln!("applockerd: *** TEST SCOPE *** gating only the '{}' mount — the rest of", mark.path);
-        eprintln!("applockerd: the system is NOT gated and cannot freeze. {n_apps} app(s), {n_folders} folder(s).");
-    }
-    if gate_files {
-        eprintln!("applockerd: file-gate ON — every file open (in scope) is checked (may add latency).");
+        eprintln!("applockerd: the system is NOT gated and cannot freeze. {n_apps} app(s).");
     }
     match fail_open {
         Some(d) => eprintln!("applockerd: fail-open watchdog: auth hangs auto-ALLOW after {}s.", d.as_secs()),
@@ -793,7 +797,7 @@ fn cmd_gate(adhoc: Option<String>) {
     // funnel through logind, so this one listener covers them all.
     spawn_lock_listener(Arc::clone(&cache));
 
-    event_loop(fan_fd, mark, locks, cache, write_lock, fail_open);
+    event_loop(fan_fd, locks, cache, write_lock, fail_open);
 }
 
 /// Watch logind for `Session.Lock` / `PrepareForSleep(true)` signals and wipe
@@ -870,7 +874,6 @@ fn mark_scope(fan_fd: RawFd, spec: &MarkSpec, mask: u64) -> std::io::Result<()> 
 
 fn event_loop(
     fan_fd: RawFd,
-    mark: MarkSpec,
     locks: Arc<RwLock<Locks>>,
     cache: Arc<UnlockCache>,
     write_lock: Arc<Mutex<()>>,
@@ -883,17 +886,10 @@ fn event_loop(
         // Apply a pending SIGHUP reload before blocking again.
         if RELOAD_LOCKS.swap(false, Ordering::SeqCst) {
             let apps = LockList::load(&locklist::default_path());
-            let folders = FolderList::load(&folderlist::default_path());
-            let (na, nf) = (apps.apps.len(), folders.folders.len());
-            // If folders are now locked, make sure the file-gate mark is present
-            // (FAN_MARK_ADD is idempotent). This lets the first locked folder take
-            // effect live, without a restart. Fully *disabling* the file-gate
-            // still needs a restart — we leave the mark rather than churn it.
-            if !folders.is_empty() {
-                let _ = mark_scope(fan_fd, &mark, FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM);
-            }
-            *locks.write().unwrap() = Locks { apps, folders };
-            eprintln!("applockerd: reloaded lists ({na} app(s), {nf} folder(s)).");
+            let na = apps.apps.len();
+            // Exec-only: never (re-)mark FAN_OPEN_PERM. Folders use vaults.
+            *locks.write().unwrap() = Locks { apps, folders: FolderList::default() };
+            eprintln!("applockerd: reloaded locked apps ({na}).");
         }
 
         let len = unsafe {
