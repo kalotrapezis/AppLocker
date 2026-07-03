@@ -49,6 +49,37 @@ def script_path(name: str) -> str:
     return os.path.join(here(), name)
 
 
+def bin_path() -> str:
+    """Find the `applockerd` binary: $APPLOCKER_BIN, the installed flat layout,
+    the repo build, or PATH."""
+    env = os.environ.get("APPLOCKER_BIN")
+    if env and os.path.exists(env):
+        return env
+    for cand in (os.path.join(here(), "applockerd"),                               # installed
+                 os.path.join(here(), "..", "daemon", "target", "release", "applockerd")):  # repo
+        if os.path.exists(cand):
+            return cand
+    return "applockerd"  # rely on PATH
+
+
+def set_applocker_pin(sudo_pw: str, pin: str) -> tuple[bool, str]:
+    """Set the AppLocker PIN as root, authorised by the sudo password from the
+    dialog (no pkexec/polkit needed). `sudo -S` consumes the first stdin line as
+    the password; `applockerd set-pin` then reads the two PIN lines that follow."""
+    cmd = ["sudo", "-S", "-p", "", bin_path(), "set-pin"]
+    try:
+        r = subprocess.run(cmd, input=f"{sudo_pw}\n{pin}\n{pin}\n", text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    if r.returncode != 0:
+        out = (r.stdout or "").strip()
+        # sudo's own failure is usually a wrong password.
+        hint = "wrong sudo password?" if "password" in out.lower() or not out else out
+        return False, hint
+    return True, ""
+
+
 def config_home() -> str:
     return os.path.expanduser("~/.config/applocker")
 
@@ -264,8 +295,8 @@ class WelcomeWindow(Gtk.Window):
 
         btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btns.set_halign(Gtk.Align.END)
-        self.skip_btn = Gtk.Button(label="Skip for now")
-        self.skip_btn.connect("clicked", lambda *_: self.close())
+        self.skip_btn = Gtk.Button(label="Skip face — use a PIN")
+        self.skip_btn.connect("clicked", self.on_skip)
         self.primary = Gtk.Button(label="Set up AppLocker")
         self.primary.get_style_context().add_class("suggested-action")
         self.primary.connect("clicked", self.on_primary)
@@ -315,6 +346,13 @@ class WelcomeWindow(Gtk.Window):
         GLib.idle_add(self._on_all_done)
 
     def _on_failed(self, step: Step, msg: str):
+        # Face is optional: if enrollment was skipped/cancelled, offer a PIN
+        # instead of a dead end (this is the "user skips face" path).
+        if step.key == "enroll":
+            self.status.set_markup("<b>No face enrolled.</b> Set a PIN to unlock instead.")
+            if self._pin_dialog():
+                self.finish()
+                return
         self.status.set_markup(
             f"<b>Couldn't finish “{GLib.markup_escape_text(step.title)}”.</b> "
             "Fix the issue and try again.")
@@ -334,6 +372,73 @@ class WelcomeWindow(Gtk.Window):
         write_marker()
         launch_settings()
         self.close()
+
+    # ── skip face → set a PIN instead ─────────────────────────────────────────
+
+    def on_skip(self, _btn):
+        """Face is optional. Skipping it opens the PIN setup so there's still an
+        unlock method (and no camera needed — ideal in a VM). If they set a PIN,
+        we're done; if they cancel it, just close (the sudo password still works
+        as a fallback at the unlock prompt)."""
+        if self._pin_dialog():
+            self.finish()
+        else:
+            self.close()
+
+    def _pin_dialog(self) -> bool:
+        """The 'New PIN setup' dialog: sudo password + PIN + confirm → Apply.
+        Returns True once a PIN is set."""
+        dlg = Gtk.Dialog(title="New PIN setup", transient_for=self, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Apply", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10, border_width=16)
+        dlg.get_content_area().add(grid)
+
+        def row(r, label, placeholder):
+            lbl = Gtk.Label(label=label, xalign=0)
+            e = Gtk.Entry()
+            e.set_visibility(False)
+            e.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+            e.set_placeholder_text(placeholder)
+            e.set_activates_default(True)
+            e.set_hexpand(True)
+            e.set_width_chars(24)
+            grid.attach(lbl, 0, r, 1, 1)
+            grid.attach(e, 1, r, 1, 1)
+            return e
+
+        sudo_e = row(0, "Sudo password", "your login/sudo password")
+        pin_e = row(1, "Set new PIN", "PIN")
+        confirm_e = row(2, "Confirm new PIN", "repeat PIN")
+        err = Gtk.Label(xalign=0)
+        grid.attach(err, 0, 3, 2, 1)
+        dlg.show_all()
+
+        done = False
+        while True:
+            if dlg.run() != Gtk.ResponseType.OK:
+                break
+            sudo_pw, pin, confirm = sudo_e.get_text(), pin_e.get_text(), confirm_e.get_text()
+            if not sudo_pw:
+                err.set_markup("<span foreground='#c0392b'>Enter your sudo password.</span>")
+                continue
+            if not pin:
+                err.set_markup("<span foreground='#c0392b'>PIN can't be empty.</span>")
+                continue
+            if pin != confirm:
+                err.set_markup("<span foreground='#c0392b'>PINs don't match.</span>")
+                continue
+            err.set_markup("<i>Setting PIN…</i>")
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            ok, msg = set_applocker_pin(sudo_pw, pin)
+            if ok:
+                done = True
+                break
+            err.set_markup(f"<span foreground='#c0392b'>Couldn't set PIN — "
+                           f"{GLib.markup_escape_text(msg)}</span>")
+        dlg.destroy()
+        return done
 
 
 # ── completion marker + handoff ──────────────────────────────────────────────
