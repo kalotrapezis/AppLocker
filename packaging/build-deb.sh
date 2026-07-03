@@ -120,20 +120,24 @@ fi
 cat <<'MSG'
 
 AppLocker installed — RELEASE build (real system-wide gate, exec-only).
-*** Intended for a throwaway VM. *** Enforcement is OFF until you enable it.
+*** Intended for a throwaway VM. Snapshot it first. *** Enforcement is OFF
+until you enable it.
 
-  1. Enroll + set a PIN:
-       python3 /usr/lib/applocker/welcome.py
+  1. Set a PIN (no webcam in a VM, so face won't run):
        sudo applockerd set-pin
   2. Lock an app (deb / flatpak / AppImage) from Settings, or:
        sudo applockerd lock-app "<name>"
-  3. Turn the gate ON (starts enforcing app launches):
-       sudo applocker on
-     Check with `applocker status`; undo with `sudo applocker off`.
+  3. Turn the GATE ON — this is JUST the app-launch gate, no PAM:
+       sudo systemctl enable --now applockerd.service
+     Launch the app -> it should prompt for the PIN first.
+     Undo:  sudo systemctl disable --now applockerd.service
 
-The gate is exec-only (folders use encrypted vaults, not fanotify). If a launch
-ever hangs, the fail-open watchdog allows it after APPLOCKER_GATE_TIMEOUT (30s).
-See /usr/share/doc/applocker/TESTS.md.
+The gate is exec-only (folders use encrypted vaults, not fanotify), so it can't
+freeze on file opens. A hung launch fails open after APPLOCKER_GATE_TIMEOUT (30s).
+
+Do NOT run `applocker on` or `applocker-pam` yet: those edit /etc/pam.d (login /
+sudo / screensaver) and can lock you out — that's a separate, later step, done
+only in a VM with a root shell open. See /usr/share/doc/applocker/TESTS.md.
 
 MSG
 exit 0
