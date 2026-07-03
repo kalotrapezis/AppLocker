@@ -97,14 +97,19 @@ pub struct GuiPrompter {
     app_name: String,
     script: PathBuf,
     attempt: u32,
+    /// Whether a real face attempt ran before we fell back to this prompt. Only
+    /// then should the dialog say "Face not recognised"; with face off / not
+    /// enrolled it would be a lie (see gui/auth_prompt.py).
+    face_was_live: bool,
 }
 
 impl GuiPrompter {
-    pub fn new(app_name: &str) -> GuiPrompter {
+    pub fn new(app_name: &str, face_was_live: bool) -> GuiPrompter {
         GuiPrompter {
             app_name: app_name.to_string(),
             script: locate_prompt_script(),
             attempt: 0,
+            face_was_live,
         }
     }
 }
@@ -127,6 +132,9 @@ impl Prompter for GuiPrompter {
             .arg(methods.join(","));
         if self.attempt > 0 {
             cmd.arg("--error").arg("Incorrect — try again.");
+        }
+        if self.face_was_live {
+            cmd.arg("--face-failed");
         }
         self.attempt += 1;
 

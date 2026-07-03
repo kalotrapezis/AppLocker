@@ -3,7 +3,9 @@ Type=Application
 Name=AppLocker
 GenericName=App & folder lock settings
 Comment=Lock apps and folders behind face / PIN / sudo, and manage face unlock
-Exec=python3 /usr/lib/applocker/settings.py
+# welcome.py shows the first-run setup wizard, then hands off to settings.py;
+# on every later launch it detects setup is done and opens settings directly.
+Exec=python3 /usr/lib/applocker/welcome.py
 Icon=system-lock-screen
 Terminal=false
 Categories=Settings;Security;

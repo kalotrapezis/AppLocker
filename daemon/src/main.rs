@@ -32,9 +32,17 @@
 //! prompt is itself an exec, and if we blocked the loop waiting for the prompt
 //! we could never allow that python to start. See ../README.md.
 //!
-//! Still NOT here (later steps): the real face pipeline, the file-gate,
-//! multi-mount marks, logind lock integration + cache wipe, D-Bus, a fail-open
-//! watchdog. This is step 2, not the finished product.
+//! A **fail-open watchdog** (`$APPLOCKER_GATE_TIMEOUT`, default 30s) now bounds
+//! how long a held exec waits on auth: if the recognizer/prompt hangs (busy
+//! camera, no display), the gate ALLOWs rather than freezing that launch. And a
+//! **test scope** (`$APPLOCKER_GATE_SCOPE`) marks a single mount instead of all
+//! of `/`, so gate bugs can't wedge the whole machine while developing.
+//!
+//! Still NOT here (later steps): multi-mount marks, D-Bus. Known production gap:
+//! with the file-gate on (a locked folder), the event-loop thread's own config
+//! reads (`policy::load_default`, SIGHUP list reloads) can self-deadlock under a
+//! whole-`/` mark — fine in test scope (confined), must be fixed before the
+//! system-wide file-gate ships. This is step 2, not the finished product.
 
 use std::ffi::CString;
 use std::fs;
@@ -63,6 +71,105 @@ struct Locks {
     folders: FolderList,
 }
 
+/// Where the fanotify mark is applied. Production gates the whole filesystem
+/// (`FAN_MARK_FILESYSTEM` on `/`); the dev-safe **test scope** gates a single
+/// mount (`FAN_MARK_MOUNT`) so a bug can never freeze anything outside it.
+#[derive(Clone)]
+struct MarkSpec {
+    /// Path to hand to `fanotify_mark`.
+    path: String,
+    /// true → whole filesystem (`/`); false → just this one mount (test scope).
+    filesystem: bool,
+}
+
+/// Resolve the gate scope from `$APPLOCKER_GATE_SCOPE`. When set, the gate marks
+/// only that mount instead of all of `/` — the safe way to test locking without
+/// putting the whole machine behind the blocking permission gate.
+///
+/// The path MUST be its own mount point, or `FAN_MARK_MOUNT` would silently mark
+/// the mount it *sits on* (often `/` — the exact disaster we're avoiding). We
+/// refuse otherwise and tell the user how to make a scratch mount. Bypass the
+/// check (at your own risk) with `APPLOCKER_GATE_FORCE=1`.
+fn gate_scope() -> Option<MarkSpec> {
+    let path = std::env::var("APPLOCKER_GATE_SCOPE").ok().filter(|s| !s.is_empty())?;
+    let forced = std::env::var("APPLOCKER_GATE_FORCE").ok().as_deref() == Some("1");
+    if !forced && !is_mount_point(&path) {
+        eprintln!(
+            "applockerd: APPLOCKER_GATE_SCOPE={path} is not its own mount point.\n\
+             \x20 Marking it would gate the whole mount it sits on (likely /), which is\n\
+             \x20 exactly the freeze we're avoiding. Make it a private mount first:\n\
+             \x20   sudo mkdir -p {path} && sudo mount --bind {path} {path}\n\
+             \x20 (a bind-mount to itself; undone by `sudo umount {path}` or a reboot.)\n\
+             \x20 Or set APPLOCKER_GATE_FORCE=1 to override."
+        );
+        process::exit(1);
+    }
+    Some(MarkSpec { path, filesystem: false })
+}
+
+/// True if `path` is its own mount point. We consult `/proc/self/mountinfo`
+/// rather than comparing `st_dev` with the parent: a **bind-mount to itself**
+/// (how the test sandbox is made) keeps the underlying device number, so the
+/// st_dev trick would wrongly report "not a mount". mountinfo lists every mount
+/// point in field 5, which catches bind mounts correctly.
+fn is_mount_point(path: &str) -> bool {
+    // Canonicalise so "/tmp/applocker-test/" and symlinks compare equal to the
+    // form the kernel records in mountinfo.
+    let want = fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let Ok(mi) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    // Each line: "id parent major:minor root MOUNTPOINT opts...". Field index 4
+    // (0-based) is the mount point, with octal escapes for spaces etc.
+    mi.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .map(unescape_mountinfo)
+            .is_some_and(|mp| mp == want)
+    })
+}
+
+/// mountinfo escapes space/tab/newline/backslash as octal (`\040` etc.).
+fn unescape_mountinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut b = s.bytes();
+    while let Some(c) = b.next() {
+        if c == b'\\' {
+            let digits: Vec<u8> = b.clone().take(3).collect();
+            if digits.len() == 3 && digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                let val = (digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0');
+                out.push(val as char);
+                b.nth(2); // consume the three octal digits
+                continue;
+            }
+        }
+        out.push(c as char);
+    }
+    out
+}
+
+/// Dev mode: when `/etc/applocker/dev-mode` exists (or `$APPLOCKER_DEV=1`), the
+/// gate refuses to mark the whole filesystem, so a bad gate can never freeze the
+/// machine during testing. The dev-mode `.deb` ships this marker.
+fn dev_mode() -> bool {
+    std::env::var("APPLOCKER_DEV").ok().as_deref() == Some("1")
+        || std::path::Path::new("/etc/applocker/dev-mode").exists()
+}
+
+/// Fail-open watchdog: if an auth run doesn't finish within this long, the gate
+/// answers ALLOW and logs it, so a hung recognizer (busy camera, no display)
+/// can't leave an exec blocked forever. `$APPLOCKER_GATE_TIMEOUT` seconds;
+/// default 30; `0` disables (strict deny-until-answered, the old behaviour).
+fn fail_open_timeout() -> Option<Duration> {
+    let secs = std::env::var("APPLOCKER_GATE_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(30);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 // ── fanotify constants ──────────────────────────────────────────────────────
 // Defined locally rather than relying on libc exposing every one of them, so
 // the spike builds against an older libc as long as the *kernel* is new enough.
@@ -71,6 +178,7 @@ const FAN_CLOEXEC: libc::c_uint = 0x0000_0001;
 const FAN_CLASS_CONTENT: libc::c_uint = 0x0000_0004; // required for PERM events
 
 const FAN_MARK_ADD: libc::c_uint = 0x0000_0001;
+const FAN_MARK_MOUNT: libc::c_uint = 0x0000_0010; // gate one mount only (test scope)
 const FAN_MARK_FILESYSTEM: libc::c_uint = 0x0000_0100;
 
 const FAN_OPEN_PERM: u64 = 0x0001_0000; // regular file opens (the file-gate)
@@ -572,7 +680,7 @@ fn cmd_auth_test(app: Option<String>) {
         Feedback::none()
     }));
     let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
-    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app), fb);
+    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app, face_live), fb);
     let fallback = SystemFallback::system();
     let pol = policy::load_default();
 
@@ -633,7 +741,23 @@ fn cmd_gate(adhoc: Option<String>) {
     if gate_files {
         mask |= FAN_OPEN_PERM;
     }
-    if let Err(e) = mark_filesystem(fan_fd, "/", mask) {
+    // Test scope (a single mount) if $APPLOCKER_GATE_SCOPE is set, else all of /.
+    let mark = gate_scope().unwrap_or(MarkSpec { path: "/".into(), filesystem: true });
+    // Dev mode: refuse to gate the whole filesystem. This makes the input-freeze
+    // impossible no matter what starts the gate (`applocker on`, the service) —
+    // the app-gate only runs when explicitly scoped to a sandbox mount. Vaults,
+    // face and the GUI are unaffected. Turn off by deleting /etc/applocker/dev-mode.
+    if dev_mode() && mark.filesystem {
+        eprintln!("applockerd: DEV MODE — not gating all of / (freeze risk); doing nothing.");
+        eprintln!("applockerd: set APPLOCKER_GATE_SCOPE=<a private mount> to test the");
+        eprintln!("applockerd: app-gate safely (see packaging/bin/applocker-test-scope),");
+        eprintln!("applockerd: or remove /etc/applocker/dev-mode to allow the real gate.");
+        // Exit 0, not 1: a clean no-op. Exiting non-zero here made the systemd
+        // service (Restart=on-failure) restart-storm and land in `failed` when
+        // someone started it in dev mode. A clean exit just stops.
+        process::exit(0);
+    }
+    if let Err(e) = mark_scope(fan_fd, &mark, mask) {
         eprintln!("applockerd: fanotify_mark failed: {e}");
         process::exit(1);
     }
@@ -641,9 +765,19 @@ fn cmd_gate(adhoc: Option<String>) {
     // Reload both lists live on SIGHUP (lock-*/unlock-* send it).
     unsafe { libc::signal(libc::SIGHUP, on_sighup as *const () as libc::sighandler_t) };
 
-    eprintln!("applockerd: gating {n_apps} app(s) + {n_folders} folder(s) on /.");
+    let fail_open = fail_open_timeout();
+    if mark.filesystem {
+        eprintln!("applockerd: gating {n_apps} app(s) + {n_folders} folder(s) on / (WHOLE SYSTEM).");
+    } else {
+        eprintln!("applockerd: *** TEST SCOPE *** gating only the '{}' mount — the rest of", mark.path);
+        eprintln!("applockerd: the system is NOT gated and cannot freeze. {n_apps} app(s), {n_folders} folder(s).");
+    }
     if gate_files {
-        eprintln!("applockerd: file-gate ON — every file open is checked (may add latency).");
+        eprintln!("applockerd: file-gate ON — every file open (in scope) is checked (may add latency).");
+    }
+    match fail_open {
+        Some(d) => eprintln!("applockerd: fail-open watchdog: auth hangs auto-ALLOW after {}s.", d.as_secs()),
+        None => eprintln!("applockerd: fail-open watchdog DISABLED — a hung auth blocks that launch forever."),
     }
     eprintln!("applockerd: policy: {}", policy::load_default().summary());
     eprintln!("applockerd: (PIN set: {})", pin::is_set(&auth::default_pin_path()));
@@ -659,7 +793,7 @@ fn cmd_gate(adhoc: Option<String>) {
     // funnel through logind, so this one listener covers them all.
     spawn_lock_listener(Arc::clone(&cache));
 
-    event_loop(fan_fd, locks, cache, write_lock);
+    event_loop(fan_fd, mark, locks, cache, write_lock, fail_open);
 }
 
 /// Watch logind for `Session.Lock` / `PrepareForSleep(true)` signals and wipe
@@ -711,16 +845,18 @@ fn init_fanotify() -> std::io::Result<RawFd> {
     Ok(fd)
 }
 
-fn mark_filesystem(fan_fd: RawFd, path: &str, mask: u64) -> std::io::Result<()> {
+fn mark_scope(fan_fd: RawFd, spec: &MarkSpec, mask: u64) -> std::io::Result<()> {
     // FAN_MARK_FILESYSTEM covers the whole filesystem containing `path`, so any
     // exec (and, if requested, any open) on that fs generates an event. (A
     // separate /home or flatpak store is a different fs and would need its own
-    // mark — noted in README as a known gap.)
-    let c_path = CString::new(path).unwrap();
+    // mark — noted in README as a known gap.) FAN_MARK_MOUNT instead gates just
+    // one mount — the test scope, so a bug can't freeze the rest of the machine.
+    let flag = if spec.filesystem { FAN_MARK_FILESYSTEM } else { FAN_MARK_MOUNT };
+    let c_path = CString::new(spec.path.as_str()).unwrap();
     let rc = unsafe {
         libc::fanotify_mark(
             fan_fd,
-            FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+            FAN_MARK_ADD | flag,
             mask,
             libc::AT_FDCWD,
             c_path.as_ptr(),
@@ -734,9 +870,11 @@ fn mark_filesystem(fan_fd: RawFd, path: &str, mask: u64) -> std::io::Result<()> 
 
 fn event_loop(
     fan_fd: RawFd,
+    mark: MarkSpec,
     locks: Arc<RwLock<Locks>>,
     cache: Arc<UnlockCache>,
     write_lock: Arc<Mutex<()>>,
+    fail_open: Option<Duration>,
 ) {
     let mut buf = [0u8; 8192];
     let meta_size = mem::size_of::<libc::fanotify_event_metadata>();
@@ -752,7 +890,7 @@ fn event_loop(
             // effect live, without a restart. Fully *disabling* the file-gate
             // still needs a restart — we leave the mark rather than churn it.
             if !folders.is_empty() {
-                let _ = mark_filesystem(fan_fd, "/", FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM);
+                let _ = mark_scope(fan_fd, &mark, FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM);
             }
             *locks.write().unwrap() = Locks { apps, folders };
             eprintln!("applockerd: reloaded lists ({na} app(s), {nf} folder(s)).");
@@ -803,6 +941,7 @@ fn event_loop(
                     &locks,
                     &cache,
                     &write_lock,
+                    fail_open,
                 );
                 if !deferred {
                     unsafe { libc::close(meta.fd) };
@@ -824,6 +963,7 @@ fn handle_event(
     locks: &Arc<RwLock<Locks>>,
     cache: &Arc<UnlockCache>,
     write_lock: &Arc<Mutex<()>>,
+    fail_open: Option<Duration>,
 ) -> bool {
     let is_exec = mask & FAN_OPEN_EXEC_PERM != 0;
     let is_open = mask & FAN_OPEN_PERM != 0;
@@ -892,20 +1032,43 @@ fn handle_event(
             println!("auth   pid={pid:<7} {app_name} (prompting)");
 
             thread::spawn(move || {
-                let (face, attempts, face_live) = face::build();
-                let cfg = face::config_for(attempts);
-                let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
-                    Feedback::spawn(&app)
-                } else {
-                    Feedback::none()
-                }));
-                let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
-                let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app), fb);
-                let fallback = SystemFallback::system();
-                let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
+                // The actual auth (camera, GTK prompt) runs in an *inner* thread
+                // and reports its verdict over a channel. The outer thread waits
+                // with the fail-open deadline: if auth doesn't answer in time it
+                // ALLOWs anyway, so a hung recognizer (busy camera, no display on
+                // Wayland-as-root) can never leave this exec blocked forever.
+                // Only the outer thread ever replies, so there's no double-answer
+                // race even when the inner thread finishes late.
+                let (tx, rx) = std::sync::mpsc::channel::<bool>();
+                let app_inner = app.clone();
+                thread::spawn(move || {
+                    let (face, attempts, face_live) = face::build();
+                    let cfg = face::config_for(attempts);
+                    let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+                        Feedback::spawn(&app_inner)
+                    } else {
+                        Feedback::none()
+                    }));
+                    let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
+                    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app_inner, face_live), fb);
+                    let fallback = SystemFallback::system();
+                    let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
+                    // If the outer thread already timed out, the receiver is gone
+                    // and this send is a harmless no-op.
+                    let _ = tx.send(matches!(outcome, Outcome::Allowed));
+                });
 
-                let allowed = matches!(outcome, Outcome::Allowed);
-                cache.finish(&target, allowed, cache_policy);
+                let (allowed, timed_out) = match fail_open {
+                    Some(d) => match rx.recv_timeout(d) {
+                        Ok(a) => (a, false),
+                        Err(_) => (true, true), // fail-open: allow rather than freeze
+                    },
+                    None => (rx.recv().unwrap_or(false), false),
+                };
+
+                // Never cache a fail-open allow — it's a safety escape, not a real
+                // unlock; the next launch should prompt again.
+                cache.finish(&target, allowed && !timed_out, cache_policy);
                 respond(
                     fan_fd,
                     event_fd,
@@ -913,11 +1076,14 @@ fn handle_event(
                     &write_lock,
                 );
                 unsafe { libc::close(event_fd) };
-                println!(
-                    "{:<6} pid={pid:<7} {path} (auth {})",
-                    if allowed { "allow" } else { "DENY" },
-                    if allowed { "passed" } else { "failed" }
-                );
+                let verdict = if timed_out {
+                    "ALLOW (fail-open: auth timed out)"
+                } else if allowed {
+                    "allow (auth passed)"
+                } else {
+                    "DENY (auth failed)"
+                };
+                println!("{verdict:<34} pid={pid:<7} {path}");
             });
             true
         }
@@ -970,5 +1136,36 @@ fn respond(fan_fd: RawFd, event_fd: libc::c_int, response: u32, write_lock: &Arc
     };
     if rc < 0 {
         eprintln!("applockerd: failed to write response: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unescape_mountinfo_handles_octal() {
+        assert_eq!(unescape_mountinfo("/tmp/applocker-test"), "/tmp/applocker-test");
+        assert_eq!(unescape_mountinfo("/mnt/my\\040drive"), "/mnt/my drive"); // \040 = space
+        assert_eq!(unescape_mountinfo("a\\011b"), "a\tb"); // \011 = tab
+        assert_eq!(unescape_mountinfo("back\\134slash"), "back\\slash"); // \134 = backslash
+        // A lone backslash not followed by 3 octal digits is left as-is.
+        assert_eq!(unescape_mountinfo("trail\\"), "trail\\");
+        assert_eq!(unescape_mountinfo("\\9ab"), "\\9ab");
+    }
+
+    #[test]
+    fn is_mount_point_detects_real_mounts() {
+        // /proc is always its own mount on Linux; a regular subdirectory is not.
+        assert!(is_mount_point("/proc"));
+        assert!(!is_mount_point("/proc/self")); // a dir within the proc mount
+        assert!(!is_mount_point("/nonexistent-applocker-xyz"));
+    }
+
+    #[test]
+    fn fail_open_timeout_parsing() {
+        // Default (unset) is a 30s watchdog; "0" disables it. We can't safely
+        // mutate process env in parallel tests, so just assert the default arm.
+        assert_eq!(fail_open_timeout().map(|d| d.as_secs()), Some(30));
     }
 }

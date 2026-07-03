@@ -53,11 +53,19 @@ import os
 
 #: SFace ONNX model (OpenCV Zoo) for the strong embedding backend.
 SFACE_MODEL = "face_recognition_sface_2021dec.onnx"
-#: YuNet face detector, the **2022mar** version — the 2023mar one needs
-#: OpenCV ≥ 4.7, but 2022mar loads and runs on Ubuntu's 4.6. YuNet handles
-#: tilted / partially occluded faces that Haar misses completely (e.g. head
-#: resting on a hand), and its landmarks enable SFace's proper alignCrop.
-YUNET_MODEL = "face_detection_yunet_2022mar.onnx"
+#: YuNet face detector. Prefer the **2023mar** version (needs OpenCV ≥ 4.7 —
+#: fine on Kubuntu 26.04's 4.10, where the old 2022mar model fails to load);
+#: fall back to **2022mar**, the only version that runs on Mint's old 4.6.
+#: Whichever model file is present *and* actually runs is used at build time
+#: (see SFaceEngine._try_yunet). YuNet handles tilted / partially occluded faces
+#: that Haar misses completely (e.g. head resting on a hand), and its landmarks
+#: enable SFace's proper alignCrop.
+YUNET_MODELS = (
+    "face_detection_yunet_2023mar.onnx",
+    "face_detection_yunet_2022mar.onnx",
+)
+#: The primary model — the one fetch_models.py downloads and probe_env reports.
+YUNET_MODEL = YUNET_MODELS[0]
 
 
 def model_dir() -> str:
@@ -229,10 +237,10 @@ class HaarPixelEngine(FaceEngine):
 class SFaceEngine(FaceEngine):
     """Strong recognition backend — the recommended unlock model.
 
-    - Detection: **YuNet 2022mar** when its model file is present (loads on
-      OpenCV 4.6, robust to tilt/occlusion, provides landmarks for alignment),
-      else **Haar** (via an internal `HaarPixelEngine`), which works with zero
-      downloads but only on upright frontal faces.
+    - Detection: **YuNet** (2023mar on modern OpenCV, 2022mar on 4.6) when a
+      usable model file is present — robust to tilt/occlusion, provides
+      landmarks for alignment — else **Haar** (via an internal `HaarPixelEngine`),
+      which works with zero downloads but only on upright frontal faces.
     - Embedding: **SFace** (`cv2.FaceRecognizerSF`) — a 128-d face descriptor.
       With YuNet the crop is properly 5-point aligned (`alignCrop`); with Haar
       it's a plain resized crop. SFace's canonical cosine threshold is ~0.363.
@@ -257,22 +265,29 @@ class SFaceEngine(FaceEngine):
         self._yunet = self._try_yunet()
 
     def _try_yunet(self):
-        """Load YuNet if its model exists AND actually runs on this OpenCV
-        (verified with a dummy detect — 4.6 rejects newer models at run time)."""
+        """Load the best YuNet whose model file exists AND actually runs on this
+        OpenCV. Version mismatches are only caught at run time (4.6 rejects the
+        newer 2023mar model, 4.10 rejects the old 2022mar one), so each candidate
+        is verified with a dummy detect. Tries them in preference order and
+        returns the first that works, else None (Haar takes over)."""
         import numpy as np
+        import sys
 
-        path = os.path.join(model_dir(), YUNET_MODEL)
-        if not (hasattr(self.cv2, "FaceDetectorYN") and os.path.exists(path)):
+        if not hasattr(self.cv2, "FaceDetectorYN"):
             return None
-        try:
-            det = self.cv2.FaceDetectorYN.create(path, "", (320, 240), 0.7)
-            det.setInputSize((320, 240))
-            det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
-            return det
-        except self.cv2.error as e:
-            import sys
-            sys.stderr.write(f"YuNet unavailable ({e}); detecting with Haar.\n")
-            return None
+        for name in YUNET_MODELS:
+            path = os.path.join(model_dir(), name)
+            if not os.path.exists(path):
+                continue
+            try:
+                det = self.cv2.FaceDetectorYN.create(path, "", (320, 240), 0.7)
+                det.setInputSize((320, 240))
+                det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
+                return det
+            except self.cv2.error as e:
+                sys.stderr.write(f"YuNet model {name} unavailable ({e}); trying next.\n")
+        sys.stderr.write("No usable YuNet model; detecting with Haar.\n")
+        return None
 
     def _yunet_face(self, frame):
         """Best YuNet detection row (box + landmarks) for the frame, or None."""

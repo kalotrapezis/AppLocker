@@ -55,8 +55,42 @@ daemon can find your session before relying on the service.
 - [ ] `sudo applocker off` → stops the service and removes the PAM hooks;
       `applocker status` shows it inactive.
 
-## 3. App gate (lock an app)
+## 2c. Dev-safe gate test (sandbox — CANNOT freeze the machine)
 
+> **Do this before §3.** The plain gate marks all of `/` as a blocking fanotify
+> permission gate: if the daemon stalls, *every* exec on the box hangs — that's
+> the input-freeze. The sandbox marks a single private mount instead
+> (`$APPLOCKER_GATE_SCOPE` → `FAN_MARK_MOUNT`), so a bug can only ever block
+> execs **inside the sandbox**. Your desktop, shell, and SDDM are never in the
+> blocking path. Nothing here persists — a reboot drops the bind-mount.
+
+- [ ] `sudo applocker-test-scope up` → makes `/tmp/applocker-test` its own mount
+      with a sample app (`bin/lockme`) and file (`vault/secret.txt`).
+- [ ] `sudo applocker-test-scope gate` → starts the scoped gate (sets the scope
+      env itself — do **not** use `sudo -E applockerd`, sudoers strips the env and
+      the daemon then refuses to gate all of `/`). Banner:
+      **`*** TEST SCOPE *** gating only the '/tmp/applocker-test' mount`**. Ctrl-C stops it.
+- [ ] In another terminal: `/tmp/applocker-test/bin/lockme` → **blocked** (auth
+      prompt, or "Operation not permitted" if you cancel). This is the gate firing.
+- [ ] `cp /bin/true /tmp/outside && /tmp/outside` → runs instantly (out of scope,
+      never gated). Open apps, menus, a new terminal — all normal. **No freeze.**
+- [ ] **Guard check:** `sudo env APPLOCKER_GATE_SCOPE=/tmp applockerd gate`
+      (a non-mount) → refuses ("not its own mount point") and exits. Good.
+- [ ] **Fail-open check:** with a hung auth, the blocked launch auto-ALLOWs after
+      the timeout (log: `ALLOW (fail-open: auth timed out)`) instead of hanging
+      forever. Tune/disable with `APPLOCKER_GATE_TIMEOUT=<secs>` (`0` = strict).
+- [ ] `sudo applocker-test-scope down` → unmounts and removes it.
+
+> From the repo (uninstalled) set `APPLOCKER_BIN=daemon/target/release/applockerd`
+> before `applocker-test-scope gate` so it runs your freshly-built daemon.
+
+## 3. App gate (lock an app)  ⚠️ WHOLE-SYSTEM GATE
+
+> **This marks all of `/`.** A stall here freezes every launch on the machine
+> (see §2c for why). Only run it once §2c passes, and keep a root TTY open with
+> `pkill -9 applockerd` ready. The fail-open watchdog (`APPLOCKER_GATE_TIMEOUT`,
+> default 30s) is the backstop; `0` disables it (old strict behaviour).
+>
 > With the service enabled (`applocker on`) the gate is always running. To test
 > without the service, run it in your session: `sudo applockerd`.
 
@@ -92,17 +126,48 @@ lock catches the real app binary even though the launcher runs `flatpak`.
 > exec event isn't reaching the gate on this kernel, which we'd handle
 > differently. (Snap apps are stored but not gated yet — expected.)
 
-## 4. File / folder gate
+## 4. Folder locking — encrypted vaults (`vault/vault.py`)
 
-> ⚠️ Never lock a folder that contains the repo, the daemon, `~/.config/applocker`,
-> or a system dir — `is_safe_to_lock` refuses these, but double-check the target.
+Folder locking uses **gocryptfs encrypted vaults**, not the fanotify file-gate.
+A locked vault is an *empty* directory; unlocked, it's a FUSE mount of decrypted
+files. Nothing is gated → this **cannot freeze the machine**, and it needs no
+root. (The old whole-`/` `FAN_OPEN_PERM` file-gate is retired — it made AppLocker
+a checkpoint for every file open; blocking one video could wedge the whole PC.)
 
-- [ ] Make a throwaway dir: `mkdir ~/locktest && echo hi > ~/locktest/f.txt`.
-- [ ] `sudo applockerd lock-folder ~/locktest` → confirms; `list-folders` shows it.
-- [ ] Open `~/locktest/f.txt` in a file manager / `xdg-open` → auth prompt first.
-- [ ] Correct secret → opens. Cancel → stays closed.
-- [ ] `sudo applockerd unlock-folder ~/locktest` → opens freely again.
-- [ ] Try `sudo applockerd lock-folder /etc` → **refused** (unsafe).
+Run against a scratch config so nothing real is touched:
+`export APPLOCKER_CONFIG_HOME=/tmp/vt/config HOME=/tmp/vt/home; mkdir -p "$HOME"`
+
+- [ ] `python3 vault/vault.py --selftest` → "all checks passed".
+- [ ] `python3 vault/vault.py create ~/Private --name Private --unlock` → creates
+      and mounts it; `~/Private` is writable.
+- [ ] Write a file into `~/Private`, then `python3 vault/vault.py lock ~/Private`
+      → `~/Private` is now **empty**; `status` shows `locked`.
+- [ ] Inspect the cipher dir (`registry.json` → `cipher`): only `gocryptfs.*` +
+      encrypted blobs, **no plaintext, no real filenames**.
+- [ ] `python3 vault/vault.py unlock ~/Private` → the file is back.
+- [ ] `lock` then `destroy ~/Private` → refused without `--force`; `--force`
+      removes the ciphertext. `list` shows nothing; no leftover FUSE mounts.
+- [ ] Safety: `create /etc/foo`, `create ~` → **refused** (system / home-root).
+
+**Standard "Private" folder + hide (KDE-Vaults style):**
+
+- [ ] `create ~/Private --name Private --hide --unlock` → the one standard vault.
+- [ ] While unlocked, `~/.hidden` does **not** list `Private` (visible when open).
+- [ ] `lock ~/Private` → `~/.hidden` now contains `Private`; the empty folder is
+      hidden in Dolphin (View ▸ Show Hidden Files reveals it). `unlock` un-hides.
+- [ ] `hide ~/Private --off` then `hide ~/Private` → toggles the stored flag.
+
+**Settings GUI (`gui/settings.py` → "Private folder" section):**
+
+- [ ] With no vault: shows "File locking is off" + a "hide while locked" checkbox
+      + **Enable file lock** → creates & unlocks `~/Private`.
+- [ ] With a vault: shows Locked/Unlocked + a **Lock/Unlock** button, a "Hide
+      folder when locked" switch, the path, and **Delete & disable file lock**
+      (confirms first, then removes the ciphertext).
+
+> Not yet wired: a per-unlock face/PIN check (today the whole settings window is
+> already behind one auth check at open); importing an existing non-empty folder;
+> PIN-wrapping the key so the key file alone can't mount. See §"Not yet".
 
 ## 5. Presence watcher (lock when you leave)
 

@@ -20,6 +20,7 @@ Reads are unprivileged (the config files are world-readable); writes need root.
 
 from __future__ import annotations
 
+import argparse
 import os
 import shlex
 import subprocess
@@ -36,6 +37,15 @@ from gi.repository import GLib, Gtk  # noqa: E402
 # no root. matcher imports only the stdlib (no OpenCV), so this is cheap.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "face"))
 import matcher  # noqa: E402
+
+# The vault helper (gocryptfs folder locking). In the installed flat layout it
+# sits next to us; in the repo it's ../vault. Userspace, no root.
+for _vp in (os.path.dirname(os.path.abspath(__file__)),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vault")):
+    if os.path.exists(os.path.join(_vp, "vault.py")):
+        sys.path.insert(0, _vp)
+        break
+import vault as vaultlib  # noqa: E402
 
 
 # ── locating the daemon + its config ─────────────────────────────────────────
@@ -109,11 +119,6 @@ def read_config() -> dict:
 def read_locked_apps() -> list:
     path = cfg_path("APPLOCKER_LOCKED_APPS", "/etc/applocker/locked-apps")
     return _read_tsv(path, fields=3)
-
-
-def read_locked_folders() -> list:
-    path = cfg_path("APPLOCKER_LOCKED_FOLDERS", "/etc/applocker/locked-folders")
-    return _read_tsv(path, fields=2)
 
 
 def _read_tsv(path: str, fields: int) -> list:
@@ -230,6 +235,13 @@ def service_active() -> bool:
         return False
 
 
+def dev_mode() -> bool:
+    """Dev build marker: while it exists, the daemon refuses to run the
+    system-wide gate (so it can't freeze the machine). The service will start
+    then immediately exit doing nothing — see _on_service_toggle."""
+    return os.path.exists("/etc/applocker/dev-mode")
+
+
 def set_service(active: bool) -> bool:
     """Start or stop the gate service (root, via pkexec unless dev mode)."""
     cmd = ["systemctl", "start" if active else "stop", SERVICE]
@@ -274,7 +286,7 @@ class SettingsWindow(Gtk.Window):
 
         self._build_face_section()
         self._build_apps_section()
-        self._build_folders_section()
+        self._build_vault_section()
         self._build_policy_section()
         self._build_apply_bar(outer)  # pinned at the bottom
 
@@ -307,6 +319,15 @@ class SettingsWindow(Gtk.Window):
             self.service_btn.set_label("Start")
             self.service_btn.set_sensitive(False)
             return
+        # In dev mode the service can't actually run the system-wide gate — say so
+        # instead of offering a Start button that silently does nothing.
+        if dev_mode():
+            self.service_label.set_markup(
+                "<b>AppLocker service</b>  —  <span foreground='#e67e22'>dev mode</span>"
+                "  (system-wide gate off — can't freeze)")
+            self.service_btn.set_label("Why?")
+            self.service_btn.set_sensitive(True)
+            return
         self.service_btn.set_sensitive(True)
         if service_active():
             self.service_label.set_markup(
@@ -318,6 +339,19 @@ class SettingsWindow(Gtk.Window):
             self.service_btn.set_label("Start")
 
     def _on_service_toggle(self, _btn):
+        if dev_mode():
+            self._toast(
+                "Dev mode is on, so the system-wide app/file gate is disabled — a "
+                "bug there could freeze the whole machine (it has before). That's "
+                "why the service starts then immediately stops doing nothing.\n\n"
+                "• Encrypted “Private folder” locking works normally right now.\n"
+                "• To test app-locking safely, use the sandbox in a terminal:\n"
+                "    sudo applocker-test-scope up\n"
+                "    sudo applocker-test-scope gate   (Ctrl-C to stop)\n"
+                "    sudo applocker-test-scope down\n\n"
+                "The real system-wide gate is deliberately deferred until it's "
+                "proven safe. (It lives behind /etc/applocker/dev-mode.)")
+            return
         set_service(not service_active())
         self._refresh_service()
 
@@ -438,17 +472,122 @@ class SettingsWindow(Gtk.Window):
         box.pack_start(add, False, False, 0)
         self._refresh_apps()
 
-    def _build_folders_section(self):
-        box = self._section("Locked files and folders")
-        self.folders_list = Gtk.ListBox()
-        self.folders_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        box.pack_start(self.folders_list, False, False, 0)
+    # -- Private folder (encrypted vault) ------------------------------------
 
-        add = Gtk.Button(label="Add folder…")
-        add.connect("clicked", self._on_add_folder)
-        add.set_halign(Gtk.Align.START)
-        box.pack_start(add, False, False, 0)
-        self._refresh_folders()
+    def _standard_vault(self):
+        """The registry entry for the standard ~/Private vault, or None."""
+        reg = vaultlib.load_registry()
+        vid = vaultlib.resolve(reg, vaultlib.standard_path())
+        return (vid, reg[vid]) if vid else (None, None)
+
+    def _build_vault_section(self):
+        self.vault_box = self._section("Private folder")
+        self._refresh_vault()
+
+    def _refresh_vault(self):
+        box = self.vault_box
+        for child in box.get_children():
+            box.remove(child)
+        path = vaultlib.standard_path()
+        vid, v = self._standard_vault()
+
+        if v is None:
+            # OFF by default — offer to create the encrypted Private folder.
+            lbl = Gtk.Label(xalign=0, label=(
+                "File locking is off. Create an encrypted <b>Private</b> folder in "
+                "your home — locked, it's empty and unreadable; unlocked, your files "
+                "are there. It can't freeze the system."))
+            lbl.set_use_markup(True)
+            lbl.set_line_wrap(True)
+            box.pack_start(lbl, False, False, 0)
+            self.vault_hide_chk = Gtk.CheckButton(
+                label="Hide the folder in the file manager while locked")
+            self.vault_hide_chk.set_active(True)
+            box.pack_start(self.vault_hide_chk, False, False, 0)
+            btn = Gtk.Button(label="Enable file lock")
+            btn.get_style_context().add_class("suggested-action")
+            btn.set_halign(Gtk.Align.START)
+            btn.connect("clicked", self._on_vault_enable)
+            box.pack_start(btn, False, False, 0)
+            box.show_all()
+            return
+
+        mounted = vaultlib.is_mounted(v["mount"])
+        state = ("<span foreground='#c0392b'>Locked</span>" if not mounted
+                 else "<span foreground='#27ae60'>Unlocked</span>")
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        info = Gtk.Label(xalign=0)
+        info.set_markup(f"<b>{GLib.markup_escape_text(v['name'])}</b>  —  {state}")
+        row.pack_start(info, True, True, 0)
+        toggle = Gtk.Button(label="Lock" if mounted else "Unlock")
+        toggle.connect("clicked", self._on_vault_toggle)
+        row.pack_start(toggle, False, False, 0)
+        box.pack_start(row, False, False, 0)
+
+        pathlbl = Gtk.Label(xalign=0, label=v["mount"])
+        pathlbl.get_style_context().add_class("dim-label")
+        box.pack_start(pathlbl, False, False, 0)
+
+        hrow, self.vault_hide_switch = self._switch_row(
+            "Hide folder when locked", bool(v.get("hide")))
+        self.vault_hide_switch.connect("notify::active", self._on_vault_hide_toggled)
+        box.pack_start(hrow, False, False, 0)
+
+        delbtn = Gtk.Button(label="Delete & disable file lock")
+        delbtn.get_style_context().add_class("destructive-action")
+        delbtn.set_halign(Gtk.Align.START)
+        delbtn.connect("clicked", self._on_vault_delete)
+        box.pack_start(delbtn, False, False, 0)
+        box.show_all()
+
+    def _on_vault_enable(self, _btn):
+        hide = self.vault_hide_chk.get_active()
+        ns = argparse.Namespace(path=vaultlib.standard_path(), name="Private",
+                                unlock=True, hide=hide)
+        if vaultlib.cmd_create(ns) != 0:
+            self._toast("Couldn't create the Private folder — is gocryptfs installed?")
+        self._refresh_vault()
+
+    def _on_vault_toggle(self, _btn):
+        path = vaultlib.standard_path()
+        vid, v = self._standard_vault()
+        if v is None:
+            return
+        ns = argparse.Namespace(key=path)
+        if vaultlib.is_mounted(v["mount"]):
+            vaultlib.cmd_lock(ns)
+        else:
+            # The settings window is already behind an auth check (opened via
+            # `applockerd authorize`), so unlocking here doesn't re-prompt yet.
+            vaultlib.cmd_unlock(ns)
+        self._refresh_vault()
+
+    def _on_vault_hide_toggled(self, switch, _param):
+        vaultlib.cmd_hide(argparse.Namespace(
+            key=vaultlib.standard_path(), off=not switch.get_active()))
+
+    def _on_vault_delete(self, _btn):
+        vid, v = self._standard_vault()
+        if v is None:
+            return
+        confirm = Gtk.MessageDialog(
+            transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Delete the Private folder?")
+        confirm.format_secondary_text(
+            "This permanently deletes its encrypted contents. Unlock and copy out "
+            "anything you want to keep first.")
+        go = confirm.run() == Gtk.ResponseType.OK
+        confirm.destroy()
+        if not go:
+            return
+        path = vaultlib.standard_path()
+        if vaultlib.is_mounted(v["mount"]):
+            vaultlib.cmd_lock(argparse.Namespace(key=path))
+        rc = vaultlib.cmd_destroy(argparse.Namespace(key=path, force=True))
+        if rc != 0:
+            self._toast("Couldn't delete the vault (is a file still open in it?).")
+        self._refresh_vault()
 
     def _build_policy_section(self):
         cfg = read_config()
@@ -531,16 +670,6 @@ class SettingsWindow(Gtk.Window):
             self.apps_list.add(self._list_row(
                 label, lambda _b, k=key: self._remove_app(k)))
         self.apps_list.show_all()
-
-    def _refresh_folders(self):
-        self._clear(self.folders_list)
-        rows = read_locked_folders()
-        if not rows:
-            self.folders_list.add(self._info_row("No folders locked."))
-        for path, name in rows:
-            self.folders_list.add(self._list_row(
-                f"{name}  —  {path}", lambda _b, p=path: self._remove_folder(p)))
-        self.folders_list.show_all()
 
     def _info_row(self, text: str):
         row = Gtk.ListBoxRow()
@@ -673,22 +802,6 @@ class SettingsWindow(Gtk.Window):
     def _remove_app(self, key: str):
         if run_privileged(["unlock-app", key]):
             self._refresh_apps()
-
-    def _on_add_folder(self, _btn):
-        dlg = Gtk.FileChooserDialog(
-            title="Choose a folder to lock", parent=self,
-            action=Gtk.FileChooserAction.SELECT_FOLDER)
-        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
-                        "Lock", Gtk.ResponseType.OK)
-        if dlg.run() == Gtk.ResponseType.OK:
-            path = dlg.get_filename()
-            if path and run_privileged(["lock-folder", path]):
-                self._refresh_folders()
-        dlg.destroy()
-
-    def _remove_folder(self, path: str):
-        if run_privileged(["unlock-folder", path]):
-            self._refresh_folders()
 
     def _toast(self, text: str):
         dlg = Gtk.MessageDialog(transient_for=self, modal=True,

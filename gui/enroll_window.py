@@ -125,8 +125,13 @@ class EnrollWindow(Gtk.Window):
         f = self._frame
         if f is not None:
             fh, fw = f.shape[:2]
-            pb = GdkPixbuf.Pixbuf.new_from_data(
-                f.tobytes(), GdkPixbuf.Colorspace.RGB, False, 8, fw, fh, fw * 3)
+            # new_from_bytes (not new_from_data): the GBytes retains the pixel
+            # buffer, so it's still alive when cairo paints it. new_from_data does
+            # NOT keep the Python bytes alive → the freed buffer paints as a blank
+            # (dark) frame, which is exactly the "no camera preview" symptom.
+            data = GLib.Bytes.new(f.tobytes())
+            pb = GdkPixbuf.Pixbuf.new_from_bytes(
+                data, GdkPixbuf.Colorspace.RGB, False, 8, fw, fh, fw * 3)
             scale = min(w / fw, h / fh)
             cr.save()
             cr.translate((w - fw * scale) / 2, (h - fh * scale) / 2)
@@ -159,6 +164,7 @@ class EnrollWindow(Gtk.Window):
     # ── camera thread ─────────────────────────────────────────────────────
     def _capture_loop(self):
         import cv2
+        import numpy as np
 
         from engine import build_engine
 
@@ -175,8 +181,10 @@ class EnrollWindow(Gtk.Window):
                 ok, frame = cap.read()
                 if not ok:
                     continue
-                # Mirror the preview so it behaves like a mirror.
-                rgb = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
+                # Mirror the preview so it behaves like a mirror. Force a
+                # contiguous buffer so tobytes()/rowstride line up in _on_draw.
+                rgb = np.ascontiguousarray(
+                    cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB))
                 self._frame = rgb
                 GLib.idle_add(self.video.queue_draw)
 

@@ -41,7 +41,7 @@ from gi.repository import Gdk, Gtk  # noqa: E402
 
 
 class AuthPrompt(Gtk.Window):
-    def __init__(self, app_name, methods, error):
+    def __init__(self, app_name, methods, error, face_failed=False):
         super().__init__(title="AppLocker")
         self.result = None  # ("pin"|"sudo", secret) or None
 
@@ -64,7 +64,17 @@ class AuthPrompt(Gtk.Window):
         title.set_xalign(0.0)
         box.pack_start(title, False, False, 0)
 
-        subtitle = Gtk.Label(label="Face not recognised — enter your PIN or password.")
+        # Wording reflects what's actually offered — no false PIN mention when no
+        # PIN is set — and only blames the face when a face attempt really ran.
+        if "pin" in methods and "sudo" in methods:
+            what = "your PIN or password"
+        elif "pin" in methods:
+            what = "your PIN"
+        else:
+            what = "your password"
+        subtitle_text = (f"Face not recognised — enter {what}."
+                         if face_failed else f"Enter {what} to continue.")
+        subtitle = Gtk.Label(label=subtitle_text)
         subtitle.set_xalign(0.0)
         subtitle.get_style_context().add_class("dim-label")
         subtitle.set_line_wrap(True)
@@ -160,13 +170,15 @@ def main():
         help="comma list of offered fallbacks: pin,sudo",
     )
     parser.add_argument("--error", default="", help="error hint from the last attempt")
+    parser.add_argument("--face-failed", action="store_true",
+                        help="a live face attempt just failed (tunes the wording)")
     args = parser.parse_args()
 
     methods = [m for m in args.methods.split(",") if m in ("pin", "sudo")]
     if not methods:
         methods = ["sudo"]
 
-    win = AuthPrompt(args.app, methods, args.error)
+    win = AuthPrompt(args.app, methods, args.error, face_failed=args.face_failed)
     win.show_all()
     win.present()
     Gtk.main()

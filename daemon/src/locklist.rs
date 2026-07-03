@@ -124,12 +124,17 @@ impl LockList {
     ///   component, so we match any exec beneath that app's install dir — this
     ///   catches the launch whether it came from the menu or `flatpak run`, and
     ///   the first exec (the app's `bin/<app-id>` wrapper) is enough to prompt.
+    /// - `appimage` — the `.AppImage` file's absolute path. Launching an
+    ///   AppImage execs the file itself (before its internal squashfs mount), so
+    ///   an exact path match on that first exec catches the launch. Precise (no
+    ///   false hits on a same-named file elsewhere), unlike native's basename.
     /// - `snap` — not handled yet.
     pub fn matches(&self, exec_path: &str) -> Option<&LockedApp> {
         let exe_base = base(exec_path);
         self.apps.iter().find(|a| match a.kind {
             AppKind::Native => base(&a.key) == exe_base,
             AppKind::Flatpak => exec_path.contains(&format!("/flatpak/app/{}/", a.key)),
+            AppKind::AppImage => a.key == exec_path,
             AppKind::Snap => false,
         })
     }
@@ -179,6 +184,22 @@ mod tests {
         assert!(l.matches(
             "/var/lib/flatpak/app/org.other.App/current/active/files/bin/org.other.App"
         ).is_none());
+    }
+
+    #[test]
+    fn appimage_matched_by_exact_path() {
+        let mut l = LockList::default();
+        l.add(LockedApp {
+            kind: AppKind::AppImage,
+            key: "/home/teo/AppImages/viber.appimage".into(),
+            name: "Viber".into(),
+        });
+        // The exact file the AppImage launch execs is matched…
+        assert!(l.matches("/home/teo/AppImages/viber.appimage").is_some());
+        // …but a same-named file elsewhere is NOT (path-precise, unlike native).
+        assert!(l.matches("/tmp/viber.appimage").is_none());
+        // …and the internal squashfs binaries (post-mount) aren't double-gated.
+        assert!(l.matches("/tmp/.mount_viberXY/AppRun").is_none());
     }
 
     #[test]

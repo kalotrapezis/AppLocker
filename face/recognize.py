@@ -209,8 +209,11 @@ def run_with_ui(args) -> int:
             f = self._frame
             if f is not None:
                 fh, fw = f.shape[:2]
-                pb = GdkPixbuf.Pixbuf.new_from_data(
-                    f.tobytes(), GdkPixbuf.Colorspace.RGB, False, 8, fw, fh, fw * 3)
+                # new_from_bytes keeps the pixel buffer alive (GBytes); new_from_data
+                # does not, so the freed buffer paints blank — the "no preview" bug.
+                data = GLib.Bytes.new(f.tobytes())
+                pb = GdkPixbuf.Pixbuf.new_from_bytes(
+                    data, GdkPixbuf.Colorspace.RGB, False, 8, fw, fh, fw * 3)
                 scale = min(w / fw, h / fh)
                 cr.save()
                 cr.translate((w - fw * scale) / 2, (h - fh * scale) / 2)
@@ -230,7 +233,9 @@ def run_with_ui(args) -> int:
         headless(kind, **kw)
         if kind == "frame":
             import cv2
-            rgb = cv2.cvtColor(cv2.flip(kw["frame"], 1), cv2.COLOR_BGR2RGB)
+            import numpy as np
+            rgb = np.ascontiguousarray(
+                cv2.cvtColor(cv2.flip(kw["frame"], 1), cv2.COLOR_BGR2RGB))
             win._frame = rgb
             GLib.idle_add(win.video.queue_draw)
         elif kind == "challenge":

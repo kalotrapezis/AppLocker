@@ -41,6 +41,7 @@ install -d "$LIB" \
 	"$STAGE/lib/$TRIPLET/security" \
 	"$STAGE/lib/systemd/system" \
 	"$STAGE/etc/xdg/autostart" \
+	"$STAGE/etc/applocker" \
 	"$STAGE/usr/share/applications" \
 	"$STAGE/usr/share/doc/applocker" \
 	"$STAGE/DEBIAN"
@@ -48,7 +49,7 @@ install -d "$LIB" \
 # Daemon + all Python helpers, flattened (matches the code's installed-layout
 # fallbacks: /usr/lib/applocker/<script>.py).
 install -m 0755 "$REPO/daemon/target/release/applockerd" "$LIB/applockerd"
-for py in "$REPO"/face/*.py "$REPO"/gui/*.py; do
+for py in "$REPO"/face/*.py "$REPO"/gui/*.py "$REPO"/vault/*.py; do
 	install -m 0644 "$py" "$LIB/"
 done
 
@@ -60,6 +61,19 @@ install -m 0644 "$REPO/pam/target/release/libpam_applocker.so" \
 ln -s ../lib/applocker/applockerd "$STAGE/usr/bin/applockerd"
 install -m 0755 "$REPO/packaging/bin/applocker-pam" "$STAGE/usr/bin/applocker-pam"
 install -m 0755 "$REPO/packaging/bin/applocker" "$STAGE/usr/bin/applocker"
+install -m 0755 "$REPO/packaging/bin/applocker-test-scope" "$STAGE/usr/bin/applocker-test-scope"
+
+# DEV MODE marker: while this file exists the daemon refuses to gate all of / (so
+# the app-gate can't freeze the machine); the app-gate only runs when explicitly
+# scoped to a sandbox mount. Remove it to allow the real system-wide gate.
+cat > "$STAGE/etc/applocker/dev-mode" <<'EOF'
+AppLocker dev mode. While this file exists, `applockerd gate` will NOT mark the
+whole filesystem (the input-freeze is impossible). Test the app-gate safely with
+  sudo applocker-test-scope up && eval "$(applocker-test-scope env)"
+  sudo -E applockerd lockme
+Delete this file to enable the real, system-wide gate.
+EOF
+chmod 0644 "$STAGE/etc/applocker/dev-mode"
 
 # System integration (service ships disabled; autostart is per-user & self-gating).
 install -m 0644 "$REPO/packaging/systemd/applockerd.service" "$STAGE/lib/systemd/system/"
@@ -76,7 +90,7 @@ Version: $VERSION
 Section: admin
 Priority: optional
 Architecture: $ARCH
-Depends: python3, python3-opencv, python3-numpy, python3-gi, gir1.2-gtk-3.0, libpam0g, libxss1, policykit-1, systemd
+Depends: python3, python3-opencv, python3-numpy, python3-gi, gir1.2-gtk-3.0, libpam0g, libxss1, pkexec, systemd, gocryptfs, fuse3
 Recommends: v4l-utils
 Installed-Size: $INSTALLED_KB
 Maintainer: AppLocker <kalotrapezis@gmail.com>
@@ -87,7 +101,9 @@ Description: Android-style app & folder locking for Linux, with face unlock
  Threat model is casual local access, not high security.
 EOF
 
-# postinst — no PAM edits (lockout risk); guide the user instead.
+# postinst — DEV MODE build: no PAM edits, no service enabled, and the gate is
+# barred from marking all of / (see /etc/applocker/dev-mode). Nothing here can
+# freeze the machine or survive a reboot on its own.
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
@@ -96,18 +112,24 @@ if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
 fi
 cat <<'MSG'
 
-AppLocker installed. Next steps (nothing is enforced until you opt in):
+AppLocker installed in DEV MODE — safe to test, cannot freeze the machine.
+(While /etc/applocker/dev-mode exists, the app-gate refuses to gate all of /.)
 
-  1. Face models + enrollment (per user):
-       python3 /usr/lib/applocker/fetch_models.py     # downloads YuNet+SFace
-       python3 /usr/lib/applocker/enroll.py --name me
-  2. Lock some apps/folders:
-       sudo applockerd lock-app "Calculator"
-  3. Turn everything on (gate service + sudo + lockscreen):
-       sudo applocker on
-     Check anytime with `applocker status`; undo with `sudo applocker off`.
-     Add the login greeter last (keep a root TTY open):
-       sudo applocker-pam enable lightdm
+Try these — all userspace, nothing persists across a reboot:
+
+  1. First-run wizard (models + enrollment):
+       python3 /usr/lib/applocker/welcome.py
+  2. Private folder (encrypted vault) — open Settings, "Private folder":
+       python3 /usr/lib/applocker/settings.py
+  3. App-gate in the safe sandbox (never touches real apps):
+       sudo applocker-test-scope up
+       sudo applocker-test-scope gate     # gates only /tmp/applocker-test; Ctrl-C stops
+       # then in another terminal:  /tmp/applocker-test/bin/lockme   (it prompts)
+       sudo applocker-test-scope down
+
+Do NOT run `applocker on` yet — it's for the system-wide gate/PAM, which is
+still deferred. Remove /etc/applocker/dev-mode only when you deliberately want
+the real gate. See /usr/share/doc/applocker/TESTS.md.
 
 MSG
 exit 0
@@ -138,6 +160,10 @@ if [ "$1" = "purge" ] || [ "$1" = "remove" ]; then
 fi
 exit 0
 EOF
+
+# Track the dev-mode marker as a conffile so deleting it (to enable the real
+# gate) is remembered across upgrades instead of being silently restored.
+printf '/etc/applocker/dev-mode\n' > "$STAGE/DEBIAN/conffiles"
 
 chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm" "$STAGE/DEBIAN/postrm"
 
