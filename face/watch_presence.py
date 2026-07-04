@@ -147,9 +147,10 @@ BRIGHTNESS_PATH = os.environ.get(
 
 # The presence snapshots only fire when you're *idle*, so brightness would never
 # track the room while you're actively typing. This is the independent cadence for
-# a brightness-only camera peek that runs whether you're active or idle (default
-# 30 min), so the screen follows time-of-day + room light even during heavy use.
-BRIGHTNESS_INTERVAL = 30 * 60
+# a brightness-only camera peek that runs whether you're active or idle (every
+# 10 min), so the screen follows time-of-day + room light even during heavy use.
+# Cheap now: the peek is a silent brightness set (no OSD) and a no-op within ±5%.
+BRIGHTNESS_INTERVAL = 10 * 60
 
 _bright_state = {"target": None, "backend": "?"}  # for change-only logging
 
@@ -199,7 +200,11 @@ def _run_ok(cmd) -> bool:
 def set_screen_brightness(percent: int):
     """Set brightness to `percent` (1-100) via the first backend that works:
     brightnessctl (laptop backlight) → ddcutil (external DDC monitor) → KDE
-    PowerDevil D-Bus. Returns the backend name, or None if none worked."""
+    PowerDevil D-Bus. Returns the backend name, or None if none worked.
+
+    The PowerDevil path uses **setBrightnessSilent** — same as setBrightness but
+    without popping KDE's brightness OSD, so our automatic nudges stay invisible
+    while the user's own brightness keys (which use setBrightness) still show it."""
     p = max(1, min(100, int(percent)))
     if _run_ok(["brightnessctl", "-q", "set", f"{p}%"]):
         return "brightnessctl"
@@ -216,7 +221,8 @@ def set_screen_brightness(percent: int):
             continue
         if mx.returncode == 0 and mx.stdout.strip().isdigit():
             target = int(int(mx.stdout.strip()) * p / 100)
-            if _run_ok([qd, *base, f"{iface}.setBrightness", str(target)]):
+            # setBrightnessSilent → no OSD popup (setBrightness would show it).
+            if _run_ok([qd, *base, f"{iface}.setBrightnessSilent", str(target)]):
                 return f"powerdevil({qd})"
     return None
 

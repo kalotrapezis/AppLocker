@@ -3,6 +3,18 @@
 A personal, alpha-stage project — versions are `0.0.1-<letter>` build rounds, not
 stable releases. Newest first.
 
+## 0.0.1-al — silent brightness (no OSD), 10-min brightness cadence, release build
+
+### Changed
+- Auto-brightness now uses KDE PowerDevil's **`setBrightnessSilent`** — our nudges no
+  longer pop the on-screen brightness OSD (your own brightness keys still do). No more
+  slider flashing mid-game.
+- Brightness peek cadence **30 min → 10 min** (`--brightness-interval`), now that each
+  peek is a silent, deadbanded no-op unless the room actually changed.
+- Built as a **release** package (no dev-mode marker) so the gate service isn't stuck
+  in dev mode. Enforcement is still OFF until you `systemctl enable --now
+  applockerd.service`; the gate is exec-only (can't freeze on file opens).
+
 ## 0.0.1-aj — presence watcher: stop crashing (so it locks), quieter brightness
 
 ### Fixed
