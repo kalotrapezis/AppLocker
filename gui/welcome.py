@@ -476,7 +476,10 @@ def main() -> int:
         # Nothing to do — go straight to settings.
         launch_settings()
         return 0
-    Gtk.Window.set_default_icon_name("applocker")  # window/taskbar icon
+    # app-id "applocker" so KWin/Wayland matches the .desktop → correct name + icon.
+    GLib.set_prgname("applocker")
+    GLib.set_application_name("AppLocker")
+    Gtk.Window.set_default_icon_name("applocker")
     win = WelcomeWindow()
     win.connect("destroy", Gtk.main_quit)
     win.show_all()

@@ -1549,13 +1549,18 @@ class AppPicker(Gtk.Dialog):
 
 
 def main():
+    # Identify as "applocker" (not "python3") so KWin/Wayland matches the window to
+    # applocker-settings.desktop (StartupWMClass=applocker) → correct name + icon in
+    # the task bar. Must be set before the first window is shown.
+    GLib.set_prgname("applocker")
+    GLib.set_application_name("AppLocker")
+    Gtk.Window.set_default_icon_name("applocker")  # window icon (X11)
     # --no-auth skips the open-time authentication gate. DEV ONLY — for iterating
     # on the layout without re-authing each launch. Production always gates.
     dev_no_auth = "--no-auth" in sys.argv
     if not dev_no_auth and not authorize():
         sys.stderr.write("AppLocker: authentication required to open settings.\n")
         return 1
-    Gtk.Window.set_default_icon_name("applocker")  # window/taskbar icon
     win = SettingsWindow()
     win.show_all()
     # show_all() reveals every section; now hide the brightness panel unless

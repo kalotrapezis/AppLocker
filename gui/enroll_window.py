@@ -272,7 +272,10 @@ def main():
     ap.add_argument("--threshold", type=float, default=None)
     ARGS = ap.parse_args()
 
-    Gtk.Window.set_default_icon_name("applocker")  # window/taskbar icon
+    # app-id "applocker" so KWin/Wayland matches the .desktop → correct name + icon.
+    GLib.set_prgname("applocker")
+    GLib.set_application_name("AppLocker")
+    Gtk.Window.set_default_icon_name("applocker")
     name = ARGS.name or ask_name()
     if not name:
         return 1
