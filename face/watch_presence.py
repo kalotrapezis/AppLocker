@@ -307,6 +307,18 @@ class IdleMonitor:
             if not self._dpy:
                 return False
             self._root = self._x11.XDefaultRootWindow(self._dpy)
+            # Verify the server actually HAS the ScreenSaver extension. Under
+            # XWayland it is typically MISSING: AllocInfo still succeeds but every
+            # QueryInfo fails (and Xlib spams "extension MIT-SCREEN-SAVER missing"),
+            # so without this check we'd report available=True while seconds()
+            # always returns None — the watcher then can't tell active from idle.
+            self._xss.XScreenSaverQueryExtension.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int)]
+            eb, errb = ctypes.c_int(), ctypes.c_int()
+            if self._xss.XScreenSaverQueryExtension(
+                    self._dpy, ctypes.byref(eb), ctypes.byref(errb)) == 0:
+                return False  # no extension (Wayland) → this backend can't work
             self._info = self._xss.XScreenSaverAllocInfo()
             return bool(self._info)
         except (OSError, AttributeError):

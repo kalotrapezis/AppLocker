@@ -3,6 +3,25 @@
 A personal, alpha-stage project — versions are `0.0.1-<letter>` build rounds, not
 stable releases. Newest first.
 
+## 0.0.1-ag — presence watcher actually runs on KDE
+
+### Fixed
+- **The presence watcher never started on KDE**, so "lock when I leave" / the camera
+  checks never happened. Cause: its autostart entry had
+  `OnlyShowIn=X-Cinnamon;GNOME;MATE;XFCE;Unity;` — which **excludes KDE**. Removed it
+  so it autostarts on login (it no-ops if the feature is off). It had only been
+  running for the session where you toggled the feature on.
+- **Idle detection lied on Wayland.** `IdleMonitor` reported `available=True` even
+  though XWayland has no MIT-SCREEN-SAVER extension, so idle time was always
+  unknown. It now checks `XScreenSaverQueryExtension` and honestly falls back to the
+  periodic-snapshot mode (and stops the `Xlib: extension missing` spam).
+
+### Known limitation
+- True idle-gating ("camera off while you actively work") needs a Wayland idle
+  source we don't have cheaply (no `input`-group / evdev access here). On Wayland it
+  currently does a periodic check on the interval instead. Fine for "did I walk
+  away?"; the camera just also blinks on that interval while you're present.
+
 ## 0.0.1-af — drop the (impossible) graphical-polkit PAM tier
 
 - Removed the `uisudo` PAM tier. Finding: the graphical password prompt (polkit)
