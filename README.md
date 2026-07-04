@@ -9,6 +9,25 @@ Point a plain webcam at yourself, enroll once, and then chosen apps ask for your
 face (or a PIN) before they open, an encrypted **Private** folder appears when
 it's you, and files you've tucked away come back when you walk up to them.
 
+## 🙏 Built on the shoulders of these projects
+
+AppLocker is basically glue around a lot of excellent open-source work. Huge thanks to:
+
+- **[OpenCV](https://opencv.org/)** + the **[OpenCV Zoo](https://github.com/opencv/opencv_zoo)** — camera capture and the face models: **YuNet** (detection) and **SFace** (recognition).
+- **[gocryptfs](https://github.com/rfjakob/gocryptfs)** — the encrypted Private folder — and **[libfuse](https://github.com/libfuse/libfuse)** (FUSE) underneath it.
+- **[GTK 3](https://www.gtk.org/)** with **[PyGObject](https://pygobject.gnome.org/)** and **[pycairo](https://github.com/pygtk/pycairo)** — every window and dialog.
+- **[Python](https://www.python.org/)** & **[NumPy](https://numpy.org/)** — the face pipeline, watchers, and GUIs.
+- **[Rust](https://www.rust-lang.org/)** (+ the [`libc`](https://github.com/rust-lang/libc) crate) — the privileged daemon, auth broker, and PAM module.
+- **[Linux-PAM](https://github.com/linux-pam/linux-pam)** — the face / PIN auth tiers for sudo and the lock screen.
+- **[systemd](https://systemd.io/) / logind** — services, session lock/unlock, idle — and the Linux kernel's **fanotify** (app gate) and **inotify** (hidden-file reveal).
+- **[polkit](https://gitlab.freedesktop.org/polkit/polkit)** — the privilege-prompt fallback.
+- **[KDE Plasma](https://kde.org/plasma-desktop/)** — PowerDevil (silent brightness), kscreenlocker (lock screen), and the theme everything follows.
+- **[dbus-python](https://gitlab.freedesktop.org/dbus/dbus-python)** — talking to logind, polkit, and KDE.
+- **[brightnessctl](https://github.com/Hummer12007/brightnessctl)** / **[ddcutil](https://www.ddcutil.com/)** — optional brightness backends.
+- App icon generated with **Google Gemini**; built with a lot of help from **[Claude Code](https://claude.com/claude-code)** (Anthropic).
+
+Licenses and trademarks belong to their respective projects. If I've missed crediting something, please open an issue.
+
 > ### 🙂 What this is — and isn't
 >
 > This is a **fun personal project and a convenience thing, not a security
