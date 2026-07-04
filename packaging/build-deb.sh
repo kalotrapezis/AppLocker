@@ -48,6 +48,8 @@ install -d "$LIB" \
 	"$STAGE/etc/xdg/autostart" \
 	"$STAGE/etc/applocker" \
 	"$STAGE/usr/share/applications" \
+	"$STAGE/usr/share/icons/hicolor/512x512/apps" \
+	"$STAGE/usr/share/pixmaps" \
 	"$STAGE/usr/share/doc/applocker" \
 	"$STAGE/DEBIAN"
 
@@ -96,6 +98,11 @@ install -m 0644 "$REPO/packaging/systemd/applockerd-broker.service" "$STAGE/lib/
 install -m 0644 "$REPO/packaging/autostart/applocker-watcher.desktop" "$STAGE/etc/xdg/autostart/"
 install -m 0644 "$REPO/packaging/autostart/applocker-hide-watch.desktop" "$STAGE/etc/xdg/autostart/"
 install -m 0644 "$REPO/packaging/applocker-settings.desktop" "$STAGE/usr/share/applications/"
+# App icon (512×512). hicolor for themed lookups + pixmaps as a size-agnostic
+# fallback; the launcher's Icon=applocker resolves to these.
+install -m 0644 "$REPO/Assets/Gemini-Applock.png" \
+	"$STAGE/usr/share/icons/hicolor/512x512/apps/applocker.png"
+install -m 0644 "$REPO/Assets/Gemini-Applock.png" "$STAGE/usr/share/pixmaps/applocker.png"
 install -m 0644 "$REPO/README.md" "$STAGE/usr/share/doc/applocker/README.md"
 install -m 0644 "$REPO/TESTS.md"  "$STAGE/usr/share/doc/applocker/TESTS.md"
 
@@ -136,6 +143,9 @@ if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
 	# freshly-installed daemon takes over (enable --now won't restart a running one).
 	systemctl try-restart applockerd-broker.service >/dev/null 2>&1 || true
 fi
+# Refresh the icon + desktop caches so the launcher icon appears immediately.
+gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
 cat <<'MSG'
 
 AppLocker installed — RELEASE build (real system-wide gate, exec-only).
@@ -174,6 +184,9 @@ if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
 	# freshly-installed daemon takes over (enable --now won't restart a running one).
 	systemctl try-restart applockerd-broker.service >/dev/null 2>&1 || true
 fi
+# Refresh the icon + desktop caches so the launcher icon appears immediately.
+gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
 cat <<'MSG'
 
 AppLocker installed in DEV MODE — safe to test, cannot freeze the machine.

@@ -272,6 +272,7 @@ def main():
     ap.add_argument("--threshold", type=float, default=None)
     ARGS = ap.parse_args()
 
+    Gtk.Window.set_default_icon_name("applocker")  # window/taskbar icon
     name = ARGS.name or ask_name()
     if not name:
         return 1

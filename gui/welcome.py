@@ -476,6 +476,7 @@ def main() -> int:
         # Nothing to do — go straight to settings.
         launch_settings()
         return 0
+    Gtk.Window.set_default_icon_name("applocker")  # window/taskbar icon
     win = WelcomeWindow()
     win.connect("destroy", Gtk.main_quit)
     win.show_all()

@@ -1555,6 +1555,7 @@ def main():
     if not dev_no_auth and not authorize():
         sys.stderr.write("AppLocker: authentication required to open settings.\n")
         return 1
+    Gtk.Window.set_default_icon_name("applocker")  # window/taskbar icon
     win = SettingsWindow()
     win.show_all()
     # show_all() reveals every section; now hide the brightness panel unless

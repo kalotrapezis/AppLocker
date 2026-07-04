@@ -6,7 +6,8 @@ Comment=Lock apps and folders behind face / PIN / sudo, and manage face unlock
 # welcome.py shows the first-run setup wizard, then hands off to settings.py;
 # on every later launch it detects setup is done and opens settings directly.
 Exec=python3 /usr/lib/applocker/welcome.py
-Icon=system-lock-screen
+Icon=applocker
 Terminal=false
+StartupWMClass=applocker
 Categories=Settings;Security;
 Keywords=lock;face;privacy;applocker;
