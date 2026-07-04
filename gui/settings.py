@@ -440,6 +440,34 @@ def service_active() -> bool:
         return False
 
 
+def service_boot_enabled() -> bool:
+    """Is the gate set to start automatically at boot (systemctl enabled)?"""
+    try:
+        out = subprocess.run(["systemctl", "is-enabled", SERVICE],
+                             capture_output=True, text=True).stdout.strip()
+        return out == "enabled"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def set_service_boot(active: bool) -> bool:
+    """Enable/disable the gate at boot (`systemctl enable --now` / `disable`).
+    Through the broker (PIN works); falls back to pkexec systemctl."""
+    r = _broker("apply", ops=[["service-enable", "on" if active else "off"]],
+                reason=("Enable" if active else "Disable") + " AppLocker gate at boot",
+                force=True)
+    if r is not None:
+        return _ok(r)
+    cmd = (["systemctl", "enable", "--now", SERVICE] if active
+           else ["systemctl", "disable", "--now", SERVICE])
+    if os.environ.get("APPLOCKER_NO_PKEXEC") != "1":
+        cmd = ["pkexec", *cmd]
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def dev_mode() -> bool:
     """Dev build marker: while it exists, the daemon refuses to run the
     system-wide gate (so it can't freeze the machine). The service will start
@@ -524,27 +552,67 @@ class SettingsWindow(Gtk.Window):
     # -- service bar ---------------------------------------------------------
 
     def _build_service_bar(self, container):
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10,
-                      border_width=10)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                        border_width=10)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self.service_label = Gtk.Label(xalign=0)
         self.service_label.set_use_markup(True)
         bar.pack_start(self.service_label, True, True, 0)
         self.service_btn = Gtk.Button(label="Start")
         self.service_btn.connect("clicked", self._on_service_toggle)
         bar.pack_start(self.service_btn, False, False, 0)
-        container.pack_start(bar, False, False, 0)
+        outer.pack_start(bar, False, False, 0)
+
+        # Second row: whether enforcement comes back on its own after a reboot.
+        # The Start/Stop button only affects *now* (a safety choice — we were
+        # unsure of the outcome); this makes it persist.
+        boot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.boot_label = Gtk.Label(xalign=0, label="Start enforcement at boot")
+        self.boot_label.get_style_context().add_class("dim-label")
+        boot.pack_start(self.boot_label, True, True, 0)
+        self.boot_switch = Gtk.Switch(active=service_boot_enabled())
+        self.boot_switch.set_valign(Gtk.Align.CENTER)
+        self.boot_switch.connect("notify::active", self._on_boot_toggled)
+        boot.pack_start(self.boot_switch, False, False, 0)
+        outer.pack_start(boot, False, False, 0)
+
+        container.pack_start(outer, False, False, 0)
         container.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
                              False, False, 0)
         self._refresh_service()
         # Keep the label live if the service changes state elsewhere.
         GLib.timeout_add_seconds(3, self._service_tick)
 
+    def _on_boot_toggled(self, switch, _param):
+        if self._loading:
+            return
+        want = switch.get_active()
+        if not set_service_boot(want):
+            self._reject_toggle(switch, "Couldn't change the boot setting. Is the "
+                                        "AppLocker service running?",
+                                revert_to=service_boot_enabled())
+            return
+        self._toast_later("Enforcement will start on boot." if want
+                          else "Enforcement won't start on boot (you can still "
+                               "Start it by hand).")
+
     def _service_tick(self):
         self._refresh_service()
         return True  # repeat
 
     def _refresh_service(self):
-        if not service_present():
+        # Keep the boot switch mirrored to the on-disk enabled state (unless the
+        # user is mid-toggle), and only usable when the unit is actually installed.
+        present = service_present()
+        if hasattr(self, "boot_switch"):
+            self.boot_switch.set_sensitive(present)
+            if not self._loading:
+                want = service_boot_enabled()
+                if self.boot_switch.get_active() != want:
+                    self._loading = True
+                    self.boot_switch.set_active(want)
+                    self._loading = False
+        if not present:
             self.service_label.set_markup(
                 "<b>AppLocker service</b>  —  not installed (run from a .deb to use it)")
             self.service_btn.set_label("Start")

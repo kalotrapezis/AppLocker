@@ -12,8 +12,13 @@ set -euo pipefail
 #   packaging/build-deb.sh c
 VERSION_BASE="0.0.1"
 ROUND_FILE="$(dirname "$0")/.build-round"
-if [ "${1:-}" != "" ]; then
-	LETTER="$1"
+# APPLOCKER_VERSION overrides the whole version string (for a real release, e.g.
+# APPLOCKER_VERSION=0.0.1 APPLOCKER_RELEASE=1 packaging/build-deb.sh). Otherwise
+# it's the base + a bumping testing-round letter (0.0.1-a, 0.0.1-b, …).
+if [ "${APPLOCKER_VERSION:-}" != "" ]; then
+	VERSION="$APPLOCKER_VERSION"
+elif [ "${1:-}" != "" ]; then
+	VERSION="${VERSION_BASE}-$1"
 else
 	n=0
 	[ -f "$ROUND_FILE" ] && n="$(cat "$ROUND_FILE")"
@@ -21,8 +26,8 @@ else
 	echo "$n" > "$ROUND_FILE"
 	# 1->a, 26->z, 27->aa (bijective base-26)
 	LETTER="$(awk -v n="$n" 'BEGIN{s="";while(n>0){n--;r=n%26;s=sprintf("%c",97+r) s;n=int(n/26)}print s}')"
+	VERSION="${VERSION_BASE}-${LETTER}"
 fi
-VERSION="${VERSION_BASE}-${LETTER}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 TRIPLET="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || cc -print-multiarch 2>/dev/null || echo x86_64-linux-gnu)"
 

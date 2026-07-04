@@ -331,6 +331,15 @@ fn run_ops(ops: &[Vec<String>]) -> Result<(), String> {
                 .arg(action)
                 .arg("applockerd.service")
                 .status()
+        } else if head == "service-enable" {
+            // Persist the gate's boot state: enable --now / disable --now.
+            let mut cmd = Command::new("systemctl");
+            match op.get(1).map(String::as_str) {
+                Some("on") => cmd.arg("enable").arg("--now"),
+                Some("off") => cmd.arg("disable").arg("--now"),
+                other => return Err(format!("bad service-enable action {other:?}")),
+            };
+            cmd.arg("applockerd.service").status()
         } else if head == "pam" {
             // Enable/disable a face-unlock PAM tier via applocker-pam (always
             // `auth sufficient`, so the password still works — can't lock out).

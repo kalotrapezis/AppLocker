@@ -1,7 +1,31 @@
 # Changelog
 
-A personal, alpha-stage project — versions are `0.0.1-<letter>` build rounds, not
-stable releases. Newest first.
+Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
+real release, **0.0.1**.
+
+## 0.0.1 — first working release 🎉
+
+The first version that works end-to-end on Kubuntu/KDE/Wayland. It's a fun personal
+convenience tool, not a security product (see the README).
+
+Working:
+- **App locking** — gate deb / Flatpak / AppImage / system apps behind face / PIN /
+  sudo. Enforcement is off until you turn it on: a **Start/Stop** button (this
+  session) plus a new **"Start enforcement at boot"** toggle to persist it. The gate
+  is exec-only, so it can't freeze on file opens.
+- **Encrypted Private folder** (gocryptfs) and **hide-in-place** files/folders with
+  inotify face-reveal.
+- **Face unlock** (YuNet + SFace, liveness) with mandatory PIN/sudo fallback; PIN
+  works everywhere via the root **broker**. Opt-in **lock-screen** and **terminal
+  sudo** face tiers.
+- **Lock when I leave** presence watcher + **auto screen-brightness** (silent, no KDE
+  OSD).
+
+### Added
+- Second service-bar toggle **"Start enforcement at boot"** (`systemctl enable/disable
+  --now`, via the broker) — the Start/Stop button only affects the running state
+  (kept separate as a safety choice while the gate was being proven out).
+- `APPLOCKER_VERSION` override in the build script for cutting real versions.
 
 ## 0.0.1-al — silent brightness (no OSD), 10-min brightness cadence, release build
 
