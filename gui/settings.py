@@ -193,6 +193,20 @@ def has_camera() -> bool:
         return False
 
 
+# The KDE screen locker authenticates against the PAM service `kde`; our line
+# lands in /etc/pam.d/kde (world-readable, so we can read the state without root).
+SCREENLOCK_PAM = os.environ.get("APPLOCKER_SCREENLOCK_PAM", "/etc/pam.d/kde")
+
+
+def screenlock_pam_enabled() -> bool:
+    """True if face unlock is wired into the KDE lock-screen PAM stack."""
+    try:
+        with open(SCREENLOCK_PAM) as f:
+            return "pam_applocker.so" in f.read()
+    except OSError:
+        return False
+
+
 # ── automatic brightness config (user-side, no root) ─────────────────────────
 # Brightness is a per-session preference, so it lives in the user's config and is
 # read by the presence watcher (watch_presence.py). No daemon/broker/root.
@@ -445,6 +459,24 @@ def set_service(active: bool) -> bool:
         return False
 
 
+def set_screenlock(active: bool) -> bool:
+    """Enable/disable face unlock for the KDE lock screen (edits /etc/pam.d/kde
+    via applocker-pam, `auth sufficient` so the password always still works).
+    Through the broker (PIN works); falls back to `pkexec applocker-pam`."""
+    r = _broker("apply", ops=[["pam-screenlock", "on" if active else "off"]],
+                reason=("Enable" if active else "Disable") + " lock-screen face unlock",
+                force=True)
+    if r is not None:
+        return _ok(r)
+    cmd = ["applocker-pam", "enable" if active else "disable", "screenlock"]
+    if os.environ.get("APPLOCKER_NO_PKEXEC") != "1":
+        cmd = ["pkexec", *cmd]
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 # ── the window ───────────────────────────────────────────────────────────────
 
 class SettingsWindow(Gtk.Window):
@@ -597,7 +629,47 @@ class SettingsWindow(Gtk.Window):
                          "any of them will unlock.")
         hint.get_style_context().add_class("dim-label")
         box.pack_start(hint, False, False, 0)
+
+        # Face unlock for the KDE lock screen (PAM). Applies immediately (a system
+        # change), gated by a fresh auth via the broker. Our PAM rule is
+        # `auth sufficient`, so the password always still works — it can never lock
+        # you out. Reflects the real on-disk state of /etc/pam.d/kde.
+        box.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                       False, False, 4)
+        slrow, self.screenlock_switch = self._switch_row(
+            "Also unlock the screen lock with my face", screenlock_pam_enabled())
+        self.screenlock_switch.connect("notify::active", self._on_screenlock_toggled)
+        box.pack_start(slrow, False, False, 0)
+        slnote = Gtk.Label(xalign=0, label="Unlock the KDE lock screen with your "
+                           "face. Your password still works normally — face is just "
+                           "a shortcut and can never lock you out.")
+        slnote.get_style_context().add_class("dim-label")
+        slnote.set_line_wrap(True)
+        slnote.set_max_width_chars(46)
+        box.pack_start(slnote, False, False, 0)
         self._refresh_faces()
+
+    def _on_screenlock_toggled(self, switch, _param):
+        if self._loading:
+            return
+        want = switch.get_active()
+        # Needs an enrolled face (nothing to match against otherwise).
+        if want and not has_enrolled_faces():
+            self._loading = True
+            switch.set_active(False)
+            self._loading = False
+            self._toast("Add a face first before turning on lock-screen face unlock.")
+            return
+        if set_screenlock(want):
+            self._toast("Lock-screen face unlock turned on — your password still "
+                        "works too." if want else "Lock-screen face unlock turned off.")
+        else:
+            # Failed/declined → snap the switch back to the real state.
+            self._loading = True
+            switch.set_active(screenlock_pam_enabled())
+            self._loading = False
+            self._toast("Couldn't change lock-screen face unlock. Is the AppLocker "
+                        "service running?")
 
     def _refresh_faces(self):
         self._clear(self.faces_list)

@@ -6,24 +6,47 @@
 # Every edit backs the file up to <file>.applocker.bak first, and `disable`
 # removes only our line — so a mistake is always reversible.
 #
-#   sudo applocker-pam enable  sudo|screensaver|lightdm|all
-#   sudo applocker-pam disable sudo|screensaver|lightdm|all
+#   sudo applocker-pam enable  sudo|screenlock|screensaver|lightdm|all
+#   sudo applocker-pam disable sudo|screenlock|screensaver|lightdm|all
 #   sudo applocker-pam status
 #
-# ⚠️  Before enabling `lightdm`, open a root shell on a TTY (Ctrl-Alt-F3) so a
-#     bad edit can be undone without a rescue disk. Enable `sudo` first.
+# Tiers: `sudo` (/etc/pam.d/sudo) and `screenlock` (KDE Plasma screen locker,
+# /etc/pam.d/kde) are the live ones. `screensaver`/`lightdm` are Mint-era leftovers
+# kept for back-compat (no-ops on KDE). `all` = sudo + screenlock.
+#
+# ⚠️  Because our rule is `auth sufficient`, the password ALWAYS still works — this
+#     adds a face shortcut but can never remove the password or lock you out.
+#     Still: enable `sudo` first and test unlocking in a NEW session before trusting.
 
 set -eu
 
 MODULE="pam_applocker.so"
-LINE="auth	sufficient	${MODULE}"
 
 file_for() {
 	case "$1" in
 	sudo)        echo /etc/pam.d/sudo ;;
+	screenlock)  echo /etc/pam.d/kde ;;            # KDE kscreenlocker PAM service
 	screensaver) echo /etc/pam.d/cinnamon-screensaver ;;
 	lightdm)     echo /etc/pam.d/lightdm ;;
 	*)           echo "" ;;
+	esac
+}
+
+# The vendor default a service falls back to when /etc/pam.d/<svc> is absent. We
+# copy it into /etc/pam.d before editing, so the rest of the stack is preserved.
+vendor_for() {
+	case "$1" in
+	screenlock) echo /usr/lib/pam.d/kde ;;
+	*)          echo "" ;;
+	esac
+}
+
+# The auth rule to insert. The screen-lock tier runs the face check at LOCKSCREEN
+# camera priority (recognize.py reads it) so it preempts the desktop helpers.
+line_for() {
+	case "$1" in
+	screenlock) printf 'auth\tsufficient\t%s\tpriority=lockscreen' "$MODULE" ;;
+	*)          printf 'auth\tsufficient\t%s' "$MODULE" ;;
 	esac
 }
 
@@ -38,14 +61,26 @@ enable_one() {
 	tier="$1"
 	f="$(file_for "$tier")"
 	if [ -z "$f" ]; then echo "unknown tier: $tier" >&2; return 1; fi
-	if [ ! -f "$f" ]; then echo "skip $tier: $f not found" >&2; return 0; fi
+	# If /etc/pam.d/<svc> doesn't exist but a vendor default does, materialise an
+	# editable copy first (PAM prefers /etc over /usr/lib). This is how KDE's `kde`
+	# service works: it ships at /usr/lib/pam.d/kde with no /etc override.
+	if [ ! -f "$f" ]; then
+		v="$(vendor_for "$tier")"
+		if [ -n "$v" ] && [ -f "$v" ]; then
+			cp "$v" "$f"
+			echo "$tier: created $f from vendor default $v"
+		else
+			echo "skip $tier: $f not found (and no vendor default)" >&2; return 0
+		fi
+	fi
+	line="$(line_for "$tier")"
 	if grep -q "$MODULE" "$f"; then
 		echo "$tier: already enabled ($f)"; return 0
 	fi
-	cp -n "$f" "$f.applocker.bak"
+	cp -n "$f" "$f.applocker.bak" 2>/dev/null || true
 	# Insert our rule before the first non-comment, non-blank line so it is the
 	# first auth rule the stack evaluates.
-	awk -v line="$LINE" '
+	awk -v line="$line" '
 		BEGIN { done = 0 }
 		done == 0 && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*$/ {
 			print line; done = 1
@@ -70,11 +105,19 @@ disable_one() {
 	grep -v "$MODULE" "$f" > "$f.applocker.tmp"
 	cat "$f.applocker.tmp" > "$f"
 	rm -f "$f.applocker.tmp"
-	echo "$tier: disabled ($f)"
+	# If we'd materialised /etc/pam.d/<svc> from the vendor default and it's now
+	# byte-identical again, drop it so the service cleanly falls back to vendor.
+	v="$(vendor_for "$tier")"
+	if [ -n "$v" ] && [ -f "$v" ] && cmp -s "$f" "$v"; then
+		rm -f "$f"
+		echo "$tier: disabled (removed $f; back to vendor default)"
+	else
+		echo "$tier: disabled ($f)"
+	fi
 }
 
 status() {
-	for tier in sudo screensaver lightdm; do
+	for tier in sudo screenlock screensaver lightdm; do
 		f="$(file_for "$tier")"
 		if [ ! -f "$f" ]; then
 			printf '%-12s %s\n' "$tier" "(no $f)"
@@ -86,25 +129,27 @@ status() {
 	done
 }
 
-expand() { # "all" → the three tiers
-	if [ "$1" = "all" ]; then echo "sudo screensaver lightdm"; else echo "$1"; fi
+expand() { # "all" → the KDE-relevant live tiers
+	if [ "$1" = "all" ]; then echo "sudo screenlock"; else echo "$1"; fi
 }
+
+USAGE="usage: applocker-pam enable|disable sudo|screenlock|screensaver|lightdm|all
+       applocker-pam status"
 
 cmd="${1:-}"
 case "$cmd" in
 enable)
 	need_root
-	[ $# -ge 2 ] || { echo "usage: applocker-pam enable sudo|screensaver|lightdm|all" >&2; exit 2; }
+	[ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }
 	for t in $(expand "$2"); do enable_one "$t"; done
-	echo "Test in a NEW terminal/session before closing your root shell." ;;
+	echo "Test in a NEW session before trusting it (your password still works)." ;;
 disable)
 	need_root
-	[ $# -ge 2 ] || { echo "usage: applocker-pam disable sudo|screensaver|lightdm|all" >&2; exit 2; }
+	[ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }
 	for t in $(expand "$2"); do disable_one "$t"; done ;;
 status)
 	status ;;
 *)
-	echo "usage: applocker-pam enable|disable sudo|screensaver|lightdm|all" >&2
-	echo "       applocker-pam status" >&2
+	echo "$USAGE" >&2
 	exit 2 ;;
 esac

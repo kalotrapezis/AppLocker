@@ -79,6 +79,10 @@ struct Options {
     /// (screensaver tier — a display exists). It falls back to headless on its
     /// own if there isn't one, so this is always safe to set.
     ui: bool,
+    /// `priority=` module arg → the camera-arbitration level recognize.py runs
+    /// at (lockscreen|app|file|presence). None = unarbitrated (the sudo tier
+    /// runs in root's session and never contends with the desktop helpers).
+    priority: Option<String>,
 }
 
 fn parse_options(argc: c_int, argv: *const *const c_char) -> Options {
@@ -86,6 +90,7 @@ fn parse_options(argc: c_int, argv: *const *const c_char) -> Options {
         script: PathBuf::from("/usr/lib/applocker/recognize.py"),
         timeout: Duration::from_secs(20),
         ui: false,
+        priority: None,
     };
     if argv.is_null() {
         return opts;
@@ -102,6 +107,8 @@ fn parse_options(argc: c_int, argv: *const *const c_char) -> Options {
             if let Ok(s) = v.parse::<u64>() {
                 opts.timeout = Duration::from_secs(s.clamp(5, 120));
             }
+        } else if let Some(v) = arg.strip_prefix("priority=") {
+            opts.priority = Some(v.to_string());
         } else if arg == "ui" {
             opts.ui = true;
         }
@@ -137,8 +144,8 @@ fn authenticate(user: &str, opts: &Options) -> c_int {
         return PAM_AUTH_ERR; // not enrolled / not installed → next module
     }
 
-    let child = Command::new("/usr/bin/python3")
-        .arg(&opts.script)
+    let mut cmd = Command::new("/usr/bin/python3");
+    cmd.arg(&opts.script)
         .arg("--faces-dir")
         .arg(&faces)
         .arg("--enrollment")
@@ -150,8 +157,12 @@ fn authenticate(user: &str, opts: &Options) -> c_int {
         .env("APPLOCKER_UI", if opts.ui { "1" } else { "0" })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // challenge text lands in the PAM app's log
-        .spawn();
+        .stderr(Stdio::inherit()); // challenge text lands in the PAM app's log
+    if let Some(pri) = &opts.priority {
+        // Arbitrate the webcam against the desktop helpers (see face/cameralock.py).
+        cmd.env("APPLOCKER_CAMERA_PRIORITY", pri);
+    }
+    let child = cmd.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(_) => return PAM_AUTH_ERR,

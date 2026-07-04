@@ -331,6 +331,19 @@ fn run_ops(ops: &[Vec<String>]) -> Result<(), String> {
                 .arg(action)
                 .arg("applockerd.service")
                 .status()
+        } else if head == "pam-screenlock" {
+            // Enable/disable face unlock for the KDE lock screen (edits
+            // /etc/pam.d/kde via applocker-pam, always `auth sufficient` so the
+            // password still works). Root-only; that's why it rides the broker.
+            let action = match op.get(1).map(String::as_str) {
+                Some("on") => "enable",
+                Some("off") => "disable",
+                other => return Err(format!("bad pam-screenlock action {other:?}")),
+            };
+            Command::new("/usr/bin/applocker-pam")
+                .arg(action)
+                .arg("screenlock")
+                .status()
         } else {
             let exe = std::env::current_exe()
                 .map_err(|e| format!("current_exe: {e}"))?;

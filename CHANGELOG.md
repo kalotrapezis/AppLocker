@@ -3,6 +3,20 @@
 A personal, alpha-stage project — versions are `0.0.1-<letter>` build rounds, not
 stable releases. Newest first.
 
+## 0.0.1-ad — lock-screen face unlock (opt-in)
+
+### Added
+- **Face unlock for the KDE lock screen**, behind a new Settings toggle ("Also
+  unlock the screen lock with my face"). Wired as `auth sufficient` into
+  `/etc/pam.d/kde` (created from the vendor default when absent), so **your password
+  always still works — it can never lock you out**; turning it off removes the line
+  cleanly. The unlock face check runs with liveness and at top camera priority
+  (`priority=lockscreen`, preempting the desktop helpers). Root edits go through the
+  broker (PIN works), with a `pkexec` fallback.
+
+> ⚠️ This one edits real PAM. It's `sufficient` (password fallback intact), but test
+> it once with a spare TTY handy (Ctrl-Alt-F2) before relying on it.
+
 ## 0.0.1-ac — alpha snapshot (backup before the lock-screen work)
 
 The "last safe build" before starting face-unlock for the KDE screen lock. Snapshot

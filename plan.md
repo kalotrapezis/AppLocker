@@ -148,6 +148,25 @@ cleanly removes anything `on` added to `/etc/pam.d/*`.
 release / running / stopped) prominently in Settings and in `applocker` output, so
 a user always knows whether launches are actually gated.
 
+### [~] 2f. Lock-screen face unlock (KDE) — TOGGLE SHIPPED (0.0.1-ad)
+User asked for a Settings toggle. Done: "Also unlock the screen lock with my face"
+switch in the Face section. Wiring, all `auth sufficient` (password ALWAYS still
+works — can't lock out):
+- `applocker-pam` gained a `screenlock` tier → `/etc/pam.d/kde` (KDE kscreenlocker's
+  PAM service). It MATERIALISES `/etc/pam.d/kde` from the vendor `/usr/lib/pam.d/kde`
+  when absent (this host had none), inserts our rule first, and on disable removes it
+  — deleting the file if it's back to vendor-identical. Sandbox-tested.
+- PAM line carries `priority=lockscreen`; `pam_applocker.so` gained a `priority=` arg
+  → sets `APPLOCKER_CAMERA_PRIORITY` so the unlock face check preempts the desktop
+  helpers (top of the camera ladder). Runs with liveness ON (login tier).
+- Broker op `pam-screenlock on|off` runs `applocker-pam` as root (serve.rs); settings
+  `set_screenlock()` prefers the broker (PIN works), falls back to `pkexec`.
+- Toggle needs an enrolled face; reflects real /etc/pam.d/kde state; force-auths.
+NOT YET VERIFIED ON METAL: this edits real PAM on the daily driver. Test plan: enable
+via Settings → lock screen (Meta+L) → your face should unlock; if it fails the
+password box still appears. Disable → /etc/pam.d/kde gone. Keep a TTY (Ctrl-Alt-F2)
+handy the first time.
+
 ### [ ] 2e. Terminal-sudo PAM: confirmed SAFE on KDE — make it a proper opt-in
 Metal check: `/etc/pam.d/sudo` has `auth sufficient pam_applocker.so` (only sudo;
 login/SDDM untouched). `sufficient` = tries face/PIN, falls back to the password →
