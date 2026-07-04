@@ -653,8 +653,7 @@ class SettingsWindow(Gtk.Window):
 
         self.pam_switches = {}
         for tier, label in (("screenlock", "Lock screen"),
-                            ("sudo", "Terminal sudo password prompts"),
-                            ("uisudo", "Graphical (app) password prompts")):
+                            ("sudo", "Terminal sudo password prompts")):
             row, sw = self._switch_row(label, pam_tier_enabled(tier))
             sw.connect("notify::active", self._on_pam_tier_toggled, tier)
             self.pam_switches[tier] = sw
@@ -662,9 +661,10 @@ class SettingsWindow(Gtk.Window):
 
         note = Gtk.Label(xalign=0, label=(
             "Face uses the head-turn liveness check. In a terminal you'll see the "
-            "turn prompts; on the lock screen and graphical prompts there's no "
-            "on-screen guide yet — just look at the camera and turn your head left, "
-            "then right."))
+            "turn prompts; on the lock screen there's no on-screen guide yet — just "
+            "look at the camera and turn your head left, then right. Graphical "
+            "app-password prompts can't use face this way (the system runs them in a "
+            "sandbox with no camera) — that needs the polkit agent, coming separately."))
         note.get_style_context().add_class("dim-label")
         note.set_line_wrap(True)
         note.set_max_width_chars(46)

@@ -169,6 +169,16 @@ Follow-ups shipped 0.0.1-ae:
   toggle out of the Face section (user hadn't found it).
 - New `uisudo` tier → /etc/pam.d/polkit-1 (vendor-materialised); broker op generalised
   to `pam <tier> on|off` (whitelist sudo|uisudo|screenlock).
+GRAPHICAL POLKIT PROMPTS CAN'T USE PAM FACE (proven, 0.0.1-af): `polkit-agent-helper@.service`
+runs with `PrivateDevices=yes` (no /dev/video), `DevicePolicy=strict DeviceAllow=/dev/null`,
+and `ProtectHome=yes` (no /home → no faces/models). So our PAM module runs recognize in a
+jail with no camera and no faces → always falls through to the password (adds ~1-2s latency).
+Removed the `uisudo` tier entirely (do NOT weaken polkit's sandbox to force it). The section
+now only offers Lock screen + Terminal sudo. Graphical prompts must use the polkit AGENT
+(`gui/polkit_agent.py`, already written, --takeover) which runs in-session with camera
+access; its model is "type the password once per session, then face auto-submits it." NEXT:
+wire a toggle + autostart for the agent (caveat: replaces KDE's agent for the session).
+
 STILL OPEN (user wants, deferred): on-greeter LIVENESS FEEDBACK. Liveness is KEPT
 (don't reduce security — user was explicit). Terminal shows turn-prompts (stderr);
 lock screen / polkit have none. Plan: forward recognize.py's challenge lines to the

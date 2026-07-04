@@ -3,6 +3,18 @@
 A personal, alpha-stage project — versions are `0.0.1-<letter>` build rounds, not
 stable releases. Newest first.
 
+## 0.0.1-af — drop the (impossible) graphical-polkit PAM tier
+
+- Removed the `uisudo` PAM tier. Finding: the graphical password prompt (polkit)
+  runs its PAM helper in a hardened systemd sandbox — `PrivateDevices=yes` (no
+  camera) and `ProtectHome=yes` (no access to your faces) — so a PAM face module
+  *cannot* work there, by polkit's design. The "Unlock these with your face" section
+  now shows only the two tiers that actually work: **Lock screen** and **Terminal
+  sudo**. Graphical prompts will be handled by AppLocker's polkit *agent*
+  (`gui/polkit_agent.py`, runs in-session with camera access) — wired separately.
+- If you enabled the graphical tier on an earlier build, clean it up with:
+  `sudo applocker-pam disable uisudo` (before upgrading).
+
 ## 0.0.1-ae — grouped "Unlock these with your face" section
 
 ### Added
