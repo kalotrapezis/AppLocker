@@ -1,15 +1,15 @@
 #!/bin/sh
 # applocker — one command to turn AppLocker on or off.
 #
-#   sudo applocker on       # enforce locked apps + folders, face/PIN/sudo on
-#                           # the lockscreen and for `sudo`
-#   sudo applocker off      # stop everything and remove the PAM hooks
+#   sudo applocker on       # enforce locked apps + folders (the GATE only)
+#   sudo applocker off      # stop the gate and remove any PAM hooks left behind
 #   applocker status        # what's currently active
 #
-# "on" enables the gate service (apps + files) and the sudo + screensaver PAM
-# tiers. The login greeter (LightDM) is left out on purpose — enable it
-# separately once you've confirmed the rest, keeping a root TTY open:
-#   sudo applocker-pam enable lightdm
+# "on" now enables ONLY the gate service. It deliberately does NOT touch PAM
+# (/etc/pam.d/*) — that path can lock you out of login/sudo and is the wrong
+# integration on KDE. Face/PIN on the lockscreen or for `sudo` is a separate,
+# explicit, later step done by hand in a VM with a root TTY open:
+#   sudo applocker-pam enable sudo        # (advanced; risk of lockout)
 set -eu
 
 need_root() {
@@ -21,30 +21,28 @@ on)
 	need_root
 	echo "==> gate service (locked apps + folders)"
 	systemctl enable --now applockerd.service
-	echo "==> face/PIN/sudo for the terminal and the lockscreen"
-	applocker-pam enable sudo
-	applocker-pam enable screensaver
-	# Turn on the walk-away lock too; it starts at the next login (autostart) or
-	# immediately from the AppLocker settings window.
-	applockerd set-attention on >/dev/null || true
+	# The broker (PIN/face for Settings + sudo autocomplete) is safe and separate.
+	systemctl enable --now applockerd-broker.service 2>/dev/null || true
 	cat <<'MSG'
 
-AppLocker is ON: locked apps/folders are enforced, and the lockscreen + sudo
-accept your face (falling back to the password). Test `sudo true` in a NEW
-terminal.
+AppLocker gate is ON: locked apps/folders are enforced (face → PIN → sudo).
+This did NOT touch PAM — your login and terminal `sudo` are unchanged.
 
-Optional — the login greeter too (do this last, keep a root TTY open):
-    sudo applocker-pam enable lightdm
+If launches still aren't blocked, you're on a DEV build (the gate is a no-op so
+it can't freeze). Check:  journalctl -u applockerd.service -e
+and install the RELEASE build to actually enforce (VM only, snapshot first).
 
-Undo everything:  sudo applocker off
+Undo:  sudo applocker off
 MSG
 	;;
 off)
 	need_root
 	systemctl disable --now applockerd.service 2>/dev/null || true
-	applocker-pam disable all
+	# Still remove any PAM hooks a previous (old) `on` may have installed, so this
+	# is always a clean, safe undo even after the Mint-era script ran.
+	applocker-pam disable all 2>/dev/null || true
 	applockerd set-attention off >/dev/null || true
-	echo "AppLocker is OFF (gate stopped, PAM hooks removed, watcher disabled)."
+	echo "AppLocker is OFF (gate stopped; any PAM hooks removed)."
 	;;
 status)
 	printf 'gate service: '

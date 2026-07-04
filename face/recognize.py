@@ -280,15 +280,34 @@ def main() -> int:
                     help="show the guided camera window (falls back to headless)")
     ap.add_argument("--debug", action="store_true",
                     help="print per-frame detector readings (face/eyes/yaw) to stderr")
+    ap.add_argument("--camera-priority", default=None,
+                    help="camera arbitration level: lockscreen|app|file|presence "
+                         "(also read from $APPLOCKER_CAMERA_PRIORITY)")
     ARGS = ap.parse_args()
 
-    if ARGS.ui or os.environ.get("APPLOCKER_UI") == "1":
+    # Arbitrate the camera against the other AppLocker helpers, at the caller's
+    # priority. Unset → run unarbitrated (standalone use / tests). If a higher
+    # level is holding the camera we wait out our budget; failing that, 'noface'.
+    from cameralock import camera_lock, priority_from_name
+    level = priority_from_name(ARGS.camera_priority
+                               or os.environ.get("APPLOCKER_CAMERA_PRIORITY"))
+    if level is None:
+        return _run(ARGS)
+    with camera_lock(level, timeout=ARGS.timeout + 5.0) as got:
+        if not got:
+            print("camera busy (out-prioritised) — giving up this round",
+                  file=sys.stderr)
+            return emit("noface", 3)
+        return _run(ARGS)
+
+
+def _run(args) -> int:
+    if args.ui or os.environ.get("APPLOCKER_UI") == "1":
         try:
-            return run_with_ui(ARGS)
+            return run_with_ui(args)
         except Exception as e:  # no display / no GTK — never block the auth
             print(f"ui unavailable ({e}); running headless", file=sys.stderr)
-
-    word, code = routine(ARGS, HeadlessNotify())
+    word, code = routine(args, HeadlessNotify())
     return emit(word, code)
 
 

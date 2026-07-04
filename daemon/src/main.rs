@@ -223,6 +223,7 @@ fn main() {
         Some("lock-folder") => cmd_lock_folder(std::env::args().nth(2)),
         Some("unlock-folder") => cmd_unlock_folder(std::env::args().nth(2)),
         Some("auth-test") => cmd_auth_test(std::env::args().nth(2)),
+        Some("serve") => applockerd::serve::run(),
         Some("gate") | None => cmd_gate(None),
         // Back-compat: `applockerd <name>` gates that one app for this run,
         // on top of the persisted locked list.
@@ -561,7 +562,13 @@ fn cmd_unlock_app(query: Option<String>) {
     let mut list = locklist::LockList::load(&path);
     let n = list.remove(&query);
     if n == 0 {
-        eprintln!("nothing matched {query:?} in the locked list.");
+        // Log exactly what we loaded so a stored-key vs passed-key mismatch is
+        // visible in the journal instead of a silent "exited 1".
+        eprintln!("nothing matched {query:?} in {} — loaded {} entry(ies):",
+                  path.display(), list.apps.len());
+        for a in &list.apps {
+            eprintln!("  [{}] key={:?} name={:?}", a.kind.as_str(), a.key, a.name);
+        }
         process::exit(1);
     }
     save_locklist_or_exit(&list, &path);
@@ -971,15 +978,29 @@ fn handle_event(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "<unknown>".to_string());
 
+    // Flatpaks exec their real binary inside a bwrap mount namespace, so the host
+    // `…/flatpak/app/<id>/…` path never appears — but a `flatpak`/`bwrap` exec's
+    // pre-exec cmdline still carries `flatpak run … <app-id> …`. So for those
+    // launchers we also match the locked flatpak app-id against the cmdline.
+    let is_flatpak_launcher =
+        is_exec && (path.ends_with("/flatpak") || path.ends_with("/bwrap"));
+
     // Resolve which lock (if any) this event hits: an exec checks the app list by
-    // binary, a file open checks the folder list by path prefix. We copy out the
-    // (key, name) and drop the read lock before any slow work. Not locked → allow
-    // inline — this includes the python3/PAM opens our own prompt makes, so no
-    // self-gating deadlock (the loop keeps answering while a worker runs auth).
+    // binary (and, for flatpak launchers, by cmdline app-id), a file open checks
+    // the folder list by path prefix. Not locked → allow inline (this includes the
+    // python3/PAM opens our own prompt makes, so no self-gating deadlock).
     let hit: Option<(String, String)> = {
         let guard = locks.read().unwrap();
         if is_exec {
-            guard.apps.matches(&path).map(|a| (a.key.clone(), a.name.clone()))
+            let by_path = guard.apps.matches(&path);
+            let matched = by_path.or_else(|| {
+                if is_flatpak_launcher {
+                    guard.apps.matches_flatpak_cmdline(&read_cmdline_tokens(pid))
+                } else {
+                    None
+                }
+            });
+            matched.map(|a| (a.key.clone(), a.name.clone()))
         } else {
             guard.folders.matches(&path).map(|f| (f.path.clone(), f.name.clone()))
         }
@@ -1089,6 +1110,19 @@ fn handle_event(
 /// Is `pid` this daemon or one of its descendants? Walks the PPid chain in
 /// /proc (a handful of small reads; only runs for events that hit a lock). A
 /// vanished process reads as "not ours" — fail closed to the normal auth path.
+/// Read `/proc/<pid>/cmdline` as its NUL-separated argv tokens (empty on any
+/// failure). Used to spot the flatpak app-id in a `flatpak`/`bwrap` launch.
+fn read_cmdline_tokens(pid: libc::c_int) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|b| {
+            b.split(|&c| c == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn pid_is_our_descendant(pid: libc::c_int) -> bool {
     let me = std::process::id() as libc::c_int;
     let mut cur = pid;

@@ -174,6 +174,24 @@ impl FaceVerifier for NoFace {
     }
 }
 
+/// Whose password the sudo fallback should check. `SUDO_USER` when we were
+/// launched via sudo; otherwise, when we run as the root service, the active
+/// desktop user (checking *root's* password would be wrong — the person at the
+/// keyboard is the desktop user). Falls back to `root` only when headless.
+fn desktop_user() -> String {
+    if let Some(u) = pam::invoking_user() {
+        if u != "root" {
+            return u;
+        }
+    }
+    if let Some(ctx) = crate::session::SessionCtx::discover() {
+        if ctx.uid != 0 {
+            return ctx.user;
+        }
+    }
+    "root".to_string()
+}
+
 /// The PIN record location: `$APPLOCKER_PIN_FILE` if set, else the system path.
 pub fn default_pin_path() -> PathBuf {
     match std::env::var_os("APPLOCKER_PIN_FILE") {
@@ -203,7 +221,7 @@ impl SystemFallback {
         SystemFallback {
             pin_path: default_pin_path(),
             pam_service: "sudo".to_string(),
-            user: pam::invoking_user().unwrap_or_else(|| "root".to_string()),
+            user: desktop_user(),
             allow_pin: policy.allow_pin,
             allow_sudo: policy.allow_sudo,
         }

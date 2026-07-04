@@ -49,7 +49,7 @@ install -d "$LIB" \
 # Daemon + all Python helpers, flattened (matches the code's installed-layout
 # fallbacks: /usr/lib/applocker/<script>.py).
 install -m 0755 "$REPO/daemon/target/release/applockerd" "$LIB/applockerd"
-for py in "$REPO"/face/*.py "$REPO"/gui/*.py "$REPO"/vault/*.py; do
+for py in "$REPO"/face/*.py "$REPO"/gui/*.py "$REPO"/vault/*.py "$REPO"/hide/*.py; do
 	install -m 0644 "$py" "$LIB/"
 done
 
@@ -82,9 +82,14 @@ EOF
 	chmod 0644 "$STAGE/etc/applocker/dev-mode"
 fi
 
-# System integration (service ships disabled; autostart is per-user & self-gating).
+# System integration. The GATE unit (applockerd.service) ships disabled — it's
+# the dangerous fanotify enforcer. The BROKER unit (applockerd-broker.service)
+# is safe (no fanotify) and gets enabled in postinst, so the PIN/face can
+# authorise privileged Settings changes without polkit. Autostart is per-user.
 install -m 0644 "$REPO/packaging/systemd/applockerd.service" "$STAGE/lib/systemd/system/"
+install -m 0644 "$REPO/packaging/systemd/applockerd-broker.service" "$STAGE/lib/systemd/system/"
 install -m 0644 "$REPO/packaging/autostart/applocker-watcher.desktop" "$STAGE/etc/xdg/autostart/"
+install -m 0644 "$REPO/packaging/autostart/applocker-hide-watch.desktop" "$STAGE/etc/xdg/autostart/"
 install -m 0644 "$REPO/packaging/applocker-settings.desktop" "$STAGE/usr/share/applications/"
 install -m 0644 "$REPO/README.md" "$STAGE/usr/share/doc/applocker/README.md"
 install -m 0644 "$REPO/TESTS.md"  "$STAGE/usr/share/doc/applocker/TESTS.md"
@@ -97,7 +102,7 @@ Version: $VERSION
 Section: admin
 Priority: optional
 Architecture: $ARCH
-Depends: python3, python3-opencv, python3-numpy, python3-gi, gir1.2-gtk-3.0, libpam0g, libxss1, pkexec, systemd, gocryptfs, fuse3
+Depends: python3, python3-opencv, python3-numpy, python3-gi, python3-dbus, gir1.2-gtk-3.0, libpam0g, libxss1, pkexec, systemd, gocryptfs, fuse3
 Recommends: v4l-utils
 Installed-Size: $INSTALLED_KB
 Maintainer: AppLocker <kalotrapezis@gmail.com>
@@ -114,8 +119,17 @@ if [ "${APPLOCKER_RELEASE:-}" = "1" ]; then
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
+# RELEASE build: the real gate must NOT be dev-disabled. Clear any leftover
+# dev-mode marker from a prior dev install, otherwise the gate silently no-ops.
+rm -f /etc/applocker/dev-mode
 if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
 	systemctl daemon-reload >/dev/null 2>&1 || true
+	# The auth broker is safe (no fanotify) and needed for the PIN/face to
+	# authorise Settings changes without polkit — enable it by default.
+	systemctl enable --now applockerd-broker.service >/dev/null 2>&1 || true
+	# On an UPGRADE the unit is already running the old binary; restart it so the
+	# freshly-installed daemon takes over (enable --now won't restart a running one).
+	systemctl try-restart applockerd-broker.service >/dev/null 2>&1 || true
 fi
 cat <<'MSG'
 
@@ -148,6 +162,12 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 set -e
 if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
 	systemctl daemon-reload >/dev/null 2>&1 || true
+	# The auth broker is safe (no fanotify) and needed for the PIN/face to
+	# authorise Settings changes without polkit — enable it by default.
+	systemctl enable --now applockerd-broker.service >/dev/null 2>&1 || true
+	# On an UPGRADE the unit is already running the old binary; restart it so the
+	# freshly-installed daemon takes over (enable --now won't restart a running one).
+	systemctl try-restart applockerd-broker.service >/dev/null 2>&1 || true
 fi
 cat <<'MSG'
 
@@ -182,6 +202,7 @@ set -e
 if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
 	if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
 		systemctl disable --now applockerd.service >/dev/null 2>&1 || true
+		systemctl disable --now applockerd-broker.service >/dev/null 2>&1 || true
 	fi
 fi
 exit 0

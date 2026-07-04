@@ -11,9 +11,12 @@ Mint-Y theme (light/dark + accent) automatically — no hardcoded colours, no
 custom CSS fighting the theme. (Same approach as the auth prompt; the KDE port
 reskins in Qt.)
 
-Tamper protection: opening this window **requires auth** (`applockerd
-authorize`), because otherwise anyone could just open it and remove the locks or
-enrol their own face. Privileged changes go through `pkexec applockerd …`.
+Tamper protection: opening this window **requires auth**, because otherwise
+anyone could just open it and remove the locks or enrol their own face. Both the
+open-gate and every privileged change go through the root **auth broker**
+(daemon/src/serve.rs) over a Unix socket, so the AppLocker PIN — not just the
+sudo password — authorises them. If no broker is running we fall back to the old
+`pkexec applockerd …` path (sudo-only) so nothing is worse than before.
 
 Reads are unprivileged (the config files are world-readable); writes need root.
 """
@@ -21,11 +24,30 @@ Reads are unprivileged (the config files are world-readable); writes need root.
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import os
+import secrets
 import shlex
+import socket
 import subprocess
 import sys
 import threading
+
+# A user-writable log (the GUI has no terminal), so add/remove/broker issues are
+# diagnosable after the fact:  tail -f ~/.cache/applocker/settings.log
+LOG_PATH = os.path.expanduser("~/.cache/applocker/settings.log")
+
+
+def _log(msg: str) -> None:
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}"
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    sys.stderr.write("applocker-settings: " + msg + "\n")
 
 import gi
 
@@ -47,6 +69,15 @@ for _vp in (os.path.dirname(os.path.abspath(__file__)),
         break
 import vault as vaultlib  # noqa: E402
 
+# The hide-in-place helper (edits `.hidden` — no root, no encryption). Installed
+# flat next to us; in the repo it's ../hide. Same lookup pattern as vault.
+for _hp in (os.path.dirname(os.path.abspath(__file__)),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hide")):
+    if os.path.exists(os.path.join(_hp, "hidelist.py")):
+        sys.path.insert(0, _hp)
+        break
+import hidelist  # noqa: E402
+
 
 # ── locating the daemon + its config ─────────────────────────────────────────
 
@@ -66,8 +97,9 @@ def script_path(name: str) -> str:
     """Locate a bundled helper script whether we're running from the repo
     (gui/ next to face/) or the installed flat layout (/usr/lib/applocker/)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    for cand in (os.path.join(here, name),               # installed: flat
-                 os.path.join(here, "..", "face", name)):  # repo: ../face
+    for cand in (os.path.join(here, name),                 # installed: flat
+                 os.path.join(here, "..", "face", name),   # repo: ../face
+                 os.path.join(here, "..", "hide", name)):   # repo: ../hide
         if os.path.exists(cand):
             return cand
     return os.path.join(here, name)
@@ -145,52 +177,207 @@ def enrolled_face() -> bool:
     return os.path.exists(path)
 
 
-def list_installed() -> list:
-    """[(kind, key, name)] from the daemon's porcelain output."""
+def has_enrolled_faces() -> bool:
+    """True if at least one face profile exists (any of them unlocks)."""
     try:
-        out = subprocess.run(
+        return bool(matcher.list_profiles())
+    except Exception:
+        return False
+
+
+def has_camera() -> bool:
+    """True if the system exposes any V4L camera device (/dev/video*)."""
+    try:
+        return any(n.startswith("video") for n in os.listdir("/dev"))
+    except OSError:
+        return False
+
+
+# ── automatic brightness config (user-side, no root) ─────────────────────────
+# Brightness is a per-session preference, so it lives in the user's config and is
+# read by the presence watcher (watch_presence.py). No daemon/broker/root.
+BRIGHTNESS_PATH = os.environ.get(
+    "APPLOCKER_BRIGHTNESS",
+    os.path.expanduser("~/.config/applocker/brightness.json"))
+
+BRIGHTNESS_DEFAULTS = {
+    "enabled": False,
+    # Target screen brightness (%) per time of day.
+    "levels": {"morning": 100, "midday": 100, "afternoon": 80, "night": 20},
+    # How far the room-darkness reading may nudge the target, ± this many %.
+    "area": 25,
+}
+
+
+def read_brightness() -> dict:
+    out = {**BRIGHTNESS_DEFAULTS, "levels": dict(BRIGHTNESS_DEFAULTS["levels"])}
+    try:
+        with open(BRIGHTNESS_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            out["enabled"] = bool(data.get("enabled", out["enabled"]))
+            out["area"] = int(data.get("area", out["area"]))
+            for k in out["levels"]:
+                if k in data.get("levels", {}):
+                    out["levels"][k] = int(data["levels"][k])
+    except (OSError, ValueError, TypeError):
+        pass
+    return out
+
+
+def write_brightness(cfg: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(BRIGHTNESS_PATH), exist_ok=True)
+        with open(BRIGHTNESS_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
+
+
+# Set by list_installed() so the picker can explain an empty list.
+_LAST_LIST_ERR = ""
+
+
+def list_installed() -> list:
+    """[(kind, key, name)] from the daemon's porcelain output. On trouble returns
+    [] and records why in _LAST_LIST_ERR (shown in the picker)."""
+    global _LAST_LIST_ERR
+    _LAST_LIST_ERR = ""
+    try:
+        p = subprocess.run(
             [bin_path(), "list-installed", "--porcelain"],
             capture_output=True, text=True, timeout=20,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        _LAST_LIST_ERR = f"couldn't run applockerd ({bin_path()}): {e}"
         return []
+    if p.returncode != 0:
+        _LAST_LIST_ERR = p.stderr.strip() or f"applockerd exited {p.returncode}"
     apps = []
-    for line in out.splitlines():
+    for line in p.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) == 3:
             apps.append(tuple(parts))
+    if not apps and not _LAST_LIST_ERR:
+        _LAST_LIST_ERR = "no installed apps were found on this system."
     return apps
 
 
-# ── talking to the daemon ────────────────────────────────────────────────────
+# ── talking to the daemon (via the root auth broker) ─────────────────────────
+#
+# Every privileged action goes through the broker socket (see daemon/src/serve.rs)
+# instead of pkexec. The broker runs *our* auth routine, so the PIN works
+# everywhere — pkexec/polkit only ever knew the sudo password. If no broker is
+# running (older install, or the service is off), we fall back to the old pkexec
+# path so nothing is worse than before.
 
-def authorize() -> bool:
-    """Gate opening the window. Returns True only if the auth routine passes."""
+def socket_path() -> str:
+    return os.environ.get("APPLOCKER_SOCK", "/run/applockerd.sock")
+
+
+# One token per Settings process. The broker authenticates the window once and
+# every change inside it rides that same auth — so adding an app and then
+# pressing Apply no longer prompts twice. A new window mints a new token, which
+# forces a fresh auth (tamper protection). `force=True` bypasses the token, for
+# the one place we want auth on *every* press (folder reveal).
+_WINDOW_TOKEN = secrets.token_hex(16)
+
+
+def _broker(verb: str, ops: list | None = None,
+            reason: str = "AppLocker settings", force: bool = False):
+    """Send one request to the broker. Returns the broker's reply string
+    (e.g. 'ok', 'denied', 'error …'); None if the broker socket is ABSENT (caller
+    may fall back); '' if the socket exists but the broker didn't answer."""
+    path = socket_path()
+    # Don't log secrets: for set-pin/verify the op carries the PIN.
+    op_summary = [op[0] if op else "" for op in (ops or [])]
+    if not os.path.exists(path):
+        _log(f"broker {verb} ops={op_summary}: socket {path} absent (fallback)")
+        return None
+    lines = [verb, _WINDOW_TOKEN, reason, "force" if force else "-"]
+    lines += ["\t".join(op) for op in (ops or [])]
+    payload = ("\n".join(lines) + "\n").encode()
     try:
-        rc = subprocess.run([bin_path(), "authorize", "AppLocker settings"]).returncode
-        return rc == 0
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(300)  # a slow human at the prompt is fine; a hang isn't
+            s.connect(path)
+            s.sendall(payload)
+            s.shutdown(socket.SHUT_WR)
+            reply = b""
+            while True:
+                chunk = s.recv(256)
+                if not chunk:
+                    break
+                reply += chunk
+    except OSError as e:
+        _log(f"broker {verb} ops={op_summary}: connect/io failed ({e}) — broker down")
+        return ""  # reachable file, but the broker is broken/gone
+    decoded = reply.decode(errors="replace").strip()
+    # Log only the first token of the reply (get-sudo's reply carries the password).
+    _log(f"broker {verb} ops={op_summary} -> reply={decoded.splitlines()[0] if decoded else '<empty>'!r}")
+    return decoded
+
+
+def _ok(reply) -> bool:
+    """True iff a broker reply string means success."""
+    return bool(reply) and reply.startswith("ok")
+
+
+def _broker_problem(reply, action: str) -> str:
+    """A human explanation of why a broker call failed, for a toast."""
+    if reply is None:
+        return (f"The AppLocker background service isn't running, so I can't {action}.\n\n"
+                "Start it with:\n    sudo systemctl start applockerd-broker.service")
+    if reply == "":
+        return (f"Couldn't reach the AppLocker service to {action} — it may have crashed.\n\n"
+                "Restart it with:\n    sudo systemctl restart applockerd-broker.service\n"
+                "and check why with:\n    journalctl -u applockerd-broker.service -e")
+    if reply.startswith("denied"):
+        return f"Authentication was declined, so I didn't {action}."
+    if reply.startswith("error"):
+        return f"The service couldn't {action}:\n{reply[6:].strip()}"
+    return f"Couldn't {action}: {reply}"
+
+
+def authorize(reason: str = "AppLocker settings", force: bool = False) -> bool:
+    """Gate an action. True only if the auth routine passes. Used to open the
+    window and (with force) to reveal the Private folder."""
+    r = _broker("authorize", reason=reason, force=force)
+    if r is not None:
+        return _ok(r)
+    try:  # no broker: fall back to the user-run routine (PIN if readable, else sudo)
+        return subprocess.run([bin_path(), "authorize", reason]).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def change_pin(new_pin: str) -> bool:
+    """Set/replace the PIN via the broker (forces a fresh auth). Needs the broker
+    running — there's no safe pkexec fallback (set-pin reads a TTY)."""
+    return _ok(_broker("set-pin", ops=[["pin", new_pin]],
+                       reason="Change AppLocker PIN", force=True))
+
+
+def forget_sudo() -> bool:
+    """Wipe the stored sudo password (turn off sudo autocomplete)."""
+    return _ok(_broker("forget-sudo", reason="Turn off sudo autocomplete", force=True))
 
 
 def run_privileged(args: list) -> bool:
-    """Run a mutating `applockerd` subcommand as root. Uses pkexec unless
-    $APPLOCKER_NO_PKEXEC=1 (for dev/testing with user-writable config paths)."""
-    cmd = [bin_path(), *args]
-    if os.environ.get("APPLOCKER_NO_PKEXEC") != "1":
-        cmd = ["pkexec", *cmd]
-    try:
-        return subprocess.run(cmd).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    """Apply one mutating change through the broker (one auth for the window)."""
+    return run_privileged_batch([args])
 
 
-def run_privileged_batch(ops: list) -> bool:
-    """Apply several mutating `applockerd` subcommands under **one** auth prompt.
-    `ops` is a list of arg-lists. Runs them as `pkexec sh -c 'cmd1 && cmd2 …'` so
-    the user authenticates once for the whole Apply, not once per change."""
+def run_privileged_batch(ops: list, force: bool = False) -> bool:
+    """Apply several mutating changes under one auth. Prefers the broker; falls
+    back to `pkexec sh -c '…'` only when no broker is reachable. `force=True`
+    demands a fresh auth even inside an already-authorised window (used when a
+    change *weakens* security, e.g. turning off a factor)."""
     if not ops:
         return True
+    r = _broker("apply", ops=ops, force=force)
+    if r is not None:
+        return _ok(r)
     binp = bin_path()
     script = " && ".join(
         " ".join(shlex.quote(tok) for tok in [binp, *op]) for op in ops
@@ -243,7 +430,12 @@ def dev_mode() -> bool:
 
 
 def set_service(active: bool) -> bool:
-    """Start or stop the gate service (root, via pkexec unless dev mode)."""
+    """Start or stop the enforcement gate service. Through the broker (so the PIN
+    works); falls back to pkexec systemctl when no broker is reachable."""
+    r = _broker("apply", ops=[["service", "on" if active else "off"]],
+                reason=("Start" if active else "Stop") + " AppLocker gate")
+    if r is not None:
+        return _ok(r)
     cmd = ["systemctl", "start" if active else "stop", SERVICE]
     if os.environ.get("APPLOCKER_NO_PKEXEC") != "1":
         cmd = ["pkexec", *cmd]
@@ -287,7 +479,9 @@ class SettingsWindow(Gtk.Window):
         self._build_face_section()
         self._build_apps_section()
         self._build_vault_section()
+        self._build_hidden_section()
         self._build_policy_section()
+        self._build_brightness_section()  # only visible when presence is on
         self._build_apply_bar(outer)  # pinned at the bottom
 
     # -- service bar ---------------------------------------------------------
@@ -379,7 +573,7 @@ class SettingsWindow(Gtk.Window):
         box = self._section("Face unlock")
 
         row, self.face_switch = self._switch_row("Use face unlock", cfg["face"])
-        self.face_switch.connect("notify::active", self._on_policy_changed)
+        self.face_switch.connect("notify::active", self._on_face_toggled)
         box.pack_start(row, False, False, 0)
 
         # The list of enrolled face profiles (up to MAX_FACES), each with a name
@@ -486,8 +680,11 @@ class SettingsWindow(Gtk.Window):
 
     def _refresh_vault(self):
         box = self.vault_box
+        # destroy() (not remove()): fully drop the old widgets so no ghost
+        # allocation lingers — that leftover is what made the button overlap the
+        # next section after a delete+recreate.
         for child in box.get_children():
-            box.remove(child)
+            child.destroy()
         path = vaultlib.standard_path()
         vid, v = self._standard_vault()
 
@@ -499,6 +696,11 @@ class SettingsWindow(Gtk.Window):
                 "are there. It can't freeze the system."))
             lbl.set_use_markup(True)
             lbl.set_line_wrap(True)
+            # Bound the width so a wrapped label reports a STABLE height-for-width.
+            # Without this it measures its height for the unwrapped (one-line) width,
+            # so the frame is allocated too little height and the button below
+            # overflows into the next section — the delete→recreate overlap.
+            lbl.set_max_width_chars(46)
             box.pack_start(lbl, False, False, 0)
             self.vault_hide_chk = Gtk.CheckButton(
                 label="Hide the folder in the file manager while locked")
@@ -510,7 +712,8 @@ class SettingsWindow(Gtk.Window):
             btn.connect("clicked", self._on_vault_enable)
             box.pack_start(btn, False, False, 0)
             box.show_all()
-            return
+            self._reflow()  # same repaint as the unlocked branch — clears the old
+            return           # (taller) layout's stale pixels off the next section
 
         mounted = vaultlib.is_mounted(v["mount"])
         state = ("<span foreground='#c0392b'>Locked</span>" if not mounted
@@ -539,6 +742,23 @@ class SettingsWindow(Gtk.Window):
         delbtn.connect("clicked", self._on_vault_delete)
         box.pack_start(delbtn, False, False, 0)
         box.show_all()
+        self._reflow()
+
+    def _reflow(self):
+        """Re-measure and fully repaint after swapping a section's contents.
+        queue_resize re-measures but leaves the pixels a now-shorter section
+        vacated (the old button) painted over its neighbour — that's the overlap.
+        A full queue_draw on the toplevel, deferred so it runs *after* the resize
+        re-allocation, clears them."""
+        self.queue_resize()
+
+        def _repaint():
+            win = self.get_window()
+            if win is not None:
+                win.invalidate_rect(None, True)  # whole window → clears stale pixels
+            return False
+
+        GLib.idle_add(_repaint)
 
     def _on_vault_enable(self, _btn):
         hide = self.vault_hide_chk.get_active()
@@ -557,8 +777,12 @@ class SettingsWindow(Gtk.Window):
         if vaultlib.is_mounted(v["mount"]):
             vaultlib.cmd_lock(ns)
         else:
-            # The settings window is already behind an auth check (opened via
-            # `applockerd authorize`), so unlocking here doesn't re-prompt yet.
+            # Revealing the Private folder is the one action we re-authenticate on
+            # *every* press, regardless of the window already being open — it's the
+            # most sensitive thing here. force=True bypasses the window token.
+            if not authorize(reason="Reveal Private folder", force=True):
+                self._toast("Authentication required to reveal the Private folder.")
+                return
             vaultlib.cmd_unlock(ns)
         self._refresh_vault()
 
@@ -589,6 +813,96 @@ class SettingsWindow(Gtk.Window):
             self._toast("Couldn't delete the vault (is a file still open in it?).")
         self._refresh_vault()
 
+    # -- Hidden files & folders (hide-in-place, no encryption) ----------------
+
+    def _build_hidden_section(self):
+        box = self._section("Hidden files & folders")
+
+        warn = Gtk.Label(xalign=0, label=(
+            "This just hides files from the file manager — it does <b>not</b> "
+            "encrypt or move them, so it is <b>not as secure as the Private "
+            "folder</b> above. Anyone with terminal access can still read them. "
+            "For real protection, move them into the Private folder instead."))
+        warn.set_use_markup(True)
+        warn.set_line_wrap(True)
+        warn.set_max_width_chars(46)  # stable height-for-width (see _refresh_vault)
+        box.pack_start(warn, False, False, 0)
+
+        self.hidden_list = Gtk.ListBox()
+        self.hidden_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        box.pack_start(self.hidden_list, False, False, 0)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        addf = Gtk.Button(label="Add file…")
+        addf.connect("clicked", lambda _b: self._pick_and_hide(
+            Gtk.FileChooserAction.OPEN, "Choose a file to hide"))
+        btns.pack_start(addf, False, False, 0)
+        addd = Gtk.Button(label="Add folder…")
+        addd.connect("clicked", lambda _b: self._pick_and_hide(
+            Gtk.FileChooserAction.SELECT_FOLDER, "Choose a folder to hide"))
+        btns.pack_start(addd, False, False, 0)
+        btns.set_halign(Gtk.Align.START)
+        box.pack_start(btns, False, False, 0)
+
+        hint = Gtk.Label(xalign=0, label=(
+            "Hidden items reappear when you open their folder and AppLocker sees "
+            "your face; they hide again when you lock the screen or walk away. "
+            "The X reveals one for good and stops managing it."))
+        hint.get_style_context().add_class("dim-label")
+        hint.set_line_wrap(True)
+        hint.set_max_width_chars(46)
+        box.pack_start(hint, False, False, 0)
+        self._refresh_hidden()
+
+    def _refresh_hidden(self):
+        self._clear(self.hidden_list)
+        try:
+            entries = hidelist.load_registry()
+        except Exception:
+            entries = []
+        if not entries:
+            self.hidden_list.add(self._info_row("Nothing hidden yet."))
+        for path in entries:
+            state = "hidden" if hidelist.is_hidden(path) else "shown"
+            gone = "" if os.path.exists(path) else " — missing"
+            label = (f"{os.path.basename(path)}   ·   {os.path.dirname(path)}"
+                     f"   ({state}{gone})")
+            self.hidden_list.add(self._list_row(
+                label, lambda _b, p=path: self._remove_hidden(p)))
+        self.hidden_list.show_all()
+
+    def _pick_and_hide(self, action, title):
+        dlg = Gtk.FileChooserDialog(title=title, transient_for=self, modal=True,
+                                    action=action)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                        "Hide", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        try:
+            dlg.set_current_folder(os.path.expanduser("~"))
+        except Exception:
+            pass
+        path = dlg.get_filename() if dlg.run() == Gtk.ResponseType.OK else None
+        dlg.destroy()
+        if not path:
+            return
+        ok, why = hidelist.is_safe(path)
+        if not ok:
+            self._toast(f"Can't hide that: {why}")
+            return
+        hidelist.cmd_add(argparse.Namespace(path=path))
+        # Start the auto-reveal watcher now so it works before the next login
+        # (it's single-instance, so a duplicate launch just exits).
+        spawn([sys.executable, script_path("hide_watch.py")])
+        self._refresh_hidden()
+
+    def _remove_hidden(self, path: str):
+        # The X reveals the item and stops managing it (like unlocking an app).
+        try:
+            hidelist.cmd_forget(argparse.Namespace(path=path))
+        except Exception as e:
+            self._toast(f"Couldn't reveal that: {e}")
+        self._refresh_hidden()
+
     def _build_policy_section(self):
         cfg = read_config()
         box = self._section("Unlock alternatives")
@@ -596,6 +910,17 @@ class SettingsWindow(Gtk.Window):
         prow, self.pin_switch = self._switch_row("Use PIN", cfg["pin"])
         self.pin_switch.connect("notify::active", self._on_fallback_toggled, "pin")
         box.pack_start(prow, False, False, 0)
+
+        # Change PIN — the only place to change it after first-run setup.
+        pinbtns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        change = Gtk.Button(label="Change PIN…")
+        change.set_halign(Gtk.Align.START)
+        change.connect("clicked", self._on_change_pin)
+        pinbtns.pack_start(change, False, False, 0)
+        reset = Gtk.Button(label="Turn off sudo autocomplete")
+        reset.connect("clicked", self._on_forget_sudo)
+        pinbtns.pack_start(reset, False, False, 0)
+        box.pack_start(pinbtns, False, False, 0)
 
         srow, self.sudo_switch = self._switch_row("Use sudo password", cfg["sudo"])
         self.sudo_switch.connect("notify::active", self._on_fallback_toggled, "sudo")
@@ -618,7 +943,7 @@ class SettingsWindow(Gtk.Window):
 
         arow, self.attention_switch = self._switch_row(
             "Lock when I leave (presence watcher)", cfg["attention"])
-        self.attention_switch.connect("notify::active", self._on_policy_changed)
+        self.attention_switch.connect("notify::active", self._on_attention_toggled)
         box.pack_start(arow, False, False, 0)
         anote = Gtk.Label(xalign=0, label="The camera stays off while you work. "
                           "Once you're idle it takes a quick photo now and then; "
@@ -756,7 +1081,14 @@ class SettingsWindow(Gtk.Window):
         if not ops:
             return
         started_attention = ui["attention"] and not self._persisted["attention"]
-        if run_privileged_batch(ops):
+        # Turning OFF an auth factor weakens security, so it must not ride the
+        # window's cached auth (e.g. a passive face match) — demand a fresh,
+        # explicit auth for it, the same as revealing the Private folder.
+        p = self._persisted
+        weakens = ((p["face"] and not ui["face"])
+                   or (p["pin"] and not ui["pin"])
+                   or (p["sudo"] and not ui["sudo"]))
+        if run_privileged_batch(ops, force=weakens):
             self._persisted = read_config()
             self._reset_controls()  # resync to what actually saved
             self._update_apply_state()
@@ -780,6 +1112,129 @@ class SettingsWindow(Gtk.Window):
             return
         self._update_apply_state()
 
+    def _on_face_toggled(self, switch, _param):
+        # Don't let face unlock be turned on with no face enrolled — it would
+        # silently do nothing and always fall through to PIN/sudo.
+        if self._loading:
+            return
+        if switch.get_active() and not has_enrolled_faces():
+            self._loading = True
+            switch.set_active(False)
+            self._loading = False
+            self._toast("Add a face first (“Add a new face…”) before turning on "
+                        "face unlock.")
+            return
+        self._update_apply_state()
+
+    def _on_attention_toggled(self, switch, _param):
+        # Presence monitoring needs a camera (it never checks *who* you are, so no
+        # enrolled face is required — but without a camera it can't work at all).
+        if self._loading:
+            return
+        if switch.get_active() and not has_camera():
+            self._loading = True
+            switch.set_active(False)
+            self._loading = False
+            self._toast("No camera detected, so “lock when I leave” can't work on "
+                        "this machine.")
+            return
+        self._update_apply_state()
+        self._refresh_brightness_visibility()
+
+    # -- automatic brightness (only shown when presence is on) ---------------
+    def _build_brightness_section(self):
+        # Own frame so we can show/hide the whole thing. Native Gtk → KDE theme.
+        # Deliberately simple: a toggle + a short explanation, with the sliders
+        # tucked behind an "Advanced" expander so the default view isn't busy.
+        frame = Gtk.Frame(label="Automatic screen brightness")
+        self.brightness_frame = frame
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                        border_width=10)
+        frame.add(inner)
+        self.box.pack_start(frame, False, False, 0)
+
+        bc = read_brightness()
+        erow, self.bright_enable = self._switch_row(
+            "Adjust brightness automatically", bc["enabled"])
+        self.bright_enable.connect("notify::active", self._on_brightness_enable_toggled)
+        inner.pack_start(erow, False, False, 0)
+
+        note = Gtk.Label(xalign=0, label=(
+            "While “lock when I leave” is on, the screen brightness follows the time "
+            "of day and how dark the room looks to the camera — bright in daylight, "
+            "gentle at night. Good defaults are used; open Advanced to set your own."))
+        note.get_style_context().add_class("dim-label")
+        note.set_line_wrap(True)
+        inner.pack_start(note, False, False, 0)
+
+        # Advanced: the per-time-of-day levels + adjustment range, collapsed.
+        adv = Gtk.Expander(label="Advanced — set the levels yourself")
+        adv_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                          border_width=6)
+        adv.add(adv_box)
+        inner.pack_start(adv, False, False, 0)
+
+        self.bright_sliders = {}
+        for key, label in (("morning", "Morning"), ("midday", "Midday"),
+                           ("afternoon", "Afternoon"), ("night", "Night")):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.pack_start(Gtk.Label(label=label, xalign=0, width_chars=10),
+                           False, False, 0)
+            sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+            sc.set_value(bc["levels"][key])
+            sc.set_value_pos(Gtk.PositionType.RIGHT)
+            self._tune_scale(sc)
+            sc.connect("value-changed", self._on_brightness_changed)
+            row.pack_start(sc, True, True, 0)
+            self.bright_sliders[key] = sc
+            adv_box.pack_start(row, False, False, 0)
+
+        arow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        arow.pack_start(Gtk.Label(label="Room adjustment ± %", xalign=0,
+                                  width_chars=14), False, False, 0)
+        self.bright_area = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 50, 5)
+        self.bright_area.set_value(bc["area"])
+        self.bright_area.set_value_pos(Gtk.PositionType.RIGHT)
+        self._tune_scale(self.bright_area)
+        self.bright_area.connect("value-changed", self._on_brightness_changed)
+        arow.pack_start(self.bright_area, True, True, 0)
+        adv_box.pack_start(arow, False, False, 0)
+
+        self._refresh_brightness_visibility()
+
+    @staticmethod
+    def _tune_scale(sc):
+        """Stop the mouse wheel from nudging the value — it grabs scroll by
+        default, which is annoying inside a scrolling window."""
+        sc.connect("scroll-event", lambda _w, _e: True)  # consume → no accidental drag
+
+    def _refresh_brightness_visibility(self):
+        # Invisible until presence is enabled (per the design).
+        if getattr(self, "brightness_frame", None) is None:
+            return
+        if self.attention_switch.get_active():
+            self.brightness_frame.show_all()
+        else:
+            self.brightness_frame.hide()
+
+    def _on_brightness_changed(self, *_args):
+        if self._loading:
+            return
+        write_brightness({
+            "enabled": self.bright_enable.get_active(),
+            "levels": {k: int(s.get_value()) for k, s in self.bright_sliders.items()},
+            "area": int(self.bright_area.get_value()),
+        })
+
+    def _on_brightness_enable_toggled(self, *_args):
+        if self._loading:
+            return
+        self._on_brightness_changed()  # persist the on/off
+        if self.bright_enable.get_active():
+            # Adjust the screen NOW, don't wait for the next idle snapshot.
+            spawn([sys.executable, script_path("watch_presence.py"),
+                   "--brightness-once"])
+
     def _on_fallback_toggled(self, switch, _param, which):
         if self._loading:
             return
@@ -792,16 +1247,81 @@ class SettingsWindow(Gtk.Window):
             return
         self._update_apply_state()
 
+    def _ask_new_pin(self):
+        """Modal dialog with two hidden entries; returns the new PIN or None."""
+        dlg = Gtk.Dialog(title="Change PIN", transient_for=self, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Set PIN", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        area = dlg.get_content_area()
+        area.set_spacing(8)
+        area.set_border_width(12)
+        e1 = Gtk.Entry(visibility=False, placeholder_text="New PIN")
+        e2 = Gtk.Entry(visibility=False, placeholder_text="Confirm new PIN")
+        e1.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        e2.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        e2.set_activates_default(True)
+        for e in (e1, e2):
+            area.add(e)
+        dlg.show_all()
+        while True:
+            resp = dlg.run()
+            if resp != Gtk.ResponseType.OK:
+                dlg.destroy()
+                return None
+            a, b = e1.get_text(), e2.get_text()
+            if len(a) < 4:
+                self._toast("Use a PIN of at least 4 digits.")
+                continue
+            if a != b:
+                self._toast("The two PINs don't match.")
+                e2.set_text("")
+                continue
+            dlg.destroy()
+            return a
+
+    def _on_change_pin(self, _btn):
+        new = self._ask_new_pin()
+        if new is None:
+            return
+        # change_pin forces a fresh auth in the broker before it takes effect.
+        if change_pin(new):
+            self._toast("PIN changed.")
+            self._persisted = read_config()
+            self._reset_controls()
+        else:
+            self._toast("Couldn't change the PIN. Is the AppLocker service running?")
+
+    def _on_forget_sudo(self, _btn):
+        confirm = Gtk.MessageDialog(
+            transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Turn off sudo autocomplete?")
+        confirm.format_secondary_text(
+            "The stored sudo password is wiped. GUI privilege prompts will ask for "
+            "your password normally until you set it up again.")
+        go = confirm.run() == Gtk.ResponseType.OK
+        confirm.destroy()
+        if not go:
+            return
+        self._toast("Sudo autocomplete turned off." if forget_sudo()
+                    else "Couldn't reach the AppLocker service.")
+
     def _on_add_app(self, _btn):
         AppPicker(self, self._add_app)
 
     def _add_app(self, key: str):
-        if run_privileged(["lock-app", key]):
-            self._refresh_apps()
+        r = _broker("apply", ops=[["lock-app", key]])
+        self._refresh_apps()  # always resync to disk so the UI can't go stale
+        if not _ok(r):
+            _log(f"add-app {key!r} COMPLAINED: reply={r!r}")
+            self._toast(_broker_problem(r, "lock that app"))
 
     def _remove_app(self, key: str):
-        if run_privileged(["unlock-app", key]):
-            self._refresh_apps()
+        r = _broker("apply", ops=[["unlock-app", key]])
+        self._refresh_apps()  # always resync to disk (a phantom row can't linger)
+        if not _ok(r):
+            _log(f"remove-app {key!r} COMPLAINED: reply={r!r}")
+            self._toast(_broker_problem(r, "unlock that app"))
 
     def _toast(self, text: str):
         dlg = Gtk.MessageDialog(transient_for=self, modal=True,
@@ -827,7 +1347,8 @@ class AppPicker(Gtk.Dialog):
         box.pack_start(self.search, False, False, 0)
 
         self.store = Gtk.ListStore(str, str, str)  # name, key, kind
-        for kind, key, name in list_installed():
+        apps = list_installed()
+        for kind, key, name in apps:
             self.store.append([name, key, kind])
         self.filter = self.store.filter_new()
         self.filter.set_visible_func(self._match)
@@ -839,6 +1360,13 @@ class AppPicker(Gtk.Dialog):
         scroller = Gtk.ScrolledWindow()
         scroller.add(view)
         box.pack_start(scroller, True, True, 0)
+
+        # Empty list is otherwise a blank, confusing dialog — say why.
+        if not apps:
+            msg = Gtk.Label(xalign=0, label="Couldn't list installed apps:\n" + _LAST_LIST_ERR)
+            msg.set_line_wrap(True)
+            msg.get_style_context().add_class("dim-label")
+            box.pack_start(msg, False, False, 0)
 
         self.show_all()
 
@@ -862,6 +1390,9 @@ def main():
         return 1
     win = SettingsWindow()
     win.show_all()
+    # show_all() reveals every section; now hide the brightness panel unless
+    # presence is on (it stays hidden until "lock when I leave" is enabled).
+    win._refresh_brightness_visibility()
     Gtk.main()
     return 0
 

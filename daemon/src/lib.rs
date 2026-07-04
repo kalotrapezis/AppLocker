@@ -15,4 +15,6 @@ pub mod locklist;
 pub mod pam;
 pub mod pin;
 pub mod policy;
+pub mod serve;
 pub mod session;
+pub mod sudopass;

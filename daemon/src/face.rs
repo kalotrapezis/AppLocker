@@ -48,6 +48,13 @@ impl FaceVerifier for SubprocessFace {
         if std::env::var_os("APPLOCKER_MODELS").is_none() {
             cmd.env("APPLOCKER_MODELS", self.home.join(".config/applocker/models"));
         }
+        // App-gate face auth arbitrates the camera at APP priority — above the
+        // hidden-folder reveal (FILE) and the presence watcher (PRESENCE), below
+        // the screen-unlock tier (LOCKSCREEN, not wired yet). recognize.py reads
+        // this and steps the lower helpers aside. Don't override a caller's choice.
+        if std::env::var_os("APPLOCKER_CAMERA_PRIORITY").is_none() {
+            cmd.env("APPLOCKER_CAMERA_PRIORITY", "app");
+        }
         cmd.arg(&self.script)
             .arg("--faces-dir")
             .arg(faces_dir(&self.home))

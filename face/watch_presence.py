@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -38,6 +39,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from attention import Config, Phase, SnapshotPresence  # noqa: E402
+from cameralock import PRESENCE, camera_lock  # noqa: E402
 
 import gi  # noqa: E402
 
@@ -120,6 +122,148 @@ def session_locked() -> bool:
         return out == "yes"
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+# ── automatic brightness ─────────────────────────────────────────────────────
+# Reads the user's brightness prefs (written by the settings GUI) and, on each
+# snapshot, nudges the screen brightness toward the time-of-day level based on how
+# dark the room looks. User-side only — no root, no daemon.
+
+BRIGHTNESS_PATH = os.environ.get(
+    "APPLOCKER_BRIGHTNESS",
+    os.path.expanduser("~/.config/applocker/brightness.json"))
+
+# The presence snapshots only fire when you're *idle*, so brightness would never
+# track the room while you're actively typing. This is the independent cadence for
+# a brightness-only camera peek that runs whether you're active or idle (default
+# 30 min), so the screen follows time-of-day + room light even during heavy use.
+BRIGHTNESS_INTERVAL = 30 * 60
+
+_bright_state = {"target": None, "backend": "?"}  # for change-only logging
+
+
+def read_brightness_config() -> dict:
+    cfg = {"enabled": False,
+           "levels": {"morning": 100, "midday": 100, "afternoon": 80, "night": 20},
+           "area": 25}
+    try:
+        with open(BRIGHTNESS_PATH) as f:
+            data = json.load(f)
+        cfg["enabled"] = bool(data.get("enabled", False))
+        cfg["area"] = int(data.get("area", cfg["area"]))
+        for k in cfg["levels"]:
+            if k in data.get("levels", {}):
+                cfg["levels"][k] = int(data["levels"][k])
+    except (OSError, ValueError, TypeError):
+        pass
+    return cfg
+
+
+def _time_of_day_level(levels: dict, hour: int) -> int:
+    if 5 <= hour < 11:
+        return levels["morning"]
+    if 11 <= hour < 16:
+        return levels["midday"]
+    if 16 <= hour < 20:
+        return levels["afternoon"]
+    return levels["night"]
+
+
+def compute_target(cfg: dict, luma: float) -> int:
+    """Time-of-day level, nudged ±area by room darkness. luma is 0-255 (128 =
+    neutral): a darker room lowers brightness, a brighter room raises it."""
+    level = _time_of_day_level(cfg["levels"], time.localtime().tm_hour)
+    nudge = ((luma / 255.0) - 0.5) * 2.0 * cfg["area"]
+    return int(max(1, min(100, level + nudge)))
+
+
+def _run_ok(cmd) -> bool:
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=8).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def set_screen_brightness(percent: int):
+    """Set brightness to `percent` (1-100) via the first backend that works:
+    brightnessctl (laptop backlight) → ddcutil (external DDC monitor) → KDE
+    PowerDevil D-Bus. Returns the backend name, or None if none worked."""
+    p = max(1, min(100, int(percent)))
+    if _run_ok(["brightnessctl", "-q", "set", f"{p}%"]):
+        return "brightnessctl"
+    if _run_ok(["ddcutil", "setvcp", "10", str(p)]):  # VCP 0x10 = luminance 0-100
+        return "ddcutil"
+    for qd in ("qdbus6", "qdbus"):
+        base = ["org.kde.Solid.PowerManagement",
+                "/org/kde/Solid/PowerManagement/Actions/BrightnessControl"]
+        iface = "org.kde.Solid.PowerManagement.Actions.BrightnessControl"
+        try:
+            mx = subprocess.run([qd, *base, f"{iface}.brightnessMax"],
+                                capture_output=True, text=True, timeout=8)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if mx.returncode == 0 and mx.stdout.strip().isdigit():
+            target = int(int(mx.stdout.strip()) * p / 100)
+            if _run_ok([qd, *base, f"{iface}.setBrightness", str(target)]):
+                return f"powerdevil({qd})"
+    return None
+
+
+def grab_room_luma(cam_index):
+    """Open the camera, grab one usable frame's mean luma (0-255) while the sensor
+    auto-exposes, then release. Returns the luma, or None if the camera is busy /
+    no readable frame / too dark to trust. Face-detection-free — used both by the
+    settings GUI's immediate adjust and the watcher's periodic brightness tick."""
+    import cv2
+    cap = cv2.VideoCapture(cam_index)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    luma = None
+    try:
+        for i in range(6):  # a few warmup frames while the sensor auto-exposes
+            ok, frame = cap.read()
+            if ok and i >= 3 and float(frame.mean()) >= DARK_FLOOR:
+                luma = float(frame.mean())
+    finally:
+        cap.release()
+    return luma
+
+
+def brightness_once(cam_index) -> int:
+    """Grab one usable frame, set the screen brightness from it, and exit. Used by
+    the settings GUI to adjust *immediately* when you enable auto-brightness,
+    instead of waiting for the next idle snapshot. No face detection needed."""
+    luma = grab_room_luma(cam_index)
+    if luma is None:
+        print("brightness-once: no usable frame (too dark / busy)", file=sys.stderr)
+        return 1
+    cfg = read_brightness_config()
+    target = compute_target(cfg, luma)
+    backend = set_screen_brightness(target)
+    print(f"brightness-once: set {target}% (room luma {luma:.0f}, via {backend})",
+          file=sys.stderr)
+    return 0 if backend else 1
+
+
+def maybe_adjust_brightness(luma):
+    """If auto-brightness is on and we have a usable room-luma reading, set the
+    screen. Logs only when the target or backend changes, to avoid spam."""
+    if luma is None:
+        return
+    cfg = read_brightness_config()
+    if not cfg["enabled"]:
+        return
+    target = compute_target(cfg, luma)
+    backend = set_screen_brightness(target)
+    if (target, backend) != (_bright_state["target"], _bright_state["backend"]):
+        _bright_state["target"], _bright_state["backend"] = target, backend
+        if backend:
+            print(f"brightness: set {target}% (room luma {luma:.0f}, via {backend})",
+                  file=sys.stderr)
+        else:
+            print("brightness: no working backend (install brightnessctl or ddcutil, "
+                  "or check KDE PowerDevil)", file=sys.stderr)
 
 
 # ── idle detection ───────────────────────────────────────────────────────────
@@ -211,29 +355,33 @@ DARK_FLOOR = 8.0
 def snapshot_face_found(engine, cam_index, warmup=3, samples=4):
     """Open the camera, grab a few frames (discarding the first `warmup` while
     the sensor auto-exposes), report whether ANY face was seen, then release.
-    Returns True/False, or None when we're *blind* (camera busy, no readable
-    frame, or too dark to tell) — the caller must treat None as "present" and
-    never lock on it."""
+    Returns ``(presence, luma)``: presence is True/False, or None when we're
+    *blind* (camera busy, no readable frame, or too dark to tell) — the caller
+    must treat None as "present" and never lock on it. ``luma`` is the mean
+    brightness (0-255) of the last usable frame, or None (used for auto-brightness)."""
     import cv2
 
     cap = cv2.VideoCapture(cam_index)
     if not cap.isOpened():
         cap.release()
-        return None
+        return None, None
     try:
         usable = False  # saw at least one readable, bright-enough frame
+        last_luma = None
         for i in range(warmup + samples):
             ok, frame = cap.read()
             if not ok:
                 continue
             if i < warmup:
                 continue
-            if float(frame.mean()) < DARK_FLOOR:
+            m = float(frame.mean())
+            if m < DARK_FLOOR:
                 continue  # too dark to trust the detector
             usable = True
+            last_luma = m
             if engine.measure(frame).face_found:
-                return True
-        return False if usable else None
+                return True, m
+        return (False if usable else None), last_luma
     finally:
         cap.release()
 
@@ -287,7 +435,15 @@ def main() -> int:
                     help="how often to sample idle time (cheap, no camera)")
     ap.add_argument("--force", action="store_true",
                     help="run even if the config has attention off")
+    ap.add_argument("--brightness-once", action="store_true",
+                    help="grab one frame, set brightness from it, and exit")
+    ap.add_argument("--brightness-interval", type=float, default=BRIGHTNESS_INTERVAL,
+                    help="seconds between brightness-only peeks (runs even while "
+                         "active, independent of presence snapshots)")
     args = ap.parse_args()
+
+    if args.brightness_once:
+        return brightness_once(args.camera)
 
     conf = read_config()
     if not args.force and not conf["enabled"]:
@@ -325,6 +481,7 @@ def main() -> int:
 
     def loop():
         next_snapshot_at = None  # monotonic deadline; None = not scheduled yet
+        next_brightness_at = time.monotonic()  # fire an initial adjust on startup
         while True:
             # Re-read config each tick so the settings GUI takes effect live:
             # interval, AC-only, and the on/off switch (turning it off exits).
@@ -356,6 +513,20 @@ def main() -> int:
             idle_s = idle.seconds()
             now = time.monotonic()
 
+            # Brightness-only peek on its own cadence — runs whether you're active
+            # or idle (the presence snapshots below only fire when idle). One frame,
+            # camera released immediately. Skipped while locked / on battery above.
+            if now >= next_brightness_at:
+                next_brightness_at = now + max(60.0, args.brightness_interval)
+                if read_brightness_config()["enabled"]:
+                    # Lowest priority: if a folder reveal / app / lockscreen wants
+                    # the camera, skip this brightness peek (luma None → no
+                    # adjustment) and try again next interval.
+                    with camera_lock(PRESENCE) as got:
+                        luma = grab_room_luma(args.camera) if got else None
+                    maybe_adjust_brightness(luma)
+                    now = time.monotonic()
+
             # Active (or idle unknown but recent activity): camera off, present.
             # When idle can't be measured at all we skip the gate and just poll
             # on the interval below (still one frame at a time).
@@ -375,8 +546,16 @@ def main() -> int:
                 time.sleep(min(args.poll, next_snapshot_at - now))
                 continue
 
-            found = snapshot_face_found(engine, args.camera)
+            # Lowest priority: yield the camera to a folder reveal / app /
+            # lockscreen. If it's busy we get found=None → treated as blind →
+            # present (never locks on it), and we retry next interval.
+            with camera_lock(PRESENCE) as got:
+                if got:
+                    found, luma = snapshot_face_found(engine, args.camera)
+                else:
+                    found, luma = None, None
             now = time.monotonic()
+            maybe_adjust_brightness(luma)  # auto-brightness rides the same frame
             if found is None:
                 # Blind (camera busy / no frame): never lock — count as present.
                 go_present()

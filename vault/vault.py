@@ -134,6 +134,33 @@ def _extpass(vdir: str) -> list[str]:
     return ["-extpass", "cat", "-extpass", _keyfile(vdir)]
 
 
+def _fusermount() -> str | None:
+    return shutil.which("fusermount3") or shutil.which("fusermount")
+
+
+def _init_vault_dir():
+    """Create a fresh vault dir with a random key and an initialised gocryptfs
+    cipher. Returns (vid, vdir, cipher). Raises RuntimeError with the reason on
+    failure (having already cleaned up the half-made dir)."""
+    vid = secrets.token_hex(8)
+    vdir = os.path.join(vaults_root(), vid)
+    cipher = os.path.join(vdir, "cipher")
+    os.makedirs(cipher, exist_ok=True)
+    # Random 32-byte key in a mode-0600 file; gocryptfs reads it via -extpass.
+    kf = _keyfile(vdir)
+    fd = os.open(kf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(secrets.token_urlsafe(32))
+    init = subprocess.run(
+        ["gocryptfs", "-init", *_extpass(vdir), cipher],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    if init.returncode != 0:
+        shutil.rmtree(vdir, ignore_errors=True)
+        raise RuntimeError("gocryptfs init failed:\n" + init.stdout)
+    return vid, vdir, cipher
+
+
 def is_mounted(mount: str) -> bool:
     """True if `mount` is currently a gocryptfs (fuse) mount point."""
     mp = os.path.realpath(mount)
@@ -226,25 +253,11 @@ def cmd_create(args) -> int:
         print("vault: a vault already exists there.", file=sys.stderr)
         return 1
 
-    vid = secrets.token_hex(8)
-    vdir = os.path.join(vaults_root(), vid)
-    cipher = os.path.join(vdir, "cipher")
-    os.makedirs(cipher, exist_ok=True)
     os.makedirs(mount, exist_ok=True)
-
-    # Random 32-byte key in a mode-0600 file; gocryptfs reads it via -extpass.
-    kf = _keyfile(vdir)
-    fd = os.open(kf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(secrets.token_urlsafe(32))
-
-    init = subprocess.run(
-        ["gocryptfs", "-init", *_extpass(vdir), cipher],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    if init.returncode != 0:
-        shutil.rmtree(vdir, ignore_errors=True)
-        print("vault: gocryptfs init failed:\n" + init.stdout, file=sys.stderr)
+    try:
+        vid, vdir, cipher = _init_vault_dir()
+    except RuntimeError as e:
+        print(f"vault: {e}", file=sys.stderr)
         return 1
 
     reg[vid] = {"name": args.name or os.path.basename(mount),
@@ -254,6 +267,79 @@ def cmd_create(args) -> int:
     if args.unlock:
         return _mount(vdir, cipher, mount)
     print("It's locked (empty) now. Unlock with:  vault.py unlock", mount)
+    return 0
+
+
+def cmd_import(args) -> int:
+    """Turn an EXISTING folder into an encrypted vault *in place*: its current
+    contents are moved into the vault's ciphertext, so afterwards the folder is
+    empty when locked and shows the decrypted files when unlocked. The data never
+    leaves your home — it's just re-encrypted where it sits.
+
+    Failure is atomic-ish: if anything goes wrong mid-move we move everything back
+    and remove the half-made vault, so the folder is left as we found it."""
+    mount = os.path.realpath(os.path.expanduser(args.path))
+    ok, why = is_safe_mount(mount)
+    if not ok:
+        print(f"vault: {why}", file=sys.stderr)
+        return 1
+    if not os.path.isdir(mount):
+        print(f"vault: {mount} is not a folder.", file=sys.stderr)
+        return 1
+    reg = load_registry()
+    if resolve(reg, mount):
+        print("vault: a vault already exists there.", file=sys.stderr)
+        return 1
+
+    try:
+        vid, vdir, cipher = _init_vault_dir()
+    except RuntimeError as e:
+        print(f"vault: {e}", file=sys.stderr)
+        return 1
+
+    # Mount at a temp point, move the folder's contents INTO it (encrypting them),
+    # then unmount — leaving `mount` empty on disk (contents now in ciphertext).
+    tmp_mount = os.path.join(vdir, "import-mnt")
+    os.makedirs(tmp_mount, exist_ok=True)
+    r = subprocess.run(["gocryptfs", *_extpass(vdir), cipher, tmp_mount],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        shutil.rmtree(vdir, ignore_errors=True)
+        print("vault: mount for import failed:\n" + r.stdout, file=sys.stderr)
+        return 1
+
+    moved = []
+    try:
+        for name in os.listdir(mount):
+            shutil.move(os.path.join(mount, name), os.path.join(tmp_mount, name))
+            moved.append(name)
+    except OSError as e:
+        # Roll back: move everything we managed to move back out, then tear down.
+        for name in moved:
+            try:
+                shutil.move(os.path.join(tmp_mount, name), os.path.join(mount, name))
+            except OSError:
+                pass
+        subprocess.run([_fusermount(), "-u", tmp_mount],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shutil.rmtree(vdir, ignore_errors=True)
+        print(f"vault: couldn't move files into the vault ({e}). Nothing changed.",
+              file=sys.stderr)
+        return 1
+
+    subprocess.run([_fusermount(), "-u", tmp_mount],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        os.rmdir(tmp_mount)
+    except OSError:
+        pass
+
+    reg[vid] = {"name": args.name or os.path.basename(mount),
+                "mount": mount, "cipher": cipher, "hide": bool(args.hide)}
+    save_registry(reg)
+    print(f"imported '{reg[vid]['name']}' ({vid}) — {len(moved)} item(s) encrypted")
+    if args.unlock:  # leave it open so the user immediately sees their files back
+        return _mount(vdir, cipher, mount)
     return 0
 
 
@@ -294,7 +380,7 @@ def cmd_lock(args) -> int:
     if not is_mounted(mount):
         print("already locked.")
         return 0
-    fuser = shutil.which("fusermount3") or shutil.which("fusermount")
+    fuser = _fusermount()
     r = subprocess.run([fuser, "-u", mount],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if r.returncode != 0:
@@ -413,6 +499,13 @@ def main() -> int:
     c.add_argument("--unlock", action="store_true", help="mount it right after creating")
     c.add_argument("--hide", action="store_true", help="hide the folder while locked")
     c.set_defaults(fn=cmd_create)
+
+    im = sub.add_parser("import", help="encrypt an EXISTING folder's contents in place")
+    im.add_argument("path")
+    im.add_argument("--name")
+    im.add_argument("--unlock", action="store_true", help="leave it mounted after import")
+    im.add_argument("--hide", action="store_true", help="hide the folder while locked")
+    im.set_defaults(fn=cmd_import)
 
     h = sub.add_parser("hide", help="hide the folder in the file manager while locked")
     h.add_argument("key", help="vault id or mount path")

@@ -108,10 +108,32 @@ impl LockList {
     /// (case-insensitive). Returns how many were removed.
     pub fn remove(&mut self, query: &str) -> usize {
         let q = query.to_lowercase();
+        let qbase = base(query).to_lowercase();
         let before = self.apps.len();
-        self.apps
-            .retain(|a| a.key != query && a.name.to_lowercase() != q);
+        // Match the same identities `lock-app` might have stored: exact key,
+        // case-folded key, display name, or the basename (so a native lock on
+        // `steam` vs `/usr/bin/steam` still removes). Lenient on purpose — a
+        // failed remove that leaves a lock in place is worse than an over-match.
+        self.apps.retain(|a| {
+            let k = a.key.to_lowercase();
+            !(a.key == query
+                || k == q
+                || a.name.to_lowercase() == q
+                || base(&a.key).to_lowercase() == qbase)
+        });
         before - self.apps.len()
+    }
+
+    /// A locked **flatpak** whose app-id appears as a token in the launching
+    /// process' cmdline. Flatpaks exec their real binary inside a bwrap mount
+    /// namespace, so the host path never matches — but the `flatpak`/`bwrap`
+    /// exec's pre-exec cmdline still carries `flatpak run … <app-id> …`. Exact
+    /// token match on the app-id, so unrelated bwrap uses (triggers, the
+    /// system-helper, our own prompt) never false-hit.
+    pub fn matches_flatpak_cmdline(&self, cmdline_tokens: &[String]) -> Option<&LockedApp> {
+        self.apps.iter().find(|a| {
+            a.kind == AppKind::Flatpak && cmdline_tokens.iter().any(|t| t == &a.key)
+        })
     }
 
     /// The locked app matching an exec'd binary path, if any.
@@ -184,6 +206,32 @@ mod tests {
         assert!(l.matches(
             "/var/lib/flatpak/app/org.other.App/current/active/files/bin/org.other.App"
         ).is_none());
+    }
+
+    #[test]
+    fn flatpak_matched_by_cmdline_app_id() {
+        // Real case: the app execs inside bwrap so its path is remapped; we match
+        // the launcher's cmdline app-id token instead (see gate probe on metal).
+        let mut l = LockList::default();
+        l.add(LockedApp { kind: AppKind::Flatpak,
+                          key: "org.localsend.localsend_app".into(), name: "LocalSend".into() });
+        let toks = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        // The locked app's launch cmdline → matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=localsend \
+             --file-forwarding org.localsend.localsend_app @@u @@")).is_some());
+        // Unrelated bwrap uses (triggers, system-helper, our own prompt) → NOT matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "bwrap --unshare-ipc --ro-bind / / -- /usr/share/flatpak/triggers/mime-database.trigger")).is_none());
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "python3 /usr/lib/applocker/auth_prompt.py --app AppLocker --methods pin,sudo")).is_none());
+        // A different flatpak's launch → NOT matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "/usr/bin/flatpak run org.other.App")).is_none());
+        // A native lock with the same string is not treated as a flatpak match.
+        let mut n = LockList::default();
+        n.add(native("org.localsend.localsend_app", "x"));
+        assert!(n.matches_flatpak_cmdline(&toks("flatpak run org.localsend.localsend_app")).is_none());
     }
 
     #[test]
