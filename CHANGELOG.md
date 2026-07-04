@@ -3,6 +3,28 @@
 A personal, alpha-stage project — versions are `0.0.1-<letter>` build rounds, not
 stable releases. Newest first.
 
+## 0.0.1-aj — presence watcher: stop crashing (so it locks), quieter brightness
+
+### Fixed
+- **The watcher crashed when you walked away, so it never locked.** Its dim-overlay
+  "draw" handler is called with a `cairo.Context`, which needs the pycairo↔gi
+  foreign marshaller (`python3-gi-cairo`); without it, GTK raises `TypeError:
+  Couldn't find foreign struct converter for 'cairo.Context'` and the process dies
+  before reaching the lock step. Now we detect it (`gi.require_foreign('cairo')`) and
+  skip the (cosmetic) dim if it's missing — **locking still happens**. Added
+  `python3-gi-cairo` / `python3-cairo` to the package deps so the dim works too.
+- **Auto-brightness kept popping KDE's brightness OSD** (even mid-game). It re-applied
+  the same level every snapshot, and camera luma jitters a few % — each set re-shows
+  the OSD. Added a ±5% deadband: it only changes brightness (and pops the OSD) on a
+  real change.
+
+### Still true on Wayland
+- Idle can't be measured (no XScreenSaver under XWayland, no evdev access), so
+  presence is a periodic check on the interval — it can wake the camera while you're
+  actively there. If that bugs you: raise "Check every…" in Settings, or turn
+  auto-brightness off. Real idle-gating would need a Wayland idle source we don't
+  have cheaply.
+
 ## 0.0.1-ag — presence watcher actually runs on KDE
 
 ### Fixed

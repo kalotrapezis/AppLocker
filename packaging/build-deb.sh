@@ -102,7 +102,7 @@ Version: $VERSION
 Section: admin
 Priority: optional
 Architecture: $ARCH
-Depends: python3, python3-opencv, python3-numpy, python3-gi, python3-dbus, gir1.2-gtk-3.0, libpam0g, libxss1, pkexec, systemd, gocryptfs, fuse3
+Depends: python3, python3-opencv, python3-numpy, python3-gi, python3-gi-cairo, python3-cairo, python3-dbus, gir1.2-gtk-3.0, libpam0g, libxss1, pkexec, systemd, gocryptfs, fuse3
 Recommends: v4l-utils
 Installed-Size: $INSTALLED_KB
 Maintainer: AppLocker <kalotrapezis@gmail.com>

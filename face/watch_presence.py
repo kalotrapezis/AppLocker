@@ -47,6 +47,18 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
+# GTK "draw" handlers are called with a cairo.Context, which needs the pycairo↔gi
+# foreign marshaller (python3-gi-cairo). On a fresh install WITHOUT it, any draw
+# signal raises `TypeError: Couldn't find foreign struct converter for
+# 'cairo.Context'` and kills the watcher mid-run — which is why it stopped locking
+# when you walked away. Detect it up front; if absent, skip the purely-cosmetic
+# dim overlay (locking still happens through the same state machine).
+try:
+    gi.require_foreign("cairo")
+    _HAVE_CAIRO = True
+except Exception:
+    _HAVE_CAIRO = False
+
 
 _TRUE = ("on", "true", "1", "yes", "enabled")
 _ALLOWED_INTERVALS = (2, 5, 10, 15, 30)
@@ -255,7 +267,15 @@ def maybe_adjust_brightness(luma):
     if not cfg["enabled"]:
         return
     target = compute_target(cfg, luma)
+    # Deadband: don't re-apply a level we're already at. Re-setting the SAME
+    # brightness still pops KDE's on-screen brightness OSD (very annoying mid-game),
+    # and camera luma jitters a few % frame-to-frame — so only act on a real change.
+    applied = _bright_state.get("applied")
+    if applied is not None and abs(target - applied) < 5:
+        return
     backend = set_screen_brightness(target)
+    if backend:
+        _bright_state["applied"] = target
     if (target, backend) != (_bright_state["target"], _bright_state["backend"]):
         _bright_state["target"], _bright_state["backend"] = target, backend
         if backend:
@@ -472,17 +492,20 @@ def main() -> int:
                  confirm_after=args.confirm_after, misses_to_lock=args.misses)
     presence = SnapshotPresence(cfg)
     idle = IdleMonitor()
-    overlay = DimOverlay()
+    # The dim overlay is cosmetic and needs cairo (see _HAVE_CAIRO). Without it we
+    # simply don't dim — but LOCKING still works, which is the part that matters.
+    overlay = DimOverlay() if _HAVE_CAIRO else None
     state = {"phase": Phase.PRESENT}
 
     def set_phase(phase):
         if phase == state["phase"]:
             return
         state["phase"] = phase
-        if phase is Phase.DIMMED:
-            overlay.show_all()
-        else:
-            overlay.hide()
+        if overlay is not None:
+            if phase is Phase.DIMMED:
+                overlay.show_all()
+            else:
+                overlay.hide()
         if phase is Phase.LOCKED:
             print("presence lost — locking session", file=sys.stderr)
             subprocess.run(["loginctl", "lock-session"], timeout=10)

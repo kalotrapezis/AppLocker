@@ -674,22 +674,19 @@ class SettingsWindow(Gtk.Window):
         if self._loading:
             return
         want = switch.get_active()
-        # Needs an enrolled face (nothing to match against otherwise).
+        # These tiers are face-only (no PIN in the PAM module), so refuse to turn
+        # one on with no enrolled face — it would do nothing.
         if want and not has_enrolled_faces():
-            self._loading = True
-            switch.set_active(False)
-            self._loading = False
-            self._toast("Add a face first before turning this on.")
+            self._reject_toggle(switch, "This one is face-only — enroll a face "
+                                        "first.")
             return
         if set_pam_tier(tier, want):
-            self._toast(("Turned on." if want else "Turned off.")
-                        + " Your password still works here too.")
+            self._toast_later(("Turned on." if want else "Turned off.")
+                              + " Your password still works here too.")
         else:
-            # Failed/declined → snap the switch back to the real on-disk state.
-            self._loading = True
-            switch.set_active(pam_tier_enabled(tier))
-            self._loading = False
-            self._toast("Couldn't change that. Is the AppLocker service running?")
+            self._reject_toggle(switch, "Couldn't change that. Is the AppLocker "
+                                        "service running?",
+                                revert_to=pam_tier_enabled(tier))
 
     def _refresh_faces(self):
         self._clear(self.faces_list)
@@ -1210,11 +1207,8 @@ class SettingsWindow(Gtk.Window):
         if self._loading:
             return
         if switch.get_active() and not has_enrolled_faces():
-            self._loading = True
-            switch.set_active(False)
-            self._loading = False
-            self._toast("Add a face first (“Add a new face…”) before turning on "
-                        "face unlock.")
+            self._reject_toggle(switch, "Add a face first (“Add a new face…”) "
+                                        "before turning on face unlock.")
             return
         self._update_apply_state()
 
@@ -1224,11 +1218,8 @@ class SettingsWindow(Gtk.Window):
         if self._loading:
             return
         if switch.get_active() and not has_camera():
-            self._loading = True
-            switch.set_active(False)
-            self._loading = False
-            self._toast("No camera detected, so “lock when I leave” can't work on "
-                        "this machine.")
+            self._reject_toggle(switch, "No camera detected, so “lock when I "
+                                        "leave” can't work on this machine.")
             return
         self._update_apply_state()
         self._refresh_brightness_visibility()
@@ -1332,10 +1323,8 @@ class SettingsWindow(Gtk.Window):
             return
         if not self.pin_switch.get_active() and not self.sudo_switch.get_active():
             # Enforce the invariant: bounce the just-turned-off switch back on.
-            self._loading = True
-            switch.set_active(True)
-            self._loading = False
-            self._toast("At least one alternative must stay enabled.")
+            self._reject_toggle(switch, "At least one alternative must stay "
+                                        "enabled.", revert_to=True)
             return
         self._update_apply_state()
 
@@ -1421,6 +1410,24 @@ class SettingsWindow(Gtk.Window):
                                 buttons=Gtk.ButtonsType.OK, text=text)
         dlg.run()
         dlg.destroy()
+
+    def _toast_later(self, text: str):
+        """Show a toast AFTER the current signal returns. Running a modal dialog
+        (gtk_dialog_run) directly inside a Gtk.Switch ``notify::active`` handler
+        re-enters GTK's event loop and ABORTS on GTK 3.24 / Python 3.14 — so
+        toggle handlers must defer their dialogs here."""
+        GLib.idle_add(lambda: (self._toast(text), False)[1])
+
+    def _reject_toggle(self, switch, text: str, revert_to: bool = False):
+        """Bounce a switch back and explain — deferred out of the notify::active
+        emission (see _toast_later); doing it inline can abort."""
+        def _do():
+            self._loading = True
+            switch.set_active(revert_to)
+            self._loading = False
+            self._toast(text)
+            return False
+        GLib.idle_add(_do)
 
 
 class AppPicker(Gtk.Dialog):
