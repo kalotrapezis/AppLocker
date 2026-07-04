@@ -162,10 +162,21 @@ works — can't lock out):
 - Broker op `pam-screenlock on|off` runs `applocker-pam` as root (serve.rs); settings
   `set_screenlock()` prefers the broker (PIN works), falls back to `pkexec`.
 - Toggle needs an enrolled face; reflects real /etc/pam.d/kde state; force-auths.
-NOT YET VERIFIED ON METAL: this edits real PAM on the daily driver. Test plan: enable
-via Settings → lock screen (Meta+L) → your face should unlock; if it fails the
-password box still appears. Disable → /etc/pam.d/kde gone. Keep a TTY (Ctrl-Alt-F2)
-handy the first time.
+VERIFIED ON METAL (user): lock-screen face unlock WORKS.
+Follow-ups shipped 0.0.1-ae:
+- Grouped Settings section "Unlock these with your face" with toggles: Lock screen,
+  Terminal sudo, Graphical (app) password prompts (polkit). Moved the lockscreen
+  toggle out of the Face section (user hadn't found it).
+- New `uisudo` tier → /etc/pam.d/polkit-1 (vendor-materialised); broker op generalised
+  to `pam <tier> on|off` (whitelist sudo|uisudo|screenlock).
+STILL OPEN (user wants, deferred): on-greeter LIVENESS FEEDBACK. Liveness is KEPT
+(don't reduce security — user was explicit). Terminal shows turn-prompts (stderr);
+lock screen / polkit have none. Plan: forward recognize.py's challenge lines to the
+greeter as PAM_TEXT_INFO messages via the pam_conv (works on Wayland lock, no window).
+The `--ui` guided window won't show above a Wayland locker, so PAM messages is the way.
+Also open: "why a button, can't it just enter" — the KDE greeter always draws its
+unlock button; our sufficient module unlocks on match regardless. Nothing to fix
+unless we later suppress the greeter field.
 
 ### [ ] 2e. Terminal-sudo PAM: confirmed SAFE on KDE — make it a proper opt-in
 Metal check: `/etc/pam.d/sudo` has `auth sufficient pam_applocker.so` (only sudo;

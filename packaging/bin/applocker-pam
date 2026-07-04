@@ -24,7 +24,8 @@ MODULE="pam_applocker.so"
 
 file_for() {
 	case "$1" in
-	sudo)        echo /etc/pam.d/sudo ;;
+	sudo)        echo /etc/pam.d/sudo ;;           # terminal sudo
+	uisudo)      echo /etc/pam.d/polkit-1 ;;        # graphical password prompts (polkit)
 	screenlock)  echo /etc/pam.d/kde ;;            # KDE kscreenlocker PAM service
 	screensaver) echo /etc/pam.d/cinnamon-screensaver ;;
 	lightdm)     echo /etc/pam.d/lightdm ;;
@@ -37,15 +38,17 @@ file_for() {
 vendor_for() {
 	case "$1" in
 	screenlock) echo /usr/lib/pam.d/kde ;;
+	uisudo)     echo /usr/lib/pam.d/polkit-1 ;;
 	*)          echo "" ;;
 	esac
 }
 
-# The auth rule to insert. The screen-lock tier runs the face check at LOCKSCREEN
-# camera priority (recognize.py reads it) so it preempts the desktop helpers.
+# The auth rule to insert. Graphical tiers run the face check at a camera-
+# arbitration priority (recognize.py reads it) so they preempt the desktop helpers.
 line_for() {
 	case "$1" in
 	screenlock) printf 'auth\tsufficient\t%s\tpriority=lockscreen' "$MODULE" ;;
+	uisudo)     printf 'auth\tsufficient\t%s\tpriority=app' "$MODULE" ;;
 	*)          printf 'auth\tsufficient\t%s' "$MODULE" ;;
 	esac
 }
@@ -117,7 +120,7 @@ disable_one() {
 }
 
 status() {
-	for tier in sudo screenlock screensaver lightdm; do
+	for tier in sudo uisudo screenlock screensaver lightdm; do
 		f="$(file_for "$tier")"
 		if [ ! -f "$f" ]; then
 			printf '%-12s %s\n' "$tier" "(no $f)"
@@ -130,10 +133,10 @@ status() {
 }
 
 expand() { # "all" → the KDE-relevant live tiers
-	if [ "$1" = "all" ]; then echo "sudo screenlock"; else echo "$1"; fi
+	if [ "$1" = "all" ]; then echo "sudo uisudo screenlock"; else echo "$1"; fi
 }
 
-USAGE="usage: applocker-pam enable|disable sudo|screenlock|screensaver|lightdm|all
+USAGE="usage: applocker-pam enable|disable sudo|uisudo|screenlock|screensaver|lightdm|all
        applocker-pam status"
 
 cmd="${1:-}"

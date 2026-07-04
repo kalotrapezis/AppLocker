@@ -3,6 +3,21 @@
 A personal, alpha-stage project — versions are `0.0.1-<letter>` build rounds, not
 stable releases. Newest first.
 
+## 0.0.1-ae — grouped "Unlock these with your face" section
+
+### Added
+- New Settings section **"Unlock these with your face"** grouping the PAM tiers as
+  toggles: **Lock screen**, **Terminal sudo password prompts**, and **Graphical
+  (app) password prompts** (polkit). All `auth sufficient` — the password always
+  still works. The `uisudo`/polkit tier is new (materialises `/etc/pam.d/polkit-1`
+  from its vendor default when absent). Broker op generalised to `pam <tier> on|off`.
+
+### Notes
+- Kept the head-turn **liveness** on the graphical tiers (security). There's no
+  on-screen "turn your head" guide there yet — it shows in a terminal but not on the
+  lock screen/polkit dialog. On-greeter feedback via PAM messages is a planned next
+  step; for now: look at the camera and turn left, then right.
+
 ## 0.0.1-ad — lock-screen face unlock (opt-in)
 
 ### Added
