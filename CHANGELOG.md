@@ -3,6 +3,19 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.1-1 — hidden files actually re-hide
+
+Fixes the hide-in-place watcher so revealed items get hidden again — before this,
+a face-revealed folder stayed visible forever.
+
+### Fixed
+- **Re-hide on screen lock never fired**: `session_locked()` queried `loginctl`
+  with an empty session id, so it always reported "unlocked". The watcher now
+  resolves the real session id at startup (`XDG_SESSION_ID`, with a
+  `loginctl list-sessions` fallback) and re-hides instantly on lock.
+- With the lock re-hide working, the inactivity timeout also does its job —
+  revealed items re-hide after a while on their own.
+
 ## 0.0.1 — first working release 🎉
 
 The first version that works end-to-end on Kubuntu/KDE/Wayland. It's a fun personal

@@ -123,10 +123,36 @@ class Inotify:
 
 # ── session state ────────────────────────────────────────────────────────────
 
-def session_locked() -> bool:
+def _session_id() -> str:
+    """This login session's id, for loginctl. XDG_SESSION_ID when set, else the
+    newest session belonging to our user."""
+    sid = os.environ.get("XDG_SESSION_ID", "").strip()
+    if sid:
+        return sid
     try:
         out = subprocess.run(
-            ["loginctl", "show-session", "", "-p", "LockedHint", "--value"],
+            ["loginctl", "list-sessions", "--no-legend"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        me = os.environ.get("USER", "")
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == me:
+                return parts[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+_SESSION_ID = ""  # resolved once at startup
+
+
+def session_locked() -> bool:
+    if not _SESSION_ID:
+        return False
+    try:
+        out = subprocess.run(
+            ["loginctl", "show-session", _SESSION_ID, "-p", "LockedHint", "--value"],
             capture_output=True, text=True, timeout=5,
         ).stdout.strip()
         return out == "yes"
@@ -159,6 +185,11 @@ def _rehide(entries: list[str]) -> None:
 
 
 def run(args) -> int:
+    global _SESSION_ID
+    _SESSION_ID = _session_id()
+    if not _SESSION_ID:
+        print("hide-watch: no login session id — lock re-hide disabled",
+              file=sys.stderr)
     ino = Inotify()
     targets: list[str] = []                   # managed entries (abs paths)
     revealed: dict[str, float] = {}           # target -> re-hide deadline (monotonic)
