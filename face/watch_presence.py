@@ -158,18 +158,58 @@ _bright_state = {"target": None, "backend": "?"}  # for change-only logging
 def read_brightness_config() -> dict:
     cfg = {"enabled": False,
            "levels": {"morning": 100, "midday": 100, "afternoon": 80, "night": 20},
-           "area": 25}
+           "area": 25, "pause_on_game": True}
     try:
         with open(BRIGHTNESS_PATH) as f:
             data = json.load(f)
         cfg["enabled"] = bool(data.get("enabled", False))
         cfg["area"] = int(data.get("area", cfg["area"]))
+        cfg["pause_on_game"] = bool(data.get("pause_on_game", cfg["pause_on_game"]))
         for k in cfg["levels"]:
             if k in data.get("levels", {}):
                 cfg["levels"][k] = int(data["levels"][k])
     except (OSError, ValueError, TypeError):
         pass
     return cfg
+
+
+# Signals that a Steam game is actually running (not just the Steam client):
+# Steam launches games through `.../reaper SteamLaunch AppId=… -- <game>`, and
+# many titles run under gamescope. Either means "in a game", so with the
+# pause-on-game option on we leave the screen brightness alone.
+_GAME_MARKERS = ("SteamLaunch", "gamescope")
+
+
+def game_running() -> bool:
+    for pat in _GAME_MARKERS:
+        try:
+            if subprocess.run(["pgrep", "-f", pat],
+                              capture_output=True, timeout=5).returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return False
+
+
+# Desktop notifications for snapshot outcomes, de-duplicated so a steady state
+# (e.g. the shutter staying closed) notifies once, not every interval.
+_note_state = {"last": None}
+
+
+def _notify(summary: str, body: str = "") -> None:
+    try:
+        subprocess.Popen(["notify-send", "-a", "AppLocker", summary, body])
+    except OSError:
+        pass
+
+
+def _snapshot_note(kind: str, msg: str) -> None:
+    """Log to stderr and pop a desktop notification, but only when the outcome
+    kind changes (so we don't spam one per snapshot)."""
+    print(f"presence: {msg}", file=sys.stderr)
+    if _note_state["last"] != kind:
+        _note_state["last"] = kind
+        _notify("AppLocker presence", msg)
 
 
 def _time_of_day_level(levels: dict, hour: int) -> int:
@@ -257,6 +297,9 @@ def brightness_once(cam_index) -> int:
         print("brightness-once: no usable frame (too dark / busy)", file=sys.stderr)
         return 1
     cfg = read_brightness_config()
+    if cfg["pause_on_game"] and game_running():
+        print("brightness-once: skipped (a game is running)", file=sys.stderr)
+        return 0
     target = compute_target(cfg, luma)
     backend = set_screen_brightness(target)
     print(f"brightness-once: set {target}% (room luma {luma:.0f}, via {backend})",
@@ -272,6 +315,13 @@ def maybe_adjust_brightness(luma):
     cfg = read_brightness_config()
     if not cfg["enabled"]:
         return
+    # Don't fight a game's own brightness/HDR while you're playing.
+    if cfg["pause_on_game"] and game_running():
+        if _bright_state.get("gamepaused") is not True:
+            _bright_state["gamepaused"] = True
+            print("brightness: paused (a game is running)", file=sys.stderr)
+        return
+    _bright_state["gamepaused"] = False
     target = compute_target(cfg, luma)
     # Deadband: don't re-apply a level we're already at. Re-setting the SAME
     # brightness still pops KDE's on-screen brightness OSD (very annoying mid-game),
@@ -473,6 +523,8 @@ def main() -> int:
                     help="how often to sample idle time (cheap, no camera)")
     ap.add_argument("--force", action="store_true",
                     help="run even if the config has attention off")
+    ap.add_argument("--no-lock", action="store_true",
+                    help="testing: log 'would lock' instead of locking the session")
     ap.add_argument("--brightness-once", action="store_true",
                     help="grab one frame, set brightness from it, and exit")
     ap.add_argument("--brightness-interval", type=float, default=BRIGHTNESS_INTERVAL,
@@ -497,7 +549,6 @@ def main() -> int:
     cfg = Config(idle_after=args.idle_after, interval=interval,
                  confirm_after=args.confirm_after, misses_to_lock=args.misses)
     presence = SnapshotPresence(cfg)
-    idle = IdleMonitor()
     # The dim overlay is cosmetic and needs cairo (see _HAVE_CAIRO). Without it we
     # simply don't dim — but LOCKING still works, which is the part that matters.
     overlay = DimOverlay() if _HAVE_CAIRO else None
@@ -513,8 +564,11 @@ def main() -> int:
             else:
                 overlay.hide()
         if phase is Phase.LOCKED:
-            print("presence lost — locking session", file=sys.stderr)
-            subprocess.run(["loginctl", "lock-session"], timeout=10)
+            if args.no_lock:
+                print("presence lost — WOULD lock session (--no-lock)", file=sys.stderr)
+            else:
+                print("presence lost — locking session", file=sys.stderr)
+                subprocess.run(["loginctl", "lock-session"], timeout=10)
 
     def go_present():
         presence.reset()
@@ -551,12 +605,10 @@ def main() -> int:
                 time.sleep(max(args.poll, 2.0))
                 continue
 
-            idle_s = idle.seconds()
             now = time.monotonic()
 
-            # Brightness-only peek on its own cadence — runs whether you're active
-            # or idle (the presence snapshots below only fire when idle). One frame,
-            # camera released immediately. Skipped while locked / on battery above.
+            # Brightness-only peek on its own cadence. One frame, camera released
+            # immediately. Skipped while locked / on battery above.
             if now >= next_brightness_at:
                 next_brightness_at = now + max(60.0, args.brightness_interval)
                 if read_brightness_config()["enabled"]:
@@ -568,17 +620,11 @@ def main() -> int:
                     maybe_adjust_brightness(luma)
                     now = time.monotonic()
 
-            # Active (or idle unknown but recent activity): camera off, present.
-            # When idle can't be measured at all we skip the gate and just poll
-            # on the interval below (still one frame at a time).
-            if idle.available and idle_s is not None and idle_s < cfg.idle_after:
-                if state["phase"] is not Phase.PRESENT or next_snapshot_at:
-                    go_present()
-                next_snapshot_at = None
-                time.sleep(args.poll)
-                continue
-
-            # Idle → checking mode. First snapshot fires immediately on entry.
+            # Pure time-based checking: a snapshot fires on the interval, whether
+            # you've touched the keyboard/mouse or not. Idle detection (X11
+            # ScreenSaver / xprintidle) is unavailable on Wayland, so relying on it
+            # meant this never ran here — hence the timer is the single source of
+            # truth. First snapshot fires immediately on startup.
             if next_snapshot_at is None:
                 next_snapshot_at = now
             if now < next_snapshot_at:
@@ -597,21 +643,34 @@ def main() -> int:
                     found, luma = None, None
             now = time.monotonic()
             maybe_adjust_brightness(luma)  # auto-brightness rides the same frame
+
+            # Log every snapshot outcome so the behaviour is observable.
+            lstr = f"{luma:.0f}" if luma is not None else "?"
             if found is None:
-                # Blind (camera busy / no frame): never lock — count as present.
+                if luma is not None and luma < DARK_FLOOR:
+                    _snapshot_note("black", f"camera sees BLACK (luma {lstr}) — "
+                                   "covered or dark; can't verify")
+                else:
+                    print("presence: camera busy / no frame — skipping",
+                          file=sys.stderr)
+                # Blind (camera busy / no frame / too dark): never lock here.
                 go_present()
                 next_snapshot_at = now + cfg.interval
                 continue
+            _note_state["last"] = None  # a real reading resets the black dedup
+            if found:
+                print(f"presence: face found (luma {lstr})", file=sys.stderr)
+            else:
+                print(f"presence: NO face in frame (luma {lstr})", file=sys.stderr)
 
             phase = presence.record(found)
             GLib.idle_add(set_phase, phase)
             next_snapshot_at = now + presence.next_delay(phase)
 
     threading.Thread(target=loop, daemon=True).start()
-    how = idle._backend or "none (periodic fallback)"
     ac = " [AC-only]" if conf["ac_only"] else ""
-    print(f"presence watcher: idle-after {args.idle_after}s, every {cfg.interval:.0f}s, "
-          f"lock after {args.misses} empty (idle backend: {how}){ac}", file=sys.stderr)
+    print(f"presence watcher: time-based, snapshot every {cfg.interval:.0f}s, "
+          f"lock after {args.misses} empty snapshots{ac}", file=sys.stderr)
     Gtk.main()
     return 0
 

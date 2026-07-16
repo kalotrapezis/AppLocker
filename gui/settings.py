@@ -34,6 +34,10 @@ import subprocess
 import sys
 import threading
 
+# Shown in the sidebar footer. Kept in step with the packaged version base
+# (packaging/build-deb.sh VERSION_BASE); the round-letter suffix isn't surfaced.
+APP_VERSION = "0.0.2"
+
 # A user-writable log (the GUI has no terminal), so add/remove/broker issues are
 # diagnosable after the fact:  tail -f ~/.cache/applocker/settings.log
 LOG_PATH = os.path.expanduser("~/.cache/applocker/settings.log")
@@ -52,7 +56,8 @@ def _log(msg: str) -> None:
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 # Face profiles are the user's own data (in ~/.config/applocker/faces), so we
 # read/manage them directly via the face-pipeline's matcher helpers — no daemon,
@@ -112,7 +117,8 @@ def cfg_path(env: str, default: str) -> str:
 def read_config() -> dict:
     """Parse /etc/applocker/config into {face, allow_pin, allow_sudo, reauth}."""
     out = {"face": False, "pin": True, "sudo": True, "reauth_every": False,
-           "attention": False, "attention_interval": 2, "attention_ac_only": False}
+           "attention": False, "attention_interval": 2, "attention_ac_only": False,
+           "apps_enabled": True}
     path = cfg_path("APPLOCKER_CONFIG", "/etc/applocker/config")
     try:
         with open(path) as f:
@@ -136,6 +142,8 @@ def read_config() -> dict:
                     out["attention"] = v in ("on", "true", "1", "yes")
                 elif k == "attention_ac_only":
                     out["attention_ac_only"] = v in ("on", "true", "1", "yes")
+                elif k == "apps_enabled":
+                    out["apps_enabled"] = v in ("on", "true", "1", "yes")
                 elif k == "attention_interval":
                     try:
                         n = int(v)
@@ -224,6 +232,8 @@ BRIGHTNESS_DEFAULTS = {
     "levels": {"morning": 100, "midday": 100, "afternoon": 80, "night": 20},
     # How far the room-darkness reading may nudge the target, ± this many %.
     "area": 25,
+    # Leave the screen alone while a Steam game is running (don't fight the game).
+    "pause_on_game": True,
 }
 
 
@@ -235,6 +245,7 @@ def read_brightness() -> dict:
         if isinstance(data, dict):
             out["enabled"] = bool(data.get("enabled", out["enabled"]))
             out["area"] = int(data.get("area", out["area"]))
+            out["pause_on_game"] = bool(data.get("pause_on_game", out["pause_on_game"]))
             for k in out["levels"]:
                 if k in data.get("levels", {}):
                     out["levels"][k] = int(data["levels"][k])
@@ -514,74 +525,376 @@ def set_pam_tier(tier: str, active: bool) -> bool:
 class SettingsWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="AppLocker settings")
-        self.set_default_size(460, 640)
+        self.set_default_size(880, 720)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("destroy", Gtk.main_quit)
 
         header = Gtk.HeaderBar(title="AppLocker settings", show_close_button=True)
-        header.set_subtitle("unlocked — re-locks on close")
         self.set_titlebar(header)
+
+        self._install_css()
 
         # Policy changes are staged, not applied per-toggle. `_persisted` is the
         # on-disk truth; `_loading` guards programmatic control updates so they
         # don't count as edits.
         self._persisted = read_config()
         self._loading = False
+        self._face_dialog = None  # set while the Face gear dialog is open
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(outer)
-        self._build_service_bar(outer)  # pinned at the top
 
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        outer.pack_start(scroller, True, True, 0)
+        # Body: a navigation sidebar on the left, a page stack on the right.
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        outer.pack_start(body, True, True, 0)
+        self._build_sidebar(body)
+        body.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL),
+                        False, False, 0)
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        body.pack_start(self.stack, True, True, 0)
 
-        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
-                           border_width=18)
-        scroller.add(self.box)
+        self._build_security_page()
+        self._build_apps_page()
+        self._build_files_page()
+        self._build_presence_page()
 
-        self._build_face_section()
-        self._build_unlock_reach_section()
-        self._build_apps_section()
-        self._build_vault_section()
-        self._build_hidden_section()
-        self._build_policy_section()
-        self._build_brightness_section()  # only visible when presence is on
         self._build_apply_bar(outer)  # pinned at the bottom
 
-    # -- service bar ---------------------------------------------------------
+        self._select_page("security")
+        self._refresh_service()
+        # Keep the service label live if it changes state elsewhere.
+        GLib.timeout_add_seconds(3, self._service_tick)
 
-    def _build_service_bar(self, container):
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
-                        border_width=10)
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        self.service_label = Gtk.Label(xalign=0)
+    # -- navigation sidebar + page/card scaffolding --------------------------
+
+    NAV = [("security", "Security & unlock"),
+           ("apps", "Locked apps"),
+           ("files", "Private files"),
+           ("presence", "Presence & display")]
+
+    def _build_sidebar(self, container):
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       border_width=12)
+        side.set_size_request(200, -1)
+
+        heading = Gtk.Label(xalign=0, label="SETTINGS")
+        heading.get_style_context().add_class("dim-label")
+        side.pack_start(heading, False, False, 0)
+
+        # Separator under the heading, before the nav list.
+        side.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                        False, False, 0)
+
+        self.nav = Gtk.ListBox()
+        self.nav.get_style_context().add_class("navigation-sidebar")
+        self.nav.get_style_context().add_class("applocker-nav")
+        # A thin separator between each nav row (skipped above the first).
+        self.nav.set_header_func(self._nav_header)
+        self._nav_rows = {}
+        for name, label in self.NAV:
+            row = Gtk.ListBoxRow()
+            row.page = name
+            lbl = Gtk.Label(label=label, xalign=0)
+            lbl.set_margin_top(9)
+            lbl.set_margin_bottom(9)
+            lbl.set_margin_start(10)
+            lbl.set_margin_end(10)
+            row.add(lbl)
+            self.nav.add(row)
+            self._nav_rows[name] = row
+        self.nav.connect("row-selected", self._on_nav_selected)
+        side.pack_start(self.nav, False, False, 0)
+
+        side.pack_start(Gtk.Box(), True, True, 0)  # expanding spacer
+
+        # Separator above the version footer.
+        side.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                        False, False, 0)
+        ver = Gtk.Label(xalign=0, label=f"AppLocker v{APP_VERSION}")
+        ver.get_style_context().add_class("dim-label")
+        side.pack_start(ver, False, False, 0)
+
+        container.pack_start(side, False, False, 0)
+
+    @staticmethod
+    def _nav_header(row, before):
+        """ListBox header func: put a separator above every row except the first,
+        so the nav items are visually divided."""
+        if before is None:
+            row.set_header(None)
+        elif row.get_header() is None:
+            row.set_header(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+    def _on_nav_selected(self, _lb, row):
+        if row is not None:
+            self.stack.set_visible_child_name(row.page)
+
+    def _select_page(self, name):
+        self.nav.select_row(self._nav_rows[name])
+        self.stack.set_visible_child_name(name)
+
+    def _page(self, name, title, subtitle):
+        """A scrollable page with a big title + subtitle; returns the content box
+        to pack cards into."""
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                      border_width=20)
+        scroller.add(box)
+        t = Gtk.Label(xalign=0)
+        t.set_markup(f"<span size='x-large' weight='bold'>"
+                     f"{GLib.markup_escape_text(title)}</span>")
+        box.pack_start(t, False, False, 0)
+        box.pack_start(self._dim_label(subtitle), False, False, 0)
+        self.stack.add_named(scroller, name)
+        return box
+
+    def _card(self, parent):
+        """A rounded, bordered card grouping related controls, matching the
+        design's cards. The rounding comes from the `applocker-card` CSS class
+        (see _install_css); `view` gives it the theme's card background."""
+        frame = Gtk.Frame()
+        frame.get_style_context().add_class("view")
+        frame.get_style_context().add_class("applocker-card")
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                        border_width=14)
+        frame.add(inner)
+        parent.pack_start(frame, False, False, 0)
+        return inner
+
+    def _install_css(self):
+        """Round the section cards' corners. GTK's `view` frame is square by
+        default, so a tiny stylesheet adds the radius (and a hair of margin so
+        adjacent cards don't touch). Loaded at APPLICATION priority so it layers
+        over the active theme without hardcoding colours."""
+        css = b"""
+        frame.applocker-card {
+            border-radius: 10px;
+            margin-top: 2px;
+            margin-bottom: 2px;
+        }
+        frame.applocker-card > border {
+            border-radius: 10px;
+        }
+        list.applocker-nav row {
+            border-radius: 8px;
+            margin-top: 3px;
+            margin-bottom: 3px;
+        }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def _heading_row(self, box, title, gear_cb=None, switch=None):
+        """A card's top row: a bold title on the left, an optional ⚙ button and
+        an optional switch on the right."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+        row.pack_start(lbl, True, True, 0)
+        if gear_cb is not None:
+            gear = Gtk.Button.new_from_icon_name("emblem-system-symbolic",
+                                                 Gtk.IconSize.BUTTON)
+            gear.set_relief(Gtk.ReliefStyle.NONE)
+            gear.set_tooltip_text("Manage…")
+            gear.set_valign(Gtk.Align.CENTER)
+            gear.connect("clicked", gear_cb)
+            row.pack_start(gear, False, False, 0)
+        if switch is not None:
+            switch.set_valign(Gtk.Align.CENTER)
+            row.pack_start(switch, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        return row
+
+    @staticmethod
+    def _dim_label(text, wrap=True):
+        lbl = Gtk.Label(xalign=0, label=text)
+        lbl.get_style_context().add_class("dim-label")
+        if wrap:
+            lbl.set_line_wrap(True)
+            lbl.set_max_width_chars(52)  # stable height-for-width (avoids overlap)
+        return lbl
+
+    def _dim(self, box, text):
+        lbl = self._dim_label(text)
+        box.pack_start(lbl, False, False, 0)
+        return lbl
+
+    # -- Security page -------------------------------------------------------
+
+    def _build_security_page(self):
+        cfg = self._persisted
+        page = self._page(
+            "security", "Security & unlock",
+            "Choose how AppLocker protects your session and confirms it is you.")
+
+        # Protection service card.
+        svc = self._card(page)
+        srow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        stitle = Gtk.Label(xalign=0)
+        stitle.set_markup("<b>Protection service</b>")
+        srow.pack_start(stitle, True, True, 0)
+        self.service_label = Gtk.Label(xalign=1)
         self.service_label.set_use_markup(True)
-        bar.pack_start(self.service_label, True, True, 0)
-        self.service_btn = Gtk.Button(label="Start")
+        srow.pack_start(self.service_label, False, False, 0)
+        self.service_btn = Gtk.Button(label="Stop")
         self.service_btn.connect("clicked", self._on_service_toggle)
-        bar.pack_start(self.service_btn, False, False, 0)
-        outer.pack_start(bar, False, False, 0)
+        srow.pack_start(self.service_btn, False, False, 0)
+        svc.pack_start(srow, False, False, 0)
 
-        # Second row: whether enforcement comes back on its own after a reboot.
-        # The Start/Stop button only affects *now* (a safety choice — we were
-        # unsure of the outcome); this makes it persist.
         boot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.boot_label = Gtk.Label(xalign=0, label="Start enforcement at boot")
-        self.boot_label.get_style_context().add_class("dim-label")
-        boot.pack_start(self.boot_label, True, True, 0)
+        boot.pack_start(Gtk.Label(label="Start enforcement when I sign in",
+                                  xalign=0), True, True, 0)
         self.boot_switch = Gtk.Switch(active=service_boot_enabled())
         self.boot_switch.set_valign(Gtk.Align.CENTER)
         self.boot_switch.connect("notify::active", self._on_boot_toggled)
         boot.pack_start(self.boot_switch, False, False, 0)
-        outer.pack_start(boot, False, False, 0)
+        svc.pack_start(boot, False, False, 0)
 
-        container.pack_start(outer, False, False, 0)
-        container.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
-                             False, False, 0)
-        self._refresh_service()
-        # Keep the label live if the service changes state elsewhere.
-        GLib.timeout_add_seconds(3, self._service_tick)
+        # Face unlock card.
+        face = self._card(page)
+        self.face_switch = Gtk.Switch(active=cfg["face"])
+        self.face_switch.connect("notify::active", self._on_face_toggled)
+        self._heading_row(face, "Face unlock", gear_cb=self._open_face_dialog,
+                          switch=self.face_switch)
+        self._dim(face, "Unlock the lock screen and terminal sudo prompts with "
+                        "your face.")
+        self.faces_summary = self._dim(face, "")
+
+        # Fallback authentication card.
+        auth = self._card(page)
+        at = Gtk.Label(xalign=0)
+        at.set_markup("<b>Fallback authentication</b>")
+        auth.pack_start(at, False, False, 0)
+        self._dim(auth, "Keep at least one fallback enabled so a camera problem "
+                        "cannot lock you out.")
+        prow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        prow.pack_start(Gtk.Label(label="Use PIN", xalign=0), True, True, 0)
+        pgear = Gtk.Button.new_from_icon_name("emblem-system-symbolic",
+                                              Gtk.IconSize.BUTTON)
+        pgear.set_relief(Gtk.ReliefStyle.NONE)
+        pgear.set_tooltip_text("Set or change PIN")
+        pgear.set_valign(Gtk.Align.CENTER)
+        pgear.connect("clicked", self._on_change_pin)
+        prow.pack_start(pgear, False, False, 0)
+        self.pin_switch = Gtk.Switch(active=cfg["pin"])
+        self.pin_switch.set_valign(Gtk.Align.CENTER)
+        self.pin_switch.connect("notify::active", self._on_fallback_toggled, "pin")
+        prow.pack_start(self.pin_switch, False, False, 0)
+        auth.pack_start(prow, False, False, 0)
+        self._dim(auth, "Turn the PIN on or off — use ⚙ to set or change it.")
+
+        srow2, self.sudo_switch = self._switch_row("Use sudo password", cfg["sudo"])
+        self.sudo_switch.connect("notify::active", self._on_fallback_toggled, "sudo")
+        auth.pack_start(srow2, False, False, 0)
+        self._dim(auth, "Accepts your account password as a fallback.")
+
+        # Auth prompts card (sudo autocomplete).
+        ap = self._card(page)
+        acrow, self.autocomplete_switch = self._switch_row(
+            "Turn off sudo autocomplete", False)
+        self.autocomplete_switch.connect("notify::active",
+                                         self._on_autocomplete_toggled)
+        ap.pack_start(acrow, False, False, 0)
+        self._dim(ap, "Applies to the lock screen and terminal password prompts.")
+
+        self._refresh_faces_summary()
+
+    def _on_autocomplete_toggled(self, switch, _param):
+        # "Turn off sudo autocomplete" wipes the stored sudo password. Flipping
+        # it on performs the wipe; flipping it back off is a no-op (autocomplete
+        # simply re-establishes itself next time you enter your sudo password).
+        if self._loading or not switch.get_active():
+            return
+
+        def _do():
+            if forget_sudo():
+                self._toast("Sudo autocomplete turned off. It fills in again the "
+                            "next time you enter your sudo password.")
+            else:
+                self._loading = True
+                switch.set_active(False)
+                self._loading = False
+                self._toast("Couldn't reach the AppLocker service.")
+            return False
+
+        GLib.idle_add(_do)
+
+    # -- Face unlock gear dialog (enrolled faces + where face unlocks) -------
+
+    def _open_face_dialog(self, _btn):
+        dlg = Gtk.Dialog(title="Face unlock", transient_for=self, modal=True)
+        dlg.set_default_size(470, 540)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(14)
+
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup("<b>Enrolled faces</b>")
+        area.add(lbl)
+        self.faces_list = Gtk.ListBox()
+        self.faces_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        area.add(self.faces_list)
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.add_face_btn = Gtk.Button(label="Add a new face…")
+        self.add_face_btn.connect("clicked", self._on_add_face)
+        btns.pack_start(self.add_face_btn, False, False, 0)
+        btns.set_halign(Gtk.Align.START)
+        area.add(btns)
+        area.add(self._dim_label("Add a few looks (glasses, new haircut) — any of "
+                                 "them will unlock."))
+
+        area.add(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        lbl2 = Gtk.Label(xalign=0)
+        lbl2.set_markup("<b>Unlock these with your face</b>")
+        area.add(lbl2)
+        intro = self._dim_label(
+            "Where your enrolled face may unlock in place of a password. Each is a "
+            "shortcut only — your password always still works, so this can never "
+            "lock you out.")
+        area.add(intro)
+        self.pam_switches = {}
+        for tier, label in (("screenlock", "Lock screen"),
+                            ("sudo", "Terminal sudo password prompts")):
+            row, sw = self._switch_row(label, pam_tier_enabled(tier))
+            sw.connect("notify::active", self._on_pam_tier_toggled, tier)
+            self.pam_switches[tier] = sw
+            area.add(row)
+
+        self._face_dialog = dlg
+        self._refresh_faces()
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+        self._face_dialog = None
+        self._refresh_faces_summary()
+
+    def _refresh_faces_summary(self):
+        try:
+            n = len(matcher.list_profiles())
+        except Exception:
+            n = 0
+        if getattr(self, "faces_summary", None) is None:
+            return
+        self.faces_summary.set_text(
+            f"{n} enrolled face{'s' if n != 1 else ''} — manage them with the "
+            f"⚙ button above." if n else
+            "No faces enrolled yet — add one with the ⚙ button above.")
+
+    def _faces_changed(self):
+        """After an async enroll finishes: always refresh the summary, and the
+        list too if the Face dialog is still open."""
+        self._refresh_faces_summary()
+        if self._face_dialog is not None:
+            try:
+                self._refresh_faces()
+            except Exception:
+                pass
 
     def _on_boot_toggled(self, switch, _param):
         if self._loading:
@@ -654,15 +967,70 @@ class SettingsWindow(Gtk.Window):
         set_service(not service_active())
         self._refresh_service()
 
-    # -- sections ------------------------------------------------------------
+    # -- Locked apps page ----------------------------------------------------
 
-    def _section(self, title: str) -> Gtk.Box:
-        frame = Gtk.Frame(label=title)
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
-                        border_width=10)
-        frame.add(inner)
-        self.box.pack_start(frame, False, False, 0)
-        return inner
+    def _build_apps_page(self):
+        cfg = self._persisted
+        page = self._page(
+            "apps", "Locked apps",
+            "One switch for the feature, per-app list behind the gear.")
+
+        card = self._card(page)
+        self.apps_switch = Gtk.Switch(active=cfg["apps_enabled"])
+        self.apps_switch.connect("notify::active", self._on_apps_toggled)
+        self._heading_row(card, "Lock apps with your face",
+                          gear_cb=self._open_apps_dialog, switch=self.apps_switch)
+        self._dim(card, "Locked apps ask for your face or PIN before they open.")
+        self.apps_summary = self._dim(card, "")
+
+        ra = self._card(page)
+        rrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        rrow.pack_start(Gtk.Label(label="Re-ask for auth", xalign=0), True, True, 0)
+        self.reauth = Gtk.ComboBoxText()
+        self.reauth.append("session", "once per session")
+        self.reauth.append("always", "every launch")
+        self.reauth.set_active_id("always" if cfg["reauth_every"] else "session")
+        self.reauth.connect("changed", self._on_policy_changed)
+        rrow.pack_start(self.reauth, False, False, 0)
+        ra.pack_start(rrow, False, False, 0)
+        self._dim(ra, "Applies to every locked app at once.")
+
+        self._refresh_apps_summary()
+
+    def _on_apps_toggled(self, switch, _param):
+        # Staged (Apply/Revert) like the other policy switches.
+        if self._loading:
+            return
+        self._update_apply_state()
+
+    def _open_apps_dialog(self, _btn):
+        dlg = Gtk.Dialog(title="Locked apps", transient_for=self, modal=True)
+        dlg.set_default_size(460, 480)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(14)
+        self.apps_list = Gtk.ListBox()
+        self.apps_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        area.add(self.apps_list)
+        add = Gtk.Button(label="Add app…")
+        add.connect("clicked", self._on_add_app)
+        add.set_halign(Gtk.Align.START)
+        area.add(add)
+        self._refresh_apps()
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+        self._refresh_apps_summary()
+
+    def _refresh_apps_summary(self):
+        n = len(read_locked_apps())
+        if getattr(self, "apps_summary", None) is None:
+            return
+        self.apps_summary.set_text(
+            f"{n} locked app{'s' if n != 1 else ''} — manage them with the "
+            f"⚙ button above." if n else
+            "No apps locked yet — add them with the ⚙ button above.")
 
     def _switch_row(self, label: str, active: bool):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -673,70 +1041,146 @@ class SettingsWindow(Gtk.Window):
         row.pack_start(sw, False, False, 0)
         return row, sw
 
-    def _build_face_section(self):
-        cfg = read_config()
-        box = self._section("Face unlock")
+    # -- Private files page --------------------------------------------------
 
-        row, self.face_switch = self._switch_row("Use face unlock", cfg["face"])
-        self.face_switch.connect("notify::active", self._on_face_toggled)
-        box.pack_start(row, False, False, 0)
+    def _build_files_page(self):
+        page = self._page(
+            "files", "Private files",
+            "Keep a protected folder, and hide files from the file manager.")
 
-        # The list of enrolled face profiles (up to MAX_FACES), each with a name
-        # and an X to delete. These are the user's own files — no root needed.
-        self.faces_list = Gtk.ListBox()
-        self.faces_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        box.pack_start(self.faces_list, False, False, 0)
+        # Private folder card — contents are rebuilt by _refresh_vault (its
+        # locked/unlocked/absent states differ).
+        self.vault_card = self._card(page)
+        self._refresh_vault()
+
+        # Hidden files card.
+        card = self._card(page)
+        self.hidden_switch = Gtk.Switch(active=self._hidden_active())
+        self.hidden_switch.connect("notify::active", self._on_hidden_toggled)
+        self._heading_row(card, "Hidden files & folders",
+                          gear_cb=self._open_hidden_dialog,
+                          switch=self.hidden_switch)
+        self._dim(card, "Hides items from the file manager only — nothing is "
+                        "encrypted.")
+        self.hidden_summary = self._dim(card, "")
+        self._refresh_hidden_summary()
+
+    def _hidden_active(self):
+        """True when there are managed items and they're currently hidden."""
+        try:
+            entries = hidelist.load_registry()
+        except Exception:
+            entries = []
+        return bool(entries) and any(hidelist.is_hidden(p) for p in entries)
+
+    def _on_hidden_toggled(self, switch, _param):
+        if self._loading:
+            return
+
+        def _do():
+            if switch.get_active():
+                hidelist.cmd_hide_all(argparse.Namespace())
+                spawn([sys.executable, script_path("hide_watch.py")])
+            else:
+                hidelist.cmd_reveal_all(argparse.Namespace())
+            self._refresh_hidden_summary()
+            return False
+
+        GLib.idle_add(_do)
+
+    def _open_hidden_dialog(self, _btn):
+        dlg = Gtk.Dialog(title="Hidden files & folders", transient_for=self,
+                         modal=True)
+        dlg.set_default_size(500, 500)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(14)
+
+        warn = Gtk.Label(xalign=0, label=(
+            "This just hides files from the file manager — it does not encrypt or "
+            "move them, so it is not as secure as the Private folder. Anyone with "
+            "terminal access can still read them."))
+        warn.get_style_context().add_class("dim-label")
+        warn.set_line_wrap(True)
+        warn.set_max_width_chars(52)
+        area.add(warn)
+
+        self.hidden_list = Gtk.ListBox()
+        self.hidden_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        area.add(self.hidden_list)
 
         btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.add_face_btn = Gtk.Button(label="Add a new face…")
-        self.add_face_btn.connect("clicked", self._on_add_face)
-        btns.pack_start(self.add_face_btn, False, False, 0)
-        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic",
-                                                Gtk.IconSize.BUTTON)
-        refresh.set_tooltip_text("Refresh after enrolling")
-        refresh.connect("clicked", lambda _b: self._refresh_faces())
-        btns.pack_start(refresh, False, False, 0)
-        box.pack_start(btns, False, False, 0)
+        addf = Gtk.Button(label="Add file…")
+        addf.connect("clicked", lambda _b: self._pick_and_hide(
+            Gtk.FileChooserAction.OPEN, "Choose a file to hide"))
+        btns.pack_start(addf, False, False, 0)
+        addd = Gtk.Button(label="Add folder…")
+        addd.connect("clicked", lambda _b: self._pick_and_hide(
+            Gtk.FileChooserAction.SELECT_FOLDER, "Choose a folder to hide"))
+        btns.pack_start(addd, False, False, 0)
+        btns.set_halign(Gtk.Align.START)
+        area.add(btns)
 
-        hint = Gtk.Label(xalign=0, label="Add a few looks (glasses, new haircut) — "
-                         "any of them will unlock.")
-        hint.get_style_context().add_class("dim-label")
-        box.pack_start(hint, False, False, 0)
-        self._refresh_faces()
+        area.add(self._dim_label(
+            "Hidden items reappear when you open their folder and AppLocker sees "
+            "your face, then hide again 1 minute later (and instantly if the "
+            "screen locks). The ✕ reveals one for good and stops managing it."))
 
-    # -- Where your face unlocks (PAM tiers) ---------------------------------
+        self._refresh_hidden()
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+        self._refresh_hidden_summary()
+        # Keep the master switch in step with whatever the dialog changed.
+        self._loading = True
+        self.hidden_switch.set_active(self._hidden_active())
+        self._loading = False
 
-    def _build_unlock_reach_section(self):
-        box = self._section("Unlock these with your face")
+    def _refresh_hidden_summary(self):
+        try:
+            n = len(hidelist.load_registry())
+        except Exception:
+            n = 0
+        if getattr(self, "hidden_summary", None) is None:
+            return
+        self.hidden_summary.set_text(
+            f"{n} hidden item{'s' if n != 1 else ''} — manage them with the "
+            f"⚙ button above." if n else
+            "Nothing hidden yet — add items with the ⚙ button above.")
 
-        intro = Gtk.Label(xalign=0, label=(
-            "Where your enrolled face may unlock in place of typing a password. "
-            "Each is a shortcut only — your password <b>always still works</b>, so "
-            "this can never lock you out."))
-        intro.set_use_markup(True)
-        intro.get_style_context().add_class("dim-label")
-        intro.set_line_wrap(True)
-        intro.set_max_width_chars(46)
-        box.pack_start(intro, False, False, 0)
+    # -- Presence & display page ---------------------------------------------
 
-        self.pam_switches = {}
-        for tier, label in (("screenlock", "Lock screen"),
-                            ("sudo", "Terminal sudo password prompts")):
-            row, sw = self._switch_row(label, pam_tier_enabled(tier))
-            sw.connect("notify::active", self._on_pam_tier_toggled, tier)
-            self.pam_switches[tier] = sw
-            box.pack_start(row, False, False, 0)
+    def _build_presence_page(self):
+        cfg = self._persisted
+        page = self._page(
+            "presence", "Presence & display",
+            "Lock the session automatically when you step away.")
 
-        note = Gtk.Label(xalign=0, label=(
-            "Face uses the head-turn liveness check. In a terminal you'll see the "
-            "turn prompts; on the lock screen there's no on-screen guide yet — just "
-            "look at the camera and turn your head left, then right. Graphical "
-            "app-password prompts can't use face this way (the system runs them in a "
-            "sandbox with no camera) — that needs the polkit agent, coming separately."))
-        note.get_style_context().add_class("dim-label")
-        note.set_line_wrap(True)
-        note.set_max_width_chars(46)
-        box.pack_start(note, False, False, 0)
+        card = self._card(page)
+        self.attention_switch = Gtk.Switch(active=cfg["attention"])
+        self.attention_switch.connect("notify::active", self._on_attention_toggled)
+        self._heading_row(card, "Lock when I leave",
+                          gear_cb=self._open_presence_dialog,
+                          switch=self.attention_switch)
+        self._dim(card, "The camera stays off while you work. When idle it takes a "
+                        "quick photo now and then; if you're gone it locks the "
+                        "session. Any face counts — it never checks who you are.")
+
+        crow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        crow.pack_start(Gtk.Label(label="Check every", xalign=0), True, True, 0)
+        self.attention_interval = Gtk.ComboBoxText()
+        for m in (2, 5, 10, 15, 30):
+            self.attention_interval.append(str(m), f"{m} minutes")
+        self.attention_interval.set_active_id(str(cfg["attention_interval"]))
+        self.attention_interval.connect("changed", self._on_policy_changed)
+        crow.pack_start(self.attention_interval, False, False, 0)
+        card.pack_start(crow, False, False, 0)
+
+        acrow, self.attention_ac_switch = self._switch_row(
+            "Only when plugged in (pause on battery)", cfg["attention_ac_only"])
+        self.attention_ac_switch.connect("notify::active", self._on_policy_changed)
+        card.pack_start(acrow, False, False, 0)
 
     def _on_pam_tier_toggled(self, switch, _param, tier):
         if self._loading:
@@ -757,6 +1201,9 @@ class SettingsWindow(Gtk.Window):
                                 revert_to=pam_tier_enabled(tier))
 
     def _refresh_faces(self):
+        # The list widget lives in the (transient) Face dialog; skip if it's gone.
+        if getattr(self, "faces_list", None) is None:
+            return
         self._clear(self.faces_list)
         try:
             profiles = matcher.list_profiles()  # faces dir + legacy owner.face
@@ -780,6 +1227,7 @@ class SettingsWindow(Gtk.Window):
         except OSError as e:
             self._toast(f"Couldn't delete: {e}")
         self._refresh_faces()
+        self._refresh_faces_summary()
 
     def _on_add_face(self, _btn):
         # The enrollment window asks for the name itself (one dialog, one owner).
@@ -788,7 +1236,7 @@ class SettingsWindow(Gtk.Window):
 
         def wait_and_refresh(proc):
             proc.wait()
-            GLib.idle_add(self._refresh_faces)
+            GLib.idle_add(self._faces_changed)
 
         proc = subprocess.Popen([sys.executable, enroll])
         threading.Thread(target=wait_and_refresh, args=(proc,), daemon=True).start()
@@ -811,18 +1259,6 @@ class SettingsWindow(Gtk.Window):
         dlg.destroy()
         return text if resp == Gtk.ResponseType.OK else ""
 
-    def _build_apps_section(self):
-        box = self._section("Locked apps")
-        self.apps_list = Gtk.ListBox()
-        self.apps_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        box.pack_start(self.apps_list, False, False, 0)
-
-        add = Gtk.Button(label="Add app…")
-        add.connect("clicked", self._on_add_app)
-        add.set_halign(Gtk.Align.START)
-        box.pack_start(add, False, False, 0)
-        self._refresh_apps()
-
     # -- Private folder (encrypted vault) ------------------------------------
 
     def _standard_vault(self):
@@ -831,12 +1267,8 @@ class SettingsWindow(Gtk.Window):
         vid = vaultlib.resolve(reg, vaultlib.standard_path())
         return (vid, reg[vid]) if vid else (None, None)
 
-    def _build_vault_section(self):
-        self.vault_box = self._section("Private folder")
-        self._refresh_vault()
-
     def _refresh_vault(self):
-        box = self.vault_box
+        box = self.vault_card
         # destroy() (not remove()): fully drop the old widgets so no ghost
         # allocation lingers — that leftover is what made the button overlap the
         # next section after a delete+recreate.
@@ -972,46 +1404,10 @@ class SettingsWindow(Gtk.Window):
 
     # -- Hidden files & folders (hide-in-place, no encryption) ----------------
 
-    def _build_hidden_section(self):
-        box = self._section("Hidden files & folders")
-
-        warn = Gtk.Label(xalign=0, label=(
-            "This just hides files from the file manager — it does <b>not</b> "
-            "encrypt or move them, so it is <b>not as secure as the Private "
-            "folder</b> above. Anyone with terminal access can still read them. "
-            "For real protection, move them into the Private folder instead."))
-        warn.set_use_markup(True)
-        warn.set_line_wrap(True)
-        warn.set_max_width_chars(46)  # stable height-for-width (see _refresh_vault)
-        box.pack_start(warn, False, False, 0)
-
-        self.hidden_list = Gtk.ListBox()
-        self.hidden_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        box.pack_start(self.hidden_list, False, False, 0)
-
-        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        addf = Gtk.Button(label="Add file…")
-        addf.connect("clicked", lambda _b: self._pick_and_hide(
-            Gtk.FileChooserAction.OPEN, "Choose a file to hide"))
-        btns.pack_start(addf, False, False, 0)
-        addd = Gtk.Button(label="Add folder…")
-        addd.connect("clicked", lambda _b: self._pick_and_hide(
-            Gtk.FileChooserAction.SELECT_FOLDER, "Choose a folder to hide"))
-        btns.pack_start(addd, False, False, 0)
-        btns.set_halign(Gtk.Align.START)
-        box.pack_start(btns, False, False, 0)
-
-        hint = Gtk.Label(xalign=0, label=(
-            "Hidden items reappear when you open their folder and AppLocker sees "
-            "your face; they hide again when you lock the screen or walk away. "
-            "The X reveals one for good and stops managing it."))
-        hint.get_style_context().add_class("dim-label")
-        hint.set_line_wrap(True)
-        hint.set_max_width_chars(46)
-        box.pack_start(hint, False, False, 0)
-        self._refresh_hidden()
-
     def _refresh_hidden(self):
+        # The list widget lives in the (transient) Hidden dialog; skip if gone.
+        if getattr(self, "hidden_list", None) is None:
+            return
         self._clear(self.hidden_list)
         try:
             entries = hidelist.load_registry()
@@ -1051,6 +1447,7 @@ class SettingsWindow(Gtk.Window):
         # (it's single-instance, so a duplicate launch just exits).
         spawn([sys.executable, script_path("hide_watch.py")])
         self._refresh_hidden()
+        self._refresh_hidden_summary()
 
     def _remove_hidden(self, path: str):
         # The X reveals the item and stops managing it (like unlocking an app).
@@ -1059,71 +1456,7 @@ class SettingsWindow(Gtk.Window):
         except Exception as e:
             self._toast(f"Couldn't reveal that: {e}")
         self._refresh_hidden()
-
-    def _build_policy_section(self):
-        cfg = read_config()
-        box = self._section("Unlock alternatives")
-
-        prow, self.pin_switch = self._switch_row("Use PIN", cfg["pin"])
-        self.pin_switch.connect("notify::active", self._on_fallback_toggled, "pin")
-        box.pack_start(prow, False, False, 0)
-
-        # Change PIN — the only place to change it after first-run setup.
-        pinbtns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        change = Gtk.Button(label="Change PIN…")
-        change.set_halign(Gtk.Align.START)
-        change.connect("clicked", self._on_change_pin)
-        pinbtns.pack_start(change, False, False, 0)
-        reset = Gtk.Button(label="Turn off sudo autocomplete")
-        reset.connect("clicked", self._on_forget_sudo)
-        pinbtns.pack_start(reset, False, False, 0)
-        box.pack_start(pinbtns, False, False, 0)
-
-        srow, self.sudo_switch = self._switch_row("Use sudo password", cfg["sudo"])
-        self.sudo_switch.connect("notify::active", self._on_fallback_toggled, "sudo")
-        box.pack_start(srow, False, False, 0)
-
-        note = Gtk.Label(xalign=0,
-                         label="Keep at least one on, so a broken camera can't lock you out.")
-        note.get_style_context().add_class("dim-label")
-        box.pack_start(note, False, False, 0)
-
-        rrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        rrow.pack_start(Gtk.Label(label="Re-ask for auth", xalign=0), True, True, 0)
-        self.reauth = Gtk.ComboBoxText()
-        self.reauth.append("session", "once per session")
-        self.reauth.append("always", "every launch")
-        self.reauth.set_active_id("always" if cfg["reauth_every"] else "session")
-        self.reauth.connect("changed", self._on_policy_changed)
-        rrow.pack_start(self.reauth, False, False, 0)
-        box.pack_start(rrow, False, False, 0)
-
-        arow, self.attention_switch = self._switch_row(
-            "Lock when I leave (presence watcher)", cfg["attention"])
-        self.attention_switch.connect("notify::active", self._on_attention_toggled)
-        box.pack_start(arow, False, False, 0)
-        anote = Gtk.Label(xalign=0, label="The camera stays off while you work. "
-                          "Once you're idle it takes a quick photo now and then; "
-                          "if you're gone it locks the session. Any face counts — "
-                          "it never checks who you are.")
-        anote.get_style_context().add_class("dim-label")
-        anote.set_line_wrap(True)
-        box.pack_start(anote, False, False, 0)
-
-        irow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        irow.pack_start(Gtk.Label(label="Check every", xalign=0), True, True, 0)
-        self.attention_interval = Gtk.ComboBoxText()
-        for m in (2, 5, 10, 15, 30):
-            self.attention_interval.append(str(m), f"{m} minutes")
-        self.attention_interval.set_active_id(str(cfg["attention_interval"]))
-        self.attention_interval.connect("changed", self._on_policy_changed)
-        irow.pack_start(self.attention_interval, False, False, 0)
-        box.pack_start(irow, False, False, 0)
-
-        acrow, self.attention_ac_switch = self._switch_row(
-            "Only when plugged in (pause on battery)", cfg["attention_ac_only"])
-        self.attention_ac_switch.connect("notify::active", self._on_policy_changed)
-        box.pack_start(acrow, False, False, 0)
+        self._refresh_hidden_summary()
 
     # -- refreshers ----------------------------------------------------------
 
@@ -1143,6 +1476,9 @@ class SettingsWindow(Gtk.Window):
         return row
 
     def _refresh_apps(self):
+        # The list widget lives in the (transient) Locked-apps dialog; skip if gone.
+        if getattr(self, "apps_list", None) is None:
+            return
         self._clear(self.apps_list)
         rows = read_locked_apps()
         if not rows:
@@ -1191,6 +1527,7 @@ class SettingsWindow(Gtk.Window):
             "attention": self.attention_switch.get_active(),
             "attention_interval": int(self.attention_interval.get_active_id()),
             "attention_ac_only": self.attention_ac_switch.get_active(),
+            "apps_enabled": self.apps_switch.get_active(),
         }
 
     def _compute_ops(self, ui: dict, base: dict) -> list:
@@ -1211,6 +1548,8 @@ class SettingsWindow(Gtk.Window):
         if ui["attention_ac_only"] != base["attention_ac_only"]:
             ops.append(["set-attention-ac-only",
                         "on" if ui["attention_ac_only"] else "off"])
+        if ui["apps_enabled"] != base["apps_enabled"]:
+            ops.append(["set-apps-enabled", "on" if ui["apps_enabled"] else "off"])
         return ops
 
     def _update_apply_state(self):
@@ -1230,6 +1569,7 @@ class SettingsWindow(Gtk.Window):
         self.attention_switch.set_active(p["attention"])
         self.attention_interval.set_active_id(str(p["attention_interval"]))
         self.attention_ac_switch.set_active(p["attention_ac_only"])
+        self.apps_switch.set_active(p["apps_enabled"])
         self._loading = False
 
     def _apply(self, _btn=None):
@@ -1244,7 +1584,8 @@ class SettingsWindow(Gtk.Window):
         p = self._persisted
         weakens = ((p["face"] and not ui["face"])
                    or (p["pin"] and not ui["pin"])
-                   or (p["sudo"] and not ui["sudo"]))
+                   or (p["sudo"] and not ui["sudo"])
+                   or (p["apps_enabled"] and not ui["apps_enabled"]))
         if run_privileged_batch(ops, force=weakens):
             self._persisted = read_config()
             self._reset_controls()  # resync to what actually saved
@@ -1290,40 +1631,44 @@ class SettingsWindow(Gtk.Window):
                                         "leave” can't work on this machine.")
             return
         self._update_apply_state()
-        self._refresh_brightness_visibility()
 
-    # -- automatic brightness (only shown when presence is on) ---------------
-    def _build_brightness_section(self):
-        # Own frame so we can show/hide the whole thing. Native Gtk → KDE theme.
-        # Deliberately simple: a toggle + a short explanation, with the sliders
-        # tucked behind an "Advanced" expander so the default view isn't busy.
-        frame = Gtk.Frame(label="Automatic screen brightness")
-        self.brightness_frame = frame
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
-                        border_width=10)
-        frame.add(inner)
-        self.box.pack_start(frame, False, False, 0)
+    # -- Presence gear dialog: automatic screen brightness -------------------
+
+    def _open_presence_dialog(self, _btn):
+        dlg = Gtk.Dialog(title="Automatic screen brightness", transient_for=self,
+                         modal=True)
+        dlg.set_default_size(460, 420)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(14)
 
         bc = read_brightness()
         erow, self.bright_enable = self._switch_row(
             "Adjust brightness automatically", bc["enabled"])
-        self.bright_enable.connect("notify::active", self._on_brightness_enable_toggled)
-        inner.pack_start(erow, False, False, 0)
+        self.bright_enable.connect("notify::active",
+                                   self._on_brightness_enable_toggled)
+        area.add(erow)
+        area.add(self._dim_label(
+            "While “lock when I leave” is on, the screen brightness follows the "
+            "time of day and how dark the room looks to the camera — bright in "
+            "daylight, gentle at night. Good defaults are used; open Advanced to "
+            "set your own."))
 
-        note = Gtk.Label(xalign=0, label=(
-            "While “lock when I leave” is on, the screen brightness follows the time "
-            "of day and how dark the room looks to the camera — bright in daylight, "
-            "gentle at night. Good defaults are used; open Advanced to set your own."))
-        note.get_style_context().add_class("dim-label")
-        note.set_line_wrap(True)
-        inner.pack_start(note, False, False, 0)
+        grow, self.bright_pause_game = self._switch_row(
+            "Don't change brightness while a game is running",
+            bc["pause_on_game"])
+        self.bright_pause_game.connect("notify::active", self._on_brightness_changed)
+        area.add(grow)
+        area.add(self._dim_label(
+            "Leaves the screen alone while a Steam game (or gamescope) is running, "
+            "so auto-brightness doesn't fight the game."))
 
-        # Advanced: the per-time-of-day levels + adjustment range, collapsed.
         adv = Gtk.Expander(label="Advanced — set the levels yourself")
         adv_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
                           border_width=6)
         adv.add(adv_box)
-        inner.pack_start(adv, False, False, 0)
+        area.add(adv)
 
         self.bright_sliders = {}
         for key, label in (("morning", "Morning"), ("midday", "Midday"),
@@ -1351,22 +1696,15 @@ class SettingsWindow(Gtk.Window):
         arow.pack_start(self.bright_area, True, True, 0)
         adv_box.pack_start(arow, False, False, 0)
 
-        self._refresh_brightness_visibility()
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
 
     @staticmethod
     def _tune_scale(sc):
         """Stop the mouse wheel from nudging the value — it grabs scroll by
         default, which is annoying inside a scrolling window."""
         sc.connect("scroll-event", lambda _w, _e: True)  # consume → no accidental drag
-
-    def _refresh_brightness_visibility(self):
-        # Invisible until presence is enabled (per the design).
-        if getattr(self, "brightness_frame", None) is None:
-            return
-        if self.attention_switch.get_active():
-            self.brightness_frame.show_all()
-        else:
-            self.brightness_frame.hide()
 
     def _on_brightness_changed(self, *_args):
         if self._loading:
@@ -1375,6 +1713,7 @@ class SettingsWindow(Gtk.Window):
             "enabled": self.bright_enable.get_active(),
             "levels": {k: int(s.get_value()) for k, s in self.bright_sliders.items()},
             "area": int(self.bright_area.get_value()),
+            "pause_on_game": self.bright_pause_game.get_active(),
         })
 
     def _on_brightness_enable_toggled(self, *_args):
@@ -1461,6 +1800,7 @@ class SettingsWindow(Gtk.Window):
     def _add_app(self, key: str):
         r = _broker("apply", ops=[["lock-app", key]])
         self._refresh_apps()  # always resync to disk so the UI can't go stale
+        self._refresh_apps_summary()
         if not _ok(r):
             _log(f"add-app {key!r} COMPLAINED: reply={r!r}")
             self._toast(_broker_problem(r, "lock that app"))
@@ -1468,6 +1808,7 @@ class SettingsWindow(Gtk.Window):
     def _remove_app(self, key: str):
         r = _broker("apply", ops=[["unlock-app", key]])
         self._refresh_apps()  # always resync to disk (a phantom row can't linger)
+        self._refresh_apps_summary()
         if not _ok(r):
             _log(f"remove-app {key!r} COMPLAINED: reply={r!r}")
             self._toast(_broker_problem(r, "unlock that app"))
@@ -1563,9 +1904,6 @@ def main():
         return 1
     win = SettingsWindow()
     win.show_all()
-    # show_all() reveals every section; now hide the brightness panel unless
-    # presence is on (it stays hidden until "lock when I leave" is enabled).
-    win._refresh_brightness_visibility()
     Gtk.main()
     return 0
 

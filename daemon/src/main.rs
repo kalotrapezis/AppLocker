@@ -214,6 +214,7 @@ fn main() {
         Some("set-attention-ac-only") => cmd_set_attention_ac_only(std::env::args().nth(2)),
         Some("set-fallback") => cmd_set_fallback(std::env::args().nth(2)),
         Some("set-reauth") => cmd_set_reauth(std::env::args().nth(2)),
+        Some("set-apps-enabled") => cmd_set_apps_enabled(std::env::args().nth(2)),
         Some("authorize") => cmd_auth_test(std::env::args().nth(2)), // alias for GUI gating
         Some("list-installed") => cmd_list_installed(),
         Some("list-apps") => cmd_list_apps(),
@@ -249,6 +250,7 @@ fn cmd_config_show() {
     println!("  applockerd set-attention-ac-only on|off          (pause on battery)");
     println!("  applockerd set-fallback pin|sudo|both");
     println!("  applockerd set-reauth session|always");
+    println!("  applockerd set-apps-enabled on|off               (master app-lock switch)");
 }
 
 fn cmd_set_face(arg: Option<String>) {
@@ -392,6 +394,29 @@ fn cmd_set_reauth(arg: Option<String>) {
     pol.reauth_every_time = every;
     save_policy_or_exit(&pol, &path);
     println!("{}", pol.summary());
+}
+
+fn cmd_set_apps_enabled(arg: Option<String>) {
+    let on = match arg.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!("usage: applockerd set-apps-enabled on|off");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.apps_enabled = on;
+    save_policy_or_exit(&pol, &path);
+    println!(
+        "app-locking {} — {}",
+        if on { "enabled" } else { "disabled" },
+        pol.summary()
+    );
+    // Nudge the running gate to reload so the change takes effect immediately
+    // (the gate honours apps_enabled by loading an empty list when it's off).
+    signal_daemon_reload();
 }
 
 fn save_policy_or_exit(pol: &policy::Policy, path: &std::path::Path) {
@@ -720,6 +745,19 @@ extern "C" fn on_sighup(_sig: libc::c_int) {
     RELOAD_LOCKS.store(true, Ordering::SeqCst);
 }
 
+/// Load the locked-app list the gate should enforce *right now*. Honours the
+/// master switch: with `apps_enabled = off` the gate sees an empty list (so
+/// nothing prompts) while the on-disk list is preserved for when it's turned
+/// back on. Kept in one place so the initial load and the SIGHUP reload agree.
+fn load_gate_apps() -> LockList {
+    if policy::load_default().apps_enabled {
+        LockList::load(&locklist::default_path())
+    } else {
+        eprintln!("applockerd: app-locking master switch is OFF — enforcing no apps.");
+        LockList::default()
+    }
+}
+
 fn cmd_gate(adhoc: Option<String>) {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("applockerd: gate mode must run as root (try: sudo applockerd)");
@@ -727,7 +765,7 @@ fn cmd_gate(adhoc: Option<String>) {
     }
 
     // Load both lists, plus any ad-hoc app named on the CLI.
-    let mut apps = LockList::load(&locklist::default_path());
+    let mut apps = load_gate_apps();
     if let Some(name) = adhoc {
         apps.add(LockedApp { kind: AppKind::Native, key: name.clone(), name });
     }
@@ -892,7 +930,7 @@ fn event_loop(
     loop {
         // Apply a pending SIGHUP reload before blocking again.
         if RELOAD_LOCKS.swap(false, Ordering::SeqCst) {
-            let apps = LockList::load(&locklist::default_path());
+            let apps = load_gate_apps();
             let na = apps.apps.len();
             // Exec-only: never (re-)mark FAN_OPEN_PERM. Folders use vaults.
             *locks.write().unwrap() = Locks { apps, folders: FolderList::default() };

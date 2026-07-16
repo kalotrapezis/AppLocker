@@ -241,15 +241,12 @@ def run(args) -> int:
         opened = {d for (d, name) in events if name == ""}
 
         for d in opened:
-            # (a) You're INSIDE a revealed target folder → keep it shown.
-            if d in revealed:
-                revealed[d] = now + args.reveal_timeout
-            # (b) d is a target's PARENT → refresh any already-revealed siblings,
-            #     and offer a face check for the ones still hidden.
+            # d is a target's PARENT → offer a face check for the ones still
+            # hidden. Note: opening/relisting a folder does NOT extend an already
+            # revealed item's deadline — the re-hide timer is fixed from the
+            # moment of reveal (see below), so hiding is predictable: exactly
+            # `reveal_timeout` after it was shown, regardless of activity.
             here = [t for t in targets if os.path.dirname(t) == d]
-            for t in here:
-                if t in revealed:
-                    revealed[t] = now + args.reveal_timeout
             hidden = [t for t in here if hidelist.is_hidden(t)]
             if (hidden and now >= suppress.get(d, 0.0)
                     and (now - last_check) >= args.cooldown):

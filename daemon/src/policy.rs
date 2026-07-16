@@ -48,6 +48,10 @@ pub struct Policy {
     /// (the camera is the biggest drain, and a laptop on battery is usually
     /// with you). The watcher reads this and pauses when unplugged.
     pub attention_ac_only: bool,
+    /// Master switch for app-locking. When off, the gate ignores the locked-app
+    /// list entirely (nothing prompts on launch) while the list itself is kept,
+    /// so the feature can be toggled without losing which apps were chosen.
+    pub apps_enabled: bool,
 }
 
 /// The intervals the UI offers (minutes between snapshots). A hand-edited value
@@ -68,6 +72,10 @@ impl Default for Policy {
             attention_enabled: false,
             attention_interval_min: ATTENTION_INTERVAL_DEFAULT,
             attention_ac_only: false,
+            // App-locking on by default: a fresh install with no locked apps is
+            // harmless, and this keeps existing configs (which never wrote the
+            // key) behaving exactly as before the master switch existed.
+            apps_enabled: true,
         }
     }
 }
@@ -111,6 +119,9 @@ impl Policy {
                 "attention_ac_only" => {
                     p.attention_ac_only = parse_bool(val).unwrap_or(p.attention_ac_only)
                 }
+                "apps_enabled" => {
+                    p.apps_enabled = parse_bool(val).unwrap_or(p.apps_enabled)
+                }
                 other => eprintln!("applockerd: config:{}: unknown key {other:?}", lineno + 1),
             }
         }
@@ -149,13 +160,15 @@ impl Policy {
              reauth = {}\n\
              attention = {}\n\
              attention_interval = {}\n\
-             attention_ac_only = {}\n",
+             attention_ac_only = {}\n\
+             apps_enabled = {}\n",
             if self.face_enabled { "on" } else { "off" },
             fallback.join(", "),
             if self.reauth_every_time { "always" } else { "session" },
             if self.attention_enabled { "on" } else { "off" },
             self.attention_interval_min,
-            if self.attention_ac_only { "on" } else { "off" }
+            if self.attention_ac_only { "on" } else { "off" },
+            if self.apps_enabled { "on" } else { "off" }
         );
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -187,11 +200,12 @@ impl Policy {
             "off".to_string()
         };
         format!(
-            "face {}, fallback: {}, re-auth: {}, attention {}",
+            "face {}, fallback: {}, re-auth: {}, attention {}, apps {}",
             if self.face_enabled { "ON" } else { "off" },
             fb.join(" + "),
             if self.reauth_every_time { "every launch" } else { "once per session" },
-            att
+            att,
+            if self.apps_enabled { "on" } else { "off" }
         )
     }
 }
@@ -287,13 +301,14 @@ mod tests {
             attention_enabled: false,
             attention_interval_min: 2,
             attention_ac_only: false,
+            apps_enabled: true,
         };
         pol.save(&path).unwrap();
         let loaded = Policy::load(&path);
         assert_eq!(loaded, pol);
         assert_eq!(
             loaded.summary(),
-            "face off, fallback: sudo, re-auth: once per session, attention off"
+            "face off, fallback: sudo, re-auth: once per session, attention off, apps on"
         );
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
@@ -311,6 +326,7 @@ mod tests {
             attention_enabled: false,
             attention_interval_min: 2,
             attention_ac_only: false,
+            apps_enabled: true,
         };
         pol.save(&path).unwrap();
         let loaded = Policy::load(&path);
@@ -329,6 +345,7 @@ mod tests {
             attention_enabled: false,
             attention_interval_min: 2,
             attention_ac_only: false,
+            apps_enabled: true,
         };
         assert!(pol.save(&tmp("empty")).is_err());
     }

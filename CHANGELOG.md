@@ -3,6 +3,40 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.2 — settings redesign + presence that actually works on Wayland
+
+A big pass over the Settings window and the two features that were unreliable:
+presence locking and hide-in-place.
+
+### Changed
+- **Redesigned Settings window** to match the design mockup: a left navigation
+  sidebar (rounded items, separators) with four pages — Security & unlock, Locked
+  apps, Private files, Presence & display — laid out as rounded cards. The long
+  lists (enrolled faces, locked apps, hidden items, PIN, brightness) moved behind
+  per-card **⚙ gear dialogs**, with live "N enrolled / locked / hidden" summaries.
+- **Presence is now purely time-based.** It used X11 idle detection (ScreenSaver /
+  `xprintidle`), which doesn't exist on Wayland, so on KDE/Wayland it effectively
+  never ran. It now takes a snapshot every interval regardless of keyboard/mouse,
+  and locks after the configured number of empty snapshots.
+
+### Added
+- **"Lock apps with your face" master switch** — a real `apps_enabled` policy flag
+  (daemon `set-apps-enabled`); when off, the gate ignores the locked-app list while
+  keeping it, so the feature toggles without losing your choices.
+- **Adaptive brightness pauses while a game is running** — a new toggle (on by
+  default) leaves the screen alone while a Steam game (`SteamLaunch`) or `gamescope`
+  is running, so auto-brightness doesn't fight the game.
+- **Black-frame notification** — when the camera can only see black (shutter closed
+  or a dark room) the watcher pops a desktop notification and logs it, instead of
+  silently treating it as "present".
+- Testing flag `watch_presence.py --no-lock` (logs "would lock" instead of locking).
+
+### Fixed
+- **Hidden files now re-hide on a predictable timer.** The re-hide deadline was
+  reset every time the folder was re-listed (by the file manager, Baloo, …), so it
+  often never fired. It's now fixed at **1 minute from reveal** (and still hides
+  instantly when the screen locks).
+
 ## 0.0.1-1 — hidden files actually re-hide
 
 Fixes the hide-in-place watcher so revealed items get hidden again — before this,
