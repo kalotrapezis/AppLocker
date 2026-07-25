@@ -32,13 +32,24 @@
 //! prompt is itself an exec, and if we blocked the loop waiting for the prompt
 //! we could never allow that python to start. See ../README.md.
 //!
-//! Still NOT here (later steps): the real face pipeline, the file-gate,
-//! multi-mount marks, logind lock integration + cache wipe, D-Bus, a fail-open
-//! watchdog. This is step 2, not the finished product.
+//! A **fail-open watchdog** (`$APPLOCKER_GATE_TIMEOUT`, default 30s) now bounds
+//! how long a held exec waits on auth: if the recognizer/prompt hangs (busy
+//! camera, no display), the gate ALLOWs rather than freezing that launch. And a
+//! **test scope** (`$APPLOCKER_GATE_SCOPE`) marks a single mount instead of all
+//! of `/`, so gate bugs can't wedge the whole machine while developing.
+//!
+//! The gate is now **exec-only** — it never marks `FAN_OPEN_PERM`. That
+//! whole-`/` *open* gate used to intercept every file open, including the
+//! event-loop thread's own config reads, which could self-deadlock and freeze
+//! the machine. Files are protected by encrypted vaults (`vault.py`) instead.
+//!
+//! Still NOT here (later steps): multi-mount marks, D-Bus. Real system-wide
+//! enforcement (`applocker on`) is validated in a throwaway VM, not the host.
 
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
+use std::time::Duration;
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::process;
@@ -62,6 +73,105 @@ struct Locks {
     folders: FolderList,
 }
 
+/// Where the fanotify mark is applied. Production gates the whole filesystem
+/// (`FAN_MARK_FILESYSTEM` on `/`); the dev-safe **test scope** gates a single
+/// mount (`FAN_MARK_MOUNT`) so a bug can never freeze anything outside it.
+#[derive(Clone)]
+struct MarkSpec {
+    /// Path to hand to `fanotify_mark`.
+    path: String,
+    /// true → whole filesystem (`/`); false → just this one mount (test scope).
+    filesystem: bool,
+}
+
+/// Resolve the gate scope from `$APPLOCKER_GATE_SCOPE`. When set, the gate marks
+/// only that mount instead of all of `/` — the safe way to test locking without
+/// putting the whole machine behind the blocking permission gate.
+///
+/// The path MUST be its own mount point, or `FAN_MARK_MOUNT` would silently mark
+/// the mount it *sits on* (often `/` — the exact disaster we're avoiding). We
+/// refuse otherwise and tell the user how to make a scratch mount. Bypass the
+/// check (at your own risk) with `APPLOCKER_GATE_FORCE=1`.
+fn gate_scope() -> Option<MarkSpec> {
+    let path = std::env::var("APPLOCKER_GATE_SCOPE").ok().filter(|s| !s.is_empty())?;
+    let forced = std::env::var("APPLOCKER_GATE_FORCE").ok().as_deref() == Some("1");
+    if !forced && !is_mount_point(&path) {
+        eprintln!(
+            "applockerd: APPLOCKER_GATE_SCOPE={path} is not its own mount point.\n\
+             \x20 Marking it would gate the whole mount it sits on (likely /), which is\n\
+             \x20 exactly the freeze we're avoiding. Make it a private mount first:\n\
+             \x20   sudo mkdir -p {path} && sudo mount --bind {path} {path}\n\
+             \x20 (a bind-mount to itself; undone by `sudo umount {path}` or a reboot.)\n\
+             \x20 Or set APPLOCKER_GATE_FORCE=1 to override."
+        );
+        process::exit(1);
+    }
+    Some(MarkSpec { path, filesystem: false })
+}
+
+/// True if `path` is its own mount point. We consult `/proc/self/mountinfo`
+/// rather than comparing `st_dev` with the parent: a **bind-mount to itself**
+/// (how the test sandbox is made) keeps the underlying device number, so the
+/// st_dev trick would wrongly report "not a mount". mountinfo lists every mount
+/// point in field 5, which catches bind mounts correctly.
+fn is_mount_point(path: &str) -> bool {
+    // Canonicalise so "/tmp/applocker-test/" and symlinks compare equal to the
+    // form the kernel records in mountinfo.
+    let want = fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let Ok(mi) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    // Each line: "id parent major:minor root MOUNTPOINT opts...". Field index 4
+    // (0-based) is the mount point, with octal escapes for spaces etc.
+    mi.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .map(unescape_mountinfo)
+            .is_some_and(|mp| mp == want)
+    })
+}
+
+/// mountinfo escapes space/tab/newline/backslash as octal (`\040` etc.).
+fn unescape_mountinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut b = s.bytes();
+    while let Some(c) = b.next() {
+        if c == b'\\' {
+            let digits: Vec<u8> = b.clone().take(3).collect();
+            if digits.len() == 3 && digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                let val = (digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0');
+                out.push(val as char);
+                b.nth(2); // consume the three octal digits
+                continue;
+            }
+        }
+        out.push(c as char);
+    }
+    out
+}
+
+/// Dev mode: when `/etc/applocker/dev-mode` exists (or `$APPLOCKER_DEV=1`), the
+/// gate refuses to mark the whole filesystem, so a bad gate can never freeze the
+/// machine during testing. The dev-mode `.deb` ships this marker.
+fn dev_mode() -> bool {
+    std::env::var("APPLOCKER_DEV").ok().as_deref() == Some("1")
+        || std::path::Path::new("/etc/applocker/dev-mode").exists()
+}
+
+/// Fail-open watchdog: if an auth run doesn't finish within this long, the gate
+/// answers ALLOW and logs it, so a hung recognizer (busy camera, no display)
+/// can't leave an exec blocked forever. `$APPLOCKER_GATE_TIMEOUT` seconds;
+/// default 30; `0` disables (strict deny-until-answered, the old behaviour).
+fn fail_open_timeout() -> Option<Duration> {
+    let secs = std::env::var("APPLOCKER_GATE_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(30);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 // ── fanotify constants ──────────────────────────────────────────────────────
 // Defined locally rather than relying on libc exposing every one of them, so
 // the spike builds against an older libc as long as the *kernel* is new enough.
@@ -70,6 +180,7 @@ const FAN_CLOEXEC: libc::c_uint = 0x0000_0001;
 const FAN_CLASS_CONTENT: libc::c_uint = 0x0000_0004; // required for PERM events
 
 const FAN_MARK_ADD: libc::c_uint = 0x0000_0001;
+const FAN_MARK_MOUNT: libc::c_uint = 0x0000_0010; // gate one mount only (test scope)
 const FAN_MARK_FILESYSTEM: libc::c_uint = 0x0000_0100;
 
 const FAN_OPEN_PERM: u64 = 0x0001_0000; // regular file opens (the file-gate)
@@ -97,8 +208,13 @@ fn main() {
         Some("set-pin") => cmd_set_pin(),
         Some("config") => cmd_config_show(),
         Some("set-face") => cmd_set_face(std::env::args().nth(2)),
+        Some("session-probe") => cmd_session_probe(),
+        Some("set-attention") => cmd_set_attention(std::env::args().nth(2)),
+        Some("set-attention-interval") => cmd_set_attention_interval(std::env::args().nth(2)),
+        Some("set-attention-ac-only") => cmd_set_attention_ac_only(std::env::args().nth(2)),
         Some("set-fallback") => cmd_set_fallback(std::env::args().nth(2)),
         Some("set-reauth") => cmd_set_reauth(std::env::args().nth(2)),
+        Some("set-apps-enabled") => cmd_set_apps_enabled(std::env::args().nth(2)),
         Some("authorize") => cmd_auth_test(std::env::args().nth(2)), // alias for GUI gating
         Some("list-installed") => cmd_list_installed(),
         Some("list-apps") => cmd_list_apps(),
@@ -108,6 +224,7 @@ fn main() {
         Some("lock-folder") => cmd_lock_folder(std::env::args().nth(2)),
         Some("unlock-folder") => cmd_unlock_folder(std::env::args().nth(2)),
         Some("auth-test") => cmd_auth_test(std::env::args().nth(2)),
+        Some("serve") => applockerd::serve::run(),
         Some("gate") | None => cmd_gate(None),
         // Back-compat: `applockerd <name>` gates that one app for this run,
         // on top of the persisted locked list.
@@ -128,8 +245,12 @@ fn cmd_config_show() {
     );
     println!("\nChange with:");
     println!("  applockerd set-face on|off");
+    println!("  applockerd set-attention on|off");
+    println!("  applockerd set-attention-interval 2|5|10|15|30   (minutes between checks)");
+    println!("  applockerd set-attention-ac-only on|off          (pause on battery)");
     println!("  applockerd set-fallback pin|sudo|both");
     println!("  applockerd set-reauth session|always");
+    println!("  applockerd set-apps-enabled on|off               (master app-lock switch)");
 }
 
 fn cmd_set_face(arg: Option<String>) {
@@ -149,6 +270,89 @@ fn cmd_set_face(arg: Option<String>) {
     if on && !pin::is_set(&auth::default_pin_path()) {
         eprintln!("note: face still needs enrollment (face/enroll.py) to actually run.");
     }
+}
+
+/// Debug: show which graphical session the root daemon would drop prompts into.
+/// Run as root (`sudo applockerd session-probe`) to see the real result.
+fn cmd_session_probe() {
+    let euid = unsafe { libc::geteuid() };
+    println!("euid: {euid} ({})", if euid == 0 { "root" } else { "not root — run with sudo" });
+    match applockerd::session::SessionCtx::discover() {
+        Some(c) => {
+            println!("active session found:");
+            println!("  user:            {} (uid {}, gid {})", c.user, c.uid, c.gid);
+            println!("  home:            {}", c.home.display());
+            println!("  DISPLAY:         {}", c.display.as_deref().unwrap_or("(none — Wayland?)"));
+            println!("  WAYLAND_DISPLAY: {}", c.wayland_display.as_deref().unwrap_or("(none)"));
+            println!("  XAUTHORITY:      {}", c.xauthority.as_deref().unwrap_or("(none found)"));
+            println!("  XDG_RUNTIME_DIR: {}", c.xdg_runtime_dir);
+            let kind = if c.wayland_display.is_some() { "Wayland" } else { "X11" };
+            println!("\nGUI prompts + the camera recognizer will run as this user ({kind}).");
+        }
+        None => println!(
+            "no active graphical session found — prompts would inherit the daemon's \
+             environment (fine for `sudo applockerd` in your session; a boot service \
+             would have no DISPLAY until someone logs in)."
+        ),
+    }
+}
+
+fn cmd_set_attention(arg: Option<String>) {
+    let on = match arg.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!("usage: applockerd set-attention on|off");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.attention_enabled = on;
+    save_policy_or_exit(&pol, &path);
+    println!(
+        "attention {} — {}",
+        if on { "enabled" } else { "disabled" },
+        pol.summary()
+    );
+    if on {
+        println!("start the watcher in your session: python3 face/watch_presence.py");
+    }
+}
+
+fn cmd_set_attention_interval(arg: Option<String>) {
+    let min = match arg.as_deref().and_then(|s| s.parse::<u32>().ok()) {
+        Some(n) if policy::ATTENTION_INTERVALS.contains(&n) => n,
+        _ => {
+            eprintln!("usage: applockerd set-attention-interval 2|5|10|15|30");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.attention_interval_min = min;
+    save_policy_or_exit(&pol, &path);
+    println!("attention interval {}m — {}", min, pol.summary());
+}
+
+fn cmd_set_attention_ac_only(arg: Option<String>) {
+    let on = match arg.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!("usage: applockerd set-attention-ac-only on|off");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.attention_ac_only = on;
+    save_policy_or_exit(&pol, &path);
+    println!(
+        "attention AC-only {} — {}",
+        if on { "enabled" } else { "disabled" },
+        pol.summary()
+    );
 }
 
 fn cmd_set_fallback(arg: Option<String>) {
@@ -190,6 +394,29 @@ fn cmd_set_reauth(arg: Option<String>) {
     pol.reauth_every_time = every;
     save_policy_or_exit(&pol, &path);
     println!("{}", pol.summary());
+}
+
+fn cmd_set_apps_enabled(arg: Option<String>) {
+    let on = match arg.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!("usage: applockerd set-apps-enabled on|off");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.apps_enabled = on;
+    save_policy_or_exit(&pol, &path);
+    println!(
+        "app-locking {} — {}",
+        if on { "enabled" } else { "disabled" },
+        pol.summary()
+    );
+    // Nudge the running gate to reload so the change takes effect immediately
+    // (the gate honours apps_enabled by loading an empty list when it's off).
+    signal_daemon_reload();
 }
 
 fn save_policy_or_exit(pol: &policy::Policy, path: &std::path::Path) {
@@ -360,7 +587,13 @@ fn cmd_unlock_app(query: Option<String>) {
     let mut list = locklist::LockList::load(&path);
     let n = list.remove(&query);
     if n == 0 {
-        eprintln!("nothing matched {query:?} in the locked list.");
+        // Log exactly what we loaded so a stored-key vs passed-key mismatch is
+        // visible in the journal instead of a silent "exited 1".
+        eprintln!("nothing matched {query:?} in {} — loaded {} entry(ies):",
+                  path.display(), list.apps.len());
+        for a in &list.apps {
+            eprintln!("  [{}] key={:?} name={:?}", a.kind.as_str(), a.key, a.name);
+        }
         process::exit(1);
     }
     save_locklist_or_exit(&list, &path);
@@ -483,7 +716,7 @@ fn cmd_auth_test(app: Option<String>) {
         Feedback::none()
     }));
     let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
-    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app), fb);
+    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app, face_live), fb);
     let fallback = SystemFallback::system();
     let pol = policy::load_default();
 
@@ -512,6 +745,19 @@ extern "C" fn on_sighup(_sig: libc::c_int) {
     RELOAD_LOCKS.store(true, Ordering::SeqCst);
 }
 
+/// Load the locked-app list the gate should enforce *right now*. Honours the
+/// master switch: with `apps_enabled = off` the gate sees an empty list (so
+/// nothing prompts) while the on-disk list is preserved for when it's turned
+/// back on. Kept in one place so the initial load and the SIGHUP reload agree.
+fn load_gate_apps() -> LockList {
+    if policy::load_default().apps_enabled {
+        LockList::load(&locklist::default_path())
+    } else {
+        eprintln!("applockerd: app-locking master switch is OFF — enforcing no apps.");
+        LockList::default()
+    }
+}
+
 fn cmd_gate(adhoc: Option<String>) {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("applockerd: gate mode must run as root (try: sudo applockerd)");
@@ -519,16 +765,21 @@ fn cmd_gate(adhoc: Option<String>) {
     }
 
     // Load both lists, plus any ad-hoc app named on the CLI.
-    let mut apps = LockList::load(&locklist::default_path());
+    let mut apps = load_gate_apps();
     if let Some(name) = adhoc {
         apps.add(LockedApp { kind: AppKind::Native, key: name.clone(), name });
     }
-    let folders = FolderList::load(&folderlist::default_path());
+    // Folder locking is handled by encrypted vaults (vault.py), NOT fanotify, so
+    // we keep an empty folder list — the file-gate is never engaged.
+    let folders = FolderList::default();
     let n_apps = apps.apps.len();
-    let n_folders = folders.folders.len();
-    let gate_files = !folders.is_empty();
-    if n_apps == 0 && n_folders == 0 {
-        eprintln!("applockerd: nothing locked yet — add with lock-app / lock-folder.");
+    let legacy_folders = FolderList::load(&folderlist::default_path()).folders.len();
+    if legacy_folders > 0 {
+        eprintln!("applockerd: note: {legacy_folders} legacy locked-folder(s) IGNORED — \
+                   folder locking now uses encrypted vaults (vault.py / Settings).");
+    }
+    if n_apps == 0 {
+        eprintln!("applockerd: no apps locked yet — add with lock-app.");
     }
     let locks = Arc::new(RwLock::new(Locks { apps, folders }));
 
@@ -537,14 +788,28 @@ fn cmd_gate(adhoc: Option<String>) {
         process::exit(1);
     });
 
-    // Always gate execs (app-gate). Add file opens (file-gate) only when folders
-    // are locked — FAN_OPEN_PERM on the whole fs intercepts *every* open, so we
-    // don't pay that cost unless the user is actually locking folders.
-    let mut mask = FAN_OPEN_EXEC_PERM;
-    if gate_files {
-        mask |= FAN_OPEN_PERM;
+    // Exec-only gate. We never mark FAN_OPEN_PERM: that whole-filesystem *open*
+    // gate intercepted EVERY file open — including the daemon's own config reads
+    // on this very event-loop thread — which could self-deadlock and freeze the
+    // machine. Files are protected by encrypted vaults instead.
+    let mask = FAN_OPEN_EXEC_PERM;
+    // Test scope (a single mount) if $APPLOCKER_GATE_SCOPE is set, else all of /.
+    let mark = gate_scope().unwrap_or(MarkSpec { path: "/".into(), filesystem: true });
+    // Dev mode: refuse to gate the whole filesystem. This makes the input-freeze
+    // impossible no matter what starts the gate (`applocker on`, the service) —
+    // the app-gate only runs when explicitly scoped to a sandbox mount. Vaults,
+    // face and the GUI are unaffected. Turn off by deleting /etc/applocker/dev-mode.
+    if dev_mode() && mark.filesystem {
+        eprintln!("applockerd: DEV MODE — not gating all of / (freeze risk); doing nothing.");
+        eprintln!("applockerd: set APPLOCKER_GATE_SCOPE=<a private mount> to test the");
+        eprintln!("applockerd: app-gate safely (see packaging/bin/applocker-test-scope),");
+        eprintln!("applockerd: or remove /etc/applocker/dev-mode to allow the real gate.");
+        // Exit 0, not 1: a clean no-op. Exiting non-zero here made the systemd
+        // service (Restart=on-failure) restart-storm and land in `failed` when
+        // someone started it in dev mode. A clean exit just stops.
+        process::exit(0);
     }
-    if let Err(e) = mark_filesystem(fan_fd, "/", mask) {
+    if let Err(e) = mark_scope(fan_fd, &mark, mask) {
         eprintln!("applockerd: fanotify_mark failed: {e}");
         process::exit(1);
     }
@@ -552,9 +817,16 @@ fn cmd_gate(adhoc: Option<String>) {
     // Reload both lists live on SIGHUP (lock-*/unlock-* send it).
     unsafe { libc::signal(libc::SIGHUP, on_sighup as *const () as libc::sighandler_t) };
 
-    eprintln!("applockerd: gating {n_apps} app(s) + {n_folders} folder(s) on /.");
-    if gate_files {
-        eprintln!("applockerd: file-gate ON — every file open is checked (may add latency).");
+    let fail_open = fail_open_timeout();
+    if mark.filesystem {
+        eprintln!("applockerd: gating {n_apps} app(s) on / (WHOLE SYSTEM, exec-only).");
+    } else {
+        eprintln!("applockerd: *** TEST SCOPE *** gating only the '{}' mount — the rest of", mark.path);
+        eprintln!("applockerd: the system is NOT gated and cannot freeze. {n_apps} app(s).");
+    }
+    match fail_open {
+        Some(d) => eprintln!("applockerd: fail-open watchdog: auth hangs auto-ALLOW after {}s.", d.as_secs()),
+        None => eprintln!("applockerd: fail-open watchdog DISABLED — a hung auth blocks that launch forever."),
     }
     eprintln!("applockerd: policy: {}", policy::load_default().summary());
     eprintln!("applockerd: (PIN set: {})", pin::is_set(&auth::default_pin_path()));
@@ -565,7 +837,49 @@ fn cmd_gate(adhoc: Option<String>) {
     let cache = Arc::new(UnlockCache::new());
     let write_lock = Arc::new(Mutex::new(()));
 
-    event_loop(fan_fd, locks, cache, write_lock);
+    // Re-lock everything when the session locks or the machine sleeps: manual
+    // lock, lid-close, and the attention watcher's `loginctl lock-session` all
+    // funnel through logind, so this one listener covers them all.
+    spawn_lock_listener(Arc::clone(&cache));
+
+    event_loop(fan_fd, locks, cache, write_lock, fail_open);
+}
+
+/// Watch logind for `Session.Lock` / `PrepareForSleep(true)` signals and wipe
+/// the unlock cache when they fire. Uses `gdbus monitor` (ships with GLib) so
+/// the std-only daemon needs no D-Bus crate; if gdbus is missing we log it and
+/// the cache simply lives until the daemon restarts (previous behaviour).
+fn spawn_lock_listener(cache: Arc<UnlockCache>) {
+    thread::spawn(move || loop {
+        let child = process::Command::new("gdbus")
+            .args(["monitor", "-y", "-d", "org.freedesktop.login1"])
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("applockerd: no lock listener (gdbus unavailable: {e}) — \
+                           unlocks last until the daemon restarts.");
+                return;
+            }
+        };
+        if let Some(stdout) = child.stdout.take() {
+            let reader = io::BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if line.contains(".Session.Lock (")
+                    || line.contains("PrepareForSleep (true")
+                {
+                    cache.wipe();
+                    eprintln!("applockerd: session locked — unlock cache wiped.");
+                }
+            }
+        }
+        let _ = child.wait();
+        // gdbus died (session bus restart?) — retry after a beat.
+        thread::sleep(Duration::from_secs(5));
+    });
 }
 
 fn init_fanotify() -> std::io::Result<RawFd> {
@@ -580,16 +894,18 @@ fn init_fanotify() -> std::io::Result<RawFd> {
     Ok(fd)
 }
 
-fn mark_filesystem(fan_fd: RawFd, path: &str, mask: u64) -> std::io::Result<()> {
+fn mark_scope(fan_fd: RawFd, spec: &MarkSpec, mask: u64) -> std::io::Result<()> {
     // FAN_MARK_FILESYSTEM covers the whole filesystem containing `path`, so any
     // exec (and, if requested, any open) on that fs generates an event. (A
     // separate /home or flatpak store is a different fs and would need its own
-    // mark — noted in README as a known gap.)
-    let c_path = CString::new(path).unwrap();
+    // mark — noted in README as a known gap.) FAN_MARK_MOUNT instead gates just
+    // one mount — the test scope, so a bug can't freeze the rest of the machine.
+    let flag = if spec.filesystem { FAN_MARK_FILESYSTEM } else { FAN_MARK_MOUNT };
+    let c_path = CString::new(spec.path.as_str()).unwrap();
     let rc = unsafe {
         libc::fanotify_mark(
             fan_fd,
-            FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+            FAN_MARK_ADD | flag,
             mask,
             libc::AT_FDCWD,
             c_path.as_ptr(),
@@ -606,6 +922,7 @@ fn event_loop(
     locks: Arc<RwLock<Locks>>,
     cache: Arc<UnlockCache>,
     write_lock: Arc<Mutex<()>>,
+    fail_open: Option<Duration>,
 ) {
     let mut buf = [0u8; 8192];
     let meta_size = mem::size_of::<libc::fanotify_event_metadata>();
@@ -613,18 +930,11 @@ fn event_loop(
     loop {
         // Apply a pending SIGHUP reload before blocking again.
         if RELOAD_LOCKS.swap(false, Ordering::SeqCst) {
-            let apps = LockList::load(&locklist::default_path());
-            let folders = FolderList::load(&folderlist::default_path());
-            let (na, nf) = (apps.apps.len(), folders.folders.len());
-            // If folders are now locked, make sure the file-gate mark is present
-            // (FAN_MARK_ADD is idempotent). This lets the first locked folder take
-            // effect live, without a restart. Fully *disabling* the file-gate
-            // still needs a restart — we leave the mark rather than churn it.
-            if !folders.is_empty() {
-                let _ = mark_filesystem(fan_fd, "/", FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM);
-            }
-            *locks.write().unwrap() = Locks { apps, folders };
-            eprintln!("applockerd: reloaded lists ({na} app(s), {nf} folder(s)).");
+            let apps = load_gate_apps();
+            let na = apps.apps.len();
+            // Exec-only: never (re-)mark FAN_OPEN_PERM. Folders use vaults.
+            *locks.write().unwrap() = Locks { apps, folders: FolderList::default() };
+            eprintln!("applockerd: reloaded locked apps ({na}).");
         }
 
         let len = unsafe {
@@ -672,6 +982,7 @@ fn event_loop(
                     &locks,
                     &cache,
                     &write_lock,
+                    fail_open,
                 );
                 if !deferred {
                     unsafe { libc::close(meta.fd) };
@@ -693,6 +1004,7 @@ fn handle_event(
     locks: &Arc<RwLock<Locks>>,
     cache: &Arc<UnlockCache>,
     write_lock: &Arc<Mutex<()>>,
+    fail_open: Option<Duration>,
 ) -> bool {
     let is_exec = mask & FAN_OPEN_EXEC_PERM != 0;
     let is_open = mask & FAN_OPEN_PERM != 0;
@@ -704,15 +1016,29 @@ fn handle_event(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "<unknown>".to_string());
 
+    // Flatpaks exec their real binary inside a bwrap mount namespace, so the host
+    // `…/flatpak/app/<id>/…` path never appears — but a `flatpak`/`bwrap` exec's
+    // pre-exec cmdline still carries `flatpak run … <app-id> …`. So for those
+    // launchers we also match the locked flatpak app-id against the cmdline.
+    let is_flatpak_launcher =
+        is_exec && (path.ends_with("/flatpak") || path.ends_with("/bwrap"));
+
     // Resolve which lock (if any) this event hits: an exec checks the app list by
-    // binary, a file open checks the folder list by path prefix. We copy out the
-    // (key, name) and drop the read lock before any slow work. Not locked → allow
-    // inline — this includes the python3/PAM opens our own prompt makes, so no
-    // self-gating deadlock (the loop keeps answering while a worker runs auth).
+    // binary (and, for flatpak launchers, by cmdline app-id), a file open checks
+    // the folder list by path prefix. Not locked → allow inline (this includes the
+    // python3/PAM opens our own prompt makes, so no self-gating deadlock).
     let hit: Option<(String, String)> = {
         let guard = locks.read().unwrap();
         if is_exec {
-            guard.apps.matches(&path).map(|a| (a.key.clone(), a.name.clone()))
+            let by_path = guard.apps.matches(&path);
+            let matched = by_path.or_else(|| {
+                if is_flatpak_launcher {
+                    guard.apps.matches_flatpak_cmdline(&read_cmdline_tokens(pid))
+                } else {
+                    None
+                }
+            });
+            matched.map(|a| (a.key.clone(), a.name.clone()))
         } else {
             guard.folders.matches(&path).map(|f| (f.path.clone(), f.name.clone()))
         }
@@ -761,20 +1087,43 @@ fn handle_event(
             println!("auth   pid={pid:<7} {app_name} (prompting)");
 
             thread::spawn(move || {
-                let (face, attempts, face_live) = face::build();
-                let cfg = face::config_for(attempts);
-                let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
-                    Feedback::spawn(&app)
-                } else {
-                    Feedback::none()
-                }));
-                let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
-                let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app), fb);
-                let fallback = SystemFallback::system();
-                let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
+                // The actual auth (camera, GTK prompt) runs in an *inner* thread
+                // and reports its verdict over a channel. The outer thread waits
+                // with the fail-open deadline: if auth doesn't answer in time it
+                // ALLOWs anyway, so a hung recognizer (busy camera, no display on
+                // Wayland-as-root) can never leave this exec blocked forever.
+                // Only the outer thread ever replies, so there's no double-answer
+                // race even when the inner thread finishes late.
+                let (tx, rx) = std::sync::mpsc::channel::<bool>();
+                let app_inner = app.clone();
+                thread::spawn(move || {
+                    let (face, attempts, face_live) = face::build();
+                    let cfg = face::config_for(attempts);
+                    let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+                        Feedback::spawn(&app_inner)
+                    } else {
+                        Feedback::none()
+                    }));
+                    let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
+                    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app_inner, face_live), fb);
+                    let fallback = SystemFallback::system();
+                    let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
+                    // If the outer thread already timed out, the receiver is gone
+                    // and this send is a harmless no-op.
+                    let _ = tx.send(matches!(outcome, Outcome::Allowed));
+                });
 
-                let allowed = matches!(outcome, Outcome::Allowed);
-                cache.finish(&target, allowed, cache_policy);
+                let (allowed, timed_out) = match fail_open {
+                    Some(d) => match rx.recv_timeout(d) {
+                        Ok(a) => (a, false),
+                        Err(_) => (true, true), // fail-open: allow rather than freeze
+                    },
+                    None => (rx.recv().unwrap_or(false), false),
+                };
+
+                // Never cache a fail-open allow — it's a safety escape, not a real
+                // unlock; the next launch should prompt again.
+                cache.finish(&target, allowed && !timed_out, cache_policy);
                 respond(
                     fan_fd,
                     event_fd,
@@ -782,11 +1131,14 @@ fn handle_event(
                     &write_lock,
                 );
                 unsafe { libc::close(event_fd) };
-                println!(
-                    "{:<6} pid={pid:<7} {path} (auth {})",
-                    if allowed { "allow" } else { "DENY" },
-                    if allowed { "passed" } else { "failed" }
-                );
+                let verdict = if timed_out {
+                    "ALLOW (fail-open: auth timed out)"
+                } else if allowed {
+                    "allow (auth passed)"
+                } else {
+                    "DENY (auth failed)"
+                };
+                println!("{verdict:<34} pid={pid:<7} {path}");
             });
             true
         }
@@ -796,6 +1148,19 @@ fn handle_event(
 /// Is `pid` this daemon or one of its descendants? Walks the PPid chain in
 /// /proc (a handful of small reads; only runs for events that hit a lock). A
 /// vanished process reads as "not ours" — fail closed to the normal auth path.
+/// Read `/proc/<pid>/cmdline` as its NUL-separated argv tokens (empty on any
+/// failure). Used to spot the flatpak app-id in a `flatpak`/`bwrap` launch.
+fn read_cmdline_tokens(pid: libc::c_int) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|b| {
+            b.split(|&c| c == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn pid_is_our_descendant(pid: libc::c_int) -> bool {
     let me = std::process::id() as libc::c_int;
     let mut cur = pid;
@@ -839,5 +1204,36 @@ fn respond(fan_fd: RawFd, event_fd: libc::c_int, response: u32, write_lock: &Arc
     };
     if rc < 0 {
         eprintln!("applockerd: failed to write response: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unescape_mountinfo_handles_octal() {
+        assert_eq!(unescape_mountinfo("/tmp/applocker-test"), "/tmp/applocker-test");
+        assert_eq!(unescape_mountinfo("/mnt/my\\040drive"), "/mnt/my drive"); // \040 = space
+        assert_eq!(unescape_mountinfo("a\\011b"), "a\tb"); // \011 = tab
+        assert_eq!(unescape_mountinfo("back\\134slash"), "back\\slash"); // \134 = backslash
+        // A lone backslash not followed by 3 octal digits is left as-is.
+        assert_eq!(unescape_mountinfo("trail\\"), "trail\\");
+        assert_eq!(unescape_mountinfo("\\9ab"), "\\9ab");
+    }
+
+    #[test]
+    fn is_mount_point_detects_real_mounts() {
+        // /proc is always its own mount on Linux; a regular subdirectory is not.
+        assert!(is_mount_point("/proc"));
+        assert!(!is_mount_point("/proc/self")); // a dir within the proc mount
+        assert!(!is_mount_point("/nonexistent-applocker-xyz"));
+    }
+
+    #[test]
+    fn fail_open_timeout_parsing() {
+        // Default (unset) is a 30s watchdog; "0" disables it. We can't safely
+        // mutate process env in parallel tests, so just assert the default arm.
+        assert_eq!(fail_open_timeout().map(|d| d.as_secs()), Some(30));
     }
 }

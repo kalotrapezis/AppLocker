@@ -52,8 +52,6 @@ class EnrollWindow(Gtk.Window):
         self.out_path = out_path
         self.saved = False
         self._stop = threading.Event()
-        self._frame = None  # latest RGB frame (numpy), swapped in by the thread
-        self._flash_until = 0.0
 
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_default_size(480, 460)
@@ -67,12 +65,24 @@ class EnrollWindow(Gtk.Window):
         title.set_markup(f"<b>Add a new face</b> — {matcher_escape(label)}")
         box.pack_start(title, False, False, 0)
 
-        # Camera preview.
-        self.video = Gtk.DrawingArea()
-        self.video.set_size_request(440, 300)
-        self.video.connect("draw", self._on_draw)
+        # Camera preview. A Gtk.Image we set a fresh pixbuf on each frame (from the
+        # main thread) — more reliable across X11/Wayland than a DrawingArea +
+        # manual cairo draw, which rendered blank on KDE/Wayland. The green "got it"
+        # check rides an overlay instead of a per-paint cairo arc.
+        self.image = Gtk.Image()
+        self.image.set_size_request(440, 300)
+        self._check = Gtk.Image.new_from_icon_name(
+            "emblem-ok-symbolic", Gtk.IconSize.DIALOG)
+        self._check.set_halign(Gtk.Align.END)
+        self._check.set_valign(Gtk.Align.START)
+        self._check.set_margin_top(8)
+        self._check.set_margin_end(8)
+        self._check.set_no_show_all(True)  # hidden until a capture flashes it
+        overlay = Gtk.Overlay()
+        overlay.add(self.image)
+        overlay.add_overlay(self._check)
         frame = Gtk.Frame()
-        frame.add(self.video)
+        frame.add(overlay)
         box.pack_start(frame, False, False, 0)
 
         # Current instruction — styled like a suggestion chip.
@@ -118,32 +128,26 @@ class EnrollWindow(Gtk.Window):
         if n < SAMPLES:
             self.instruction.set_text(STEPS[n])
 
-    def _on_draw(self, area, cr):
-        w, h = area.get_allocated_width(), area.get_allocated_height()
-        cr.set_source_rgb(0.08, 0.08, 0.08)
-        cr.paint()
-        f = self._frame
-        if f is not None:
-            fh, fw = f.shape[:2]
-            pb = GdkPixbuf.Pixbuf.new_from_data(
-                f.tobytes(), GdkPixbuf.Colorspace.RGB, False, 8, fw, fh, fw * 3)
-            scale = min(w / fw, h / fh)
-            cr.save()
-            cr.translate((w - fw * scale) / 2, (h - fh * scale) / 2)
-            cr.scale(scale, scale)
-            Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
-            cr.paint()
-            cr.restore()
-        if time.time() < self._flash_until:  # green check on each capture
-            cr.set_source_rgb(0.15, 0.68, 0.38)
-            cr.arc(w - 26, 26, 14, 0, 6.2832)
-            cr.fill()
-            cr.set_source_rgb(1, 1, 1)
-            cr.set_line_width(3)
-            cr.move_to(w - 32, 26)
-            cr.line_to(w - 27, 31)
-            cr.line_to(w - 19, 20)
-            cr.stroke()
+    def _show_frame(self, rgb):
+        """Paint one RGB frame into the preview (main thread). new_from_bytes (not
+        new_from_data) keeps the pixel buffer alive for the pixbuf's lifetime."""
+        fh, fw = rgb.shape[:2]
+        data = GLib.Bytes.new(rgb.tobytes())
+        pb = GdkPixbuf.Pixbuf.new_from_bytes(
+            data, GdkPixbuf.Colorspace.RGB, False, 8, fw, fh, fw * 3)
+        w = self.image.get_allocated_width() or 440
+        h = self.image.get_allocated_height() or 300
+        scale = min(w / fw, h / fh)
+        if scale > 0:
+            pb = pb.scale_simple(max(1, int(fw * scale)), max(1, int(fh * scale)),
+                                 GdkPixbuf.InterpType.BILINEAR)
+        self.image.set_from_pixbuf(pb)
+        return False
+
+    def _flash_check(self):
+        """Show the green check briefly after a captured sample."""
+        self._check.show()
+        GLib.timeout_add(500, self._check.hide)  # hide() returns None → one-shot
         return False
 
     def _finish(self, message, ok):
@@ -159,14 +163,28 @@ class EnrollWindow(Gtk.Window):
     # ── camera thread ─────────────────────────────────────────────────────
     def _capture_loop(self):
         import cv2
+        import numpy as np
 
-        from engine import build_engine
-
-        engine = build_engine()
-        cap = cv2.VideoCapture(ARGS.camera)
-        if not cap.isOpened():
-            GLib.idle_add(self._finish, "Cannot open the camera.", False)
+        # Load camera first, independent of engine — user should see what camera sees
+        # even if recognition engine fails to load.
+        try:
+            cap = cv2.VideoCapture(ARGS.camera)
+            if not cap.isOpened():
+                GLib.idle_add(self._finish, 'Cannot open the camera.', False)
+                return
+        except Exception as e:
+            GLib.idle_add(self._finish, f'Cannot start camera: {e}', False)
             return
+
+        # Load recognizer engine. If it fails, we still show video but can't embed.
+        engine = None
+        try:
+            from engine import build_engine
+            engine = build_engine()
+        except Exception as e:
+            err = str(e).split('\n')[0]  # first line only, avoid spam
+            GLib.idle_add(self._finish, f'Cannot start the recognizer: {err}', False)
+            # Continue anyway — camera preview will show, but face capture unavailable.
 
         embeddings = []
         last = 0.0
@@ -175,11 +193,14 @@ class EnrollWindow(Gtk.Window):
                 ok, frame = cap.read()
                 if not ok:
                     continue
-                # Mirror the preview so it behaves like a mirror.
-                rgb = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
-                self._frame = rgb
-                GLib.idle_add(self.video.queue_draw)
+                # Mirror the preview so it behaves like a mirror. Force a
+                # contiguous buffer so tobytes()/rowstride line up in the pixbuf.
+                rgb = np.ascontiguousarray(
+                    cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB))
+                GLib.idle_add(self._show_frame, rgb)
 
+                if engine is None:  # engine failed; just show video, don't embed
+                    continue
                 if time.time() - last < 0.9:  # give time to follow the prompt
                     continue
                 emb = engine.embed(frame)
@@ -187,19 +208,25 @@ class EnrollWindow(Gtk.Window):
                     continue
                 embeddings.append(emb)
                 last = time.time()
-                self._flash_until = last + 0.5
+                GLib.idle_add(self._flash_check)
                 GLib.idle_add(self._set_progress, len(embeddings))
+        except Exception as e:
+            err = str(e).split('\n')[0]
+            GLib.idle_add(self._finish, f'Camera error: {err}', False)
+            return
         finally:
             cap.release()
 
         if self._stop.is_set():
             return
+        if engine is None:
+            return  # engine load failed; already reported via _finish
         if len(embeddings) < max(3, SAMPLES // 2):
-            GLib.idle_add(self._finish, "Too few good samples — try better lighting.", False)
+            GLib.idle_add(self._finish, 'Too few good samples — try better lighting.', False)
             return
 
         enr = matcher.Enrollment(
-            user=os.environ.get("USER", "owner"),
+            user=os.environ.get('USER', 'owner'),
             label=self.label,
             dim=engine.dim,
             threshold=ARGS.threshold if ARGS.threshold is not None else engine.default_threshold,
@@ -207,7 +234,7 @@ class EnrollWindow(Gtk.Window):
             backend=engine.name,
         )
         enr.save(self.out_path)
-        GLib.idle_add(self._finish, f"Saved — “{self.label}” can now unlock.", True)
+        GLib.idle_add(self._finish, f'Saved — “{self.label}” can now unlock.', True)
 
 
 def ask_name():
@@ -245,6 +272,10 @@ def main():
     ap.add_argument("--threshold", type=float, default=None)
     ARGS = ap.parse_args()
 
+    # app-id "applocker" so KWin/Wayland matches the .desktop → correct name + icon.
+    GLib.set_prgname("applocker")
+    GLib.set_application_name("AppLocker")
+    Gtk.Window.set_default_icon_name("applocker")
     name = ARGS.name or ask_name()
     if not name:
         return 1

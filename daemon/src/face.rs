@@ -14,7 +14,7 @@
 //! once the user has run `probe_env.py` → `enroll.py`.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::auth::{Config, FaceVerifier, NoFace};
@@ -22,25 +22,20 @@ use crate::auth::{Config, FaceVerifier, NoFace};
 /// A face verifier backed by one run of `recognize.py`. Returns `true` only on a
 /// `match` line — every other outcome (nomatch/noface/nolive/error) is a miss,
 /// so the routine falls through to the PIN/sudo prompt rather than failing open.
+///
+/// `home` is the user whose enrolled faces/models we use and (when we're the
+/// root service) whose session we drop the camera process into.
 pub struct SubprocessFace {
     script: PathBuf,
-    faces_dir: PathBuf,
-    legacy: PathBuf,
+    home: PathBuf,
 }
 
 impl SubprocessFace {
-    pub fn new() -> SubprocessFace {
+    pub fn new(home: PathBuf) -> SubprocessFace {
         SubprocessFace {
             script: locate_recognize_script(),
-            faces_dir: faces_dir(),
-            legacy: legacy_enrollment_path(),
+            home,
         }
-    }
-}
-
-impl Default for SubprocessFace {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -51,15 +46,20 @@ impl FaceVerifier for SubprocessFace {
         // home — point the engine there explicitly, or it silently falls back
         // to the weak haar-pixel backend (which the sface profiles refuse).
         if std::env::var_os("APPLOCKER_MODELS").is_none() {
-            if let Some(home) = invoking_user_home() {
-                cmd.env("APPLOCKER_MODELS", home.join(".config/applocker/models"));
-            }
+            cmd.env("APPLOCKER_MODELS", self.home.join(".config/applocker/models"));
+        }
+        // App-gate face auth arbitrates the camera at APP priority — above the
+        // hidden-folder reveal (FILE) and the presence watcher (PRESENCE), below
+        // the screen-unlock tier (LOCKSCREEN, not wired yet). recognize.py reads
+        // this and steps the lower helpers aside. Don't override a caller's choice.
+        if std::env::var_os("APPLOCKER_CAMERA_PRIORITY").is_none() {
+            cmd.env("APPLOCKER_CAMERA_PRIORITY", "app");
         }
         cmd.arg(&self.script)
             .arg("--faces-dir")
-            .arg(&self.faces_dir)
+            .arg(faces_dir(&self.home))
             .arg("--enrollment") // legacy single-file profile, if present
-            .arg(&self.legacy)
+            .arg(legacy_enrollment_path(&self.home))
             // Short per-run budget: the daemon retries the whole run (3×, 1s
             // apart — see build()), so each run can give up quickly instead of
             // camping on the camera for 15s.
@@ -76,6 +76,10 @@ impl FaceVerifier for SubprocessFace {
         if std::env::var("APPLOCKER_FACE_LIVENESS").ok().as_deref() != Some("1") {
             cmd.arg("--no-liveness");
         }
+
+        // As the root service, run the camera capture in the user's session
+        // (their DISPLAY for any guided window, and the `video` group).
+        crate::session::attach(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -108,28 +112,40 @@ pub fn build() -> (Box<dyn FaceVerifier>, u32, bool) {
         Some("0") => false,
         _ => crate::policy::load_default().face_enabled,
     };
-    if enabled && has_enrollment() {
+    let home = effective_home();
+    if enabled && has_enrollment(&home) {
         // 3 subprocess runs, 1s apart (user: one miss shouldn't end it) — each
         // run is a 5s camera window, so worst case ≈ 17s before PIN/sudo.
-        (Box::new(SubprocessFace::new()), 3, true)
+        (Box::new(SubprocessFace::new(home)), 3, true)
     } else {
         if enabled {
             eprintln!(
                 "applockerd: face enabled but no enrolled faces in {} — using PIN/sudo only",
-                faces_dir().display()
+                faces_dir(&home).display()
             );
         }
         (Box::new(NoFace), 1, false)
     }
 }
 
+/// The home directory whose enrolled faces/models we use. For the root service
+/// that's the active session user's home; otherwise the invoking user's.
+fn effective_home() -> PathBuf {
+    if unsafe { libc::geteuid() } == 0 {
+        if let Some(ctx) = crate::session::SessionCtx::discover() {
+            return ctx.home;
+        }
+    }
+    invoking_user_home().unwrap_or_else(|| PathBuf::from("/root"))
+}
+
 /// True if the user has at least one enrolled face (a `*.face` in the faces dir,
 /// or the legacy single-file profile).
-fn has_enrollment() -> bool {
-    if legacy_enrollment_path().is_file() {
+fn has_enrollment(home: &Path) -> bool {
+    if legacy_enrollment_path(home).is_file() {
         return true;
     }
-    std::fs::read_dir(faces_dir())
+    std::fs::read_dir(faces_dir(home))
         .map(|mut d| {
             d.any(|e| {
                 e.ok()
@@ -149,24 +165,21 @@ pub fn config_for(attempts: u32) -> Config {
     }
 }
 
-/// The invoking user's named-profiles directory (`$APPLOCKER_FACES_DIR`, else
-/// `~/.config/applocker/faces`). The daemon runs as root, so we resolve the
-/// *invoking* user's home (via `SUDO_USER`), not root's.
-fn faces_dir() -> PathBuf {
+/// The named-profiles directory (`$APPLOCKER_FACES_DIR`, else
+/// `<home>/.config/applocker/faces`).
+fn faces_dir(home: &Path) -> PathBuf {
     if let Some(p) = std::env::var_os("APPLOCKER_FACES_DIR") {
         return PathBuf::from(p);
     }
-    let home = invoking_user_home().unwrap_or_else(|| PathBuf::from("/root"));
     home.join(".config/applocker/faces")
 }
 
 /// The legacy single-file profile (`$APPLOCKER_FACE_ENROLLMENT`, else
-/// `~/.config/applocker/owner.face`).
-fn legacy_enrollment_path() -> PathBuf {
+/// `<home>/.config/applocker/owner.face`).
+fn legacy_enrollment_path(home: &Path) -> PathBuf {
     if let Some(p) = std::env::var_os("APPLOCKER_FACE_ENROLLMENT") {
         return PathBuf::from(p);
     }
-    let home = invoking_user_home().unwrap_or_else(|| PathBuf::from("/root"));
     home.join(".config/applocker/owner.face")
 }
 

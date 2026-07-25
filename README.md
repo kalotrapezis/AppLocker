@@ -1,191 +1,132 @@
+<p align="center">
+  <img src="Assets/Gemini-Applock.png" alt="AppLocker" width="128">
+</p>
+
 # AppLocker
 
-Android-style app & folder locking for Linux Mint (Cinnamon), with face unlock
-on a plain webcam. Lock chosen apps and folders behind a face scan, a PIN, or
-your sudo password — checked *before* the app is allowed to launch.
+An Android-style "lock this app / hide this folder behind my face" toy for Linux.
+Point a plain webcam at yourself, enroll once, and then chosen apps ask for your
+face (or a PIN) before they open, an encrypted **Private** folder appears when
+it's you, and files you've tucked away come back when you walk up to them.
 
-Built for Linux Mint / Cinnamon first, with a planned port to Kubuntu / KDE.
-The portability rule below is what makes that port cheap.
+## 🙏 Built on the shoulders of these projects
 
-## Threat model (read this first)
+AppLocker is basically glue around a lot of excellent open-source work. Huge thanks to:
 
-This is **deliberately not high security**. The assumption is *casual local
-access* — a partner, kid, colleague, or guest poking at an unlocked laptop — not
-a determined attacker. Anyone with root, a live USB, or physical disk access
-wins, and that is accepted. The goal is the Android lock-screen experience, not
-disk encryption. For real at-rest protection, locked folders should later sit on
-top of `gocryptfs`/`fscrypt`; AppLocker only gates *access while the system is
-running*.
+- **[OpenCV](https://opencv.org/)** + the **[OpenCV Zoo](https://github.com/opencv/opencv_zoo)** — camera capture and the face models: **YuNet** (detection) and **SFace** (recognition).
+- **[gocryptfs](https://github.com/rfjakob/gocryptfs)** — the encrypted Private folder — and **[libfuse](https://github.com/libfuse/libfuse)** (FUSE) underneath it.
+- **[GTK 3](https://www.gtk.org/)** with **[PyGObject](https://pygobject.gnome.org/)** and **[pycairo](https://github.com/pygtk/pycairo)** — every window and dialog.
+- **[Python](https://www.python.org/)** & **[NumPy](https://numpy.org/)** — the face pipeline, watchers, and GUIs.
+- **[Rust](https://www.rust-lang.org/)** (+ the [`libc`](https://github.com/rust-lang/libc) crate) — the privileged daemon, auth broker, and PAM module.
+- **[Linux-PAM](https://github.com/linux-pam/linux-pam)** — the face / PIN auth tiers for sudo and the lock screen.
+- **[systemd](https://systemd.io/) / logind** — services, session lock/unlock, idle — and the Linux kernel's **fanotify** (app gate) and **inotify** (hidden-file reveal).
+- **[polkit](https://gitlab.freedesktop.org/polkit/polkit)** — the privilege-prompt fallback.
+- **[KDE Plasma](https://kde.org/plasma-desktop/)** — PowerDevil (silent brightness), kscreenlocker (lock screen), and the theme everything follows.
+- **[dbus-python](https://gitlab.freedesktop.org/dbus/dbus-python)** — talking to logind, polkit, and KDE.
+- **[brightnessctl](https://github.com/Hummer12007/brightnessctl)** / **[ddcutil](https://www.ddcutil.com/)** — optional brightness backends.
+- App icon generated with **Google Gemini**; built with a lot of help from **[Claude Code](https://claude.com/claude-code)** (Anthropic).
 
-A plain RGB webcam (no IR) can be fooled by a photo. We raise that bar in
-software with a liveness challenge (blink / head-turn), never claiming it is
-spoof-proof.
+Licenses and trademarks belong to their respective projects. If I've missed crediting something, please open an issue.
 
-## Architecture
+> ### 🙂 What this is — and isn't
+>
+> This is a **fun personal project and a convenience thing, not a security
+> product.** It's the phone-style lock-screen experience on a laptop: enough to
+> keep a partner, a kid, a colleague, or a nosy guest out of your stuff on an
+> unlocked machine. It is **not** protection against anyone with root, a live
+> USB, or physical disk access — that's out of scope and always will be. Treat it
+> like a curtain, not a vault. (The one genuinely-encrypted piece, the Private
+> folder, is the exception — see below.)
+>
+> ### ⚠️ Alpha — expect breakage
+>
+> Early and moving fast. Targets **Kubuntu / KDE Plasma / Wayland** on a real
+> webcam. Things change between builds; keep the last `.deb` around as a fallback.
 
-Three runtime pieces plus two windows. The split exists so the **logic** lives
-in DE-agnostic code and only the **look** is desktop-specific.
+## What works today
 
-```
-                    ┌──────────────────────────────────────┐
-                    │            applockerd (Rust)          │  ← root, systemd
-                    │                                       │
-   execve ───────►  │  exec gate    (fanotify EXEC_PERM)    │
-   file open ─────► │  file gate    (fanotify OPEN_PERM)    │
-   logind Lock ───► │  unlock-cache (wipe on lock/reboot)   │
-                    │  auth routine (face×3 → PIN → sudo)   │
-                    └───────┬───────────────────┬───────────┘
-                            │ D-Bus             │ spawns
-                            ▼                   ▼
-                  ┌──────────────────┐   ┌──────────────────┐
-                  │  GUI (Python/GTK)│   │ face pipeline    │
-                  │  - settings      │   │ (Python/OpenCV/  │
-                  │  - enrollment    │   │  MediaPipe)      │
-                  └──────────────────┘   └──────────────────┘
-```
+Everything here is **userspace** — no kernel modules, nothing that can wedge the
+machine on a file open.
 
-| Component | Language | Role |
-|-----------|----------|------|
-| `applockerd` | **Rust** | Privileged daemon: fanotify exec/file gate, unlock-cache, auth orchestration, D-Bus. Runs as root via systemd. |
-| face pipeline | **Python** | Webcam capture, enrollment (multi-angle embeddings), recognition, liveness. |
-| GUI | **Python + GTK** | Settings window + enrollment window. Thin client to the daemon. |
+- 🔐 **Encrypted "Private" folder** — a `gocryptfs` vault in your home. Locked, it's
+  an empty, unreadable directory; unlocked (after your face/PIN), your files are
+  there. This is the *only* part that's actually cryptographically private, and it
+  needs no root and can't freeze anything.
+- 🫥 **Hidden files & folders** — pick any file/folder; it drops out of the file
+  manager (via a `.hidden` list — nothing moved, nothing encrypted). Open its
+  folder and a **silent face check** brings it back; lock the screen or wander off
+  and it hides again. The convenient, weaker sibling of the Private folder.
+- 📷 **Face unlock** on a plain webcam (YuNet detector + SFace embeddings), with a
+  liveness challenge for the stronger tiers, and **PIN / sudo-password fallback**
+  that can never be fully turned off (so a bad camera can't lock you out).
+- 🚪 **App locking** — gate chosen `.deb`, Flatpak, AppImage, and system apps
+  behind the face/PIN prompt before they launch (exec-only gate; folders use the
+  vault, not a file gate, so it can't deadlock on I/O).
+- 👀 **"Lock when I leave"** — while you're active the camera stays off; once idle
+  it takes the occasional snapshot, and if you've gone it locks the session. It
+  runs all day, so it builds the face models per snapshot and frees them again
+  rather than keeping OpenCV resident.
+- 💡 **Auto screen-brightness** — rides the same camera to nudge brightness by
+  time-of-day and room light (optional, off by default).
+- 🔑 **PIN everywhere** — a root auth **broker** runs the face→PIN→sudo routine, so
+  the AppLocker PIN authorises settings changes and prompts without needing your
+  sudo password (replaces `pkexec`/polkit). Optional encrypted **sudo
+  autocomplete** on top.
+- 🎥 **One camera, shared politely** — a small priority queue
+  (lockscreen ▸ app ▸ file-reveal ▸ presence) so the helpers take turns instead of
+  fighting over the webcam.
 
-### The portability rule
+**Not done yet:** face unlock for the **screen lock** (PAM `kde`) — next up, behind
+its own Settings toggle. The system-wide app gate is real in the release build but
+still young; test deliberately.
 
-Never call Cinnamon-, KWin-, or cinnamon-screensaver-specific APIs. Use only the
-layers that are byte-for-byte identical on Cinnamon and KDE:
-
-- **systemd-logind / `loginctl`** — lock the session, and subscribe to
-  `Lock`/`Unlock`/prepare-for-shutdown signals. This is how apps re-lock when the
-  PC is locked or rebooted.
-- **PAM** — the "PIN or sudo password" fallback auth.
-- **fanotify** — kernel API, fully DE-independent.
-- **XDG `.desktop`** — enumerating installed apps for the `+` picker.
-- **D-Bus** — GUI ↔ daemon IPC.
-
-Porting to KDE = reskin the GUI in Qt. The daemon does not change.
-
-## Two detection tiers (the attention feature)
-
-| Tier | When | Question | Cost |
-|------|------|----------|------|
-| **Recognition** | at unlock / on return | "is this *me*?" (128-d embedding match) | heavy |
-| **Presence** | continuously, while unlocked | "is *a* face still there?" | light |
-
-While unlocked we only run the cheap presence tier. When presence is lost for a
-configurable grace period (with frame debounce, so looking down doesn't lock
-you), the daemon locks the session **and wipes the unlock cache**, so every
-locked app needs auth again. If the attention feature is off, the cache is wiped
-on session-lock and reboot instead.
-
-### Auth routine (one routine, used everywhere)
-
-Triggered both by launching a locked app and by returning after an
-attention-lock:
-
-```
-try face  ─┐
-try face   ├─ up to 3×, 0.5s apart  ── any match ─► ALLOW
-try face  ─┘
-   └─ all 3 fail ─► prompt PIN / sudo password ─► ALLOW / DENY
-```
-
-At least one fallback (PIN or sudo) is **always** enabled and cannot be turned
-off — otherwise a failed camera locks you out of your own machine.
-
-## Problems we expect down the line
-
-- **Interpreted scripts** — `python secret.py` execs `/usr/bin/python`, not the
-  script, so exec-gating sees the interpreter. Scripts must be gated via the
-  file-gate, not the exec-gate.
-- **fanotify mark scope** — `FAN_MARK_FILESYSTEM` covers one filesystem. A
-  separate `/home` partition, flatpaks, snaps, and AppImages live elsewhere and
-  need their own marks. Flatpak/snap apps also don't exec a simple binary path.
-- **Camera contention** — the attention watcher holds the webcam, so video calls
-  can't. Need a single camera-owner service and auto-pause when another app
-  wants the camera.
-- **Lock-out recovery** — bad light, beard, broken camera. Mandatory fallback +
-  a documented recovery path (boot, stop the service).
-- **The daemon waits on userspace** — every `execve` on the system pauses until
-  `applockerd` answers. A hang in the daemon hangs the machine. Needs a fail-open
-  watchdog and a hard timeout default.
-- **Self-gating deadlock** — the daemon and its helpers must never be blocked by
-  their own gate.
-- **Settings tamper** — the settings window must itself require auth to change
-  locks, or it's trivially bypassed.
-- **Wayland** — Cinnamon is X11 today; KDE may be Wayland. Screen-lock via
-  logind is fine, but any future overlay/grab work differs.
-
-## Status
-
-Steps 1–2 done (`daemon/` + `gui/`). The exec-gate blocks a launch before it
-opens, and launching a locked app now runs the real **auth routine**: face(stub)
-→ PIN / sudo-password prompt, allowing only on success and caching the unlock.
+## Install & try
 
 ```bash
-cd daemon
-cargo build --release
-cargo test                                    # 17 tests, no root/camera/display
+# build a package (needs cargo + dpkg-deb)
+packaging/build-deb.sh                 # dev build — app gate disabled (safe)
+sudo apt install ./dist/applocker_*.deb
 
-# set a PIN, then test the whole prompt+PIN+PAM flow with no fanotify:
-APPLOCKER_PIN_FILE=/tmp/applocker-pin ./target/release/applockerd set-pin
-APPLOCKER_PIN_FILE=/tmp/applocker-pin ./target/release/applockerd auth-test firefox
-
-# or gate a real app (root):
-sudo APPLOCKER_PIN_FILE=/tmp/applocker-pin ./target/release/applockerd gnome-calculator
+# open the settings window
+python3 /usr/lib/applocker/settings.py
 ```
 
-Face is an **opt-in convenience** — the secure, always-available default is
-PIN and/or the sudo password, chosen with a live-editable policy:
+First run walks you through models + face enrollment (or "Skip face" for PIN
+only). The Private folder, hidden files, and presence features all work without
+turning on the system-wide app gate.
 
-```bash
-applockerd set-face off        # PIN/sudo only, no camera in the loop (default)
-applockerd set-face on         # try face first, fall back to PIN/sudo
-applockerd set-fallback sudo   # e.g. sudo password only
-applockerd config              # show current policy
-```
+## How it's put together
 
-At least one fallback is always enabled, so you can't lock yourself out. Step 3
-(the face pipeline, `face/`) is in progress: the liveness challenge and the
-matcher are built and self-tested; the OpenCV engine + camera glue await an
-on-hardware run. Until face is enabled *and* enrolled, the daemon uses the
-`NoFace` stub and goes straight to the fallback. See
-[daemon/README.md](daemon/README.md) and [face/README.md](face/README.md).
+| Piece | Language | Job |
+|-------|----------|-----|
+| `applockerd` | **Rust** | Root daemon: the auth **broker** (Unix socket), the exec **gate** (fanotify), encrypted sudo store. Panic-isolated, self-healing systemd unit. |
+| face pipeline | **Python / OpenCV** | Camera capture, enrollment (multi-angle embeddings), recognition, liveness, presence, auto-brightness. |
+| vault / hide | **Python** | `gocryptfs` Private folder + the `.hidden` hide-in-place manager and its inotify face-reveal watcher. |
+| GUI | **Python / GTK 3** | Settings + enrollment windows. Native GTK so it follows the KDE theme; a thin client over the daemon. |
 
-## Roadmap
+The rule that keeps it portable: only lean on DE-neutral layers — **logind**
+(`loginctl`) for lock/unlock, **PAM** for the password fallback, **fanotify** and
+**inotify** (kernel), **XDG `.desktop`** for the app list. No Cinnamon/KWin-
+specific calls, so the same logic runs on GNOME/KDE and only the look is themed.
 
-1. ✅ Exec-gate spike — block one app.
-2. ✅ Auth routine + a real GTK auth prompt (PIN + sudo via PAM).
-   Persistent locked-apps list from installed `.desktop` files
-   (`lock-app`/`unlock-app`/`list-installed`), live-reloaded on SIGHUP — replaces
-   the substring placeholder. Unwraps `sh -c` launchers and refuses to gate a
-   bare shell/interpreter. Flatpak/Snap stored but not yet enforced.
-3. 🚧 Face pipeline on the webcam (enrollment + match + **liveness required**) —
-   `face/`. Pure-logic core (liveness state machine, matcher) is built and
-   self-tested; the OpenCV engine + camera glue need on-hardware run after
-   `sudo apt install python3-opencv python3-numpy opencv-data`. Wires into the
-   daemon via the `FaceVerifier` seam (opt-in: `APPLOCKER_FACE=1`).
-4. ✅ File-gate for locked folders (the "files & folders" half of the fence) —
-   `folderlist.rs`. `lock-folder`/`unlock-folder`/`list-folders`; gates
-   `FAN_OPEN_PERM` on opens under a locked folder via the same async auth path,
-   canonical-prefix match, refuses system roots, enabled only when folders are
-   locked. Same self-gating/perf caveats as the app-gate (documented).
-5. 🚧 Attention watcher + unlock-cache wipe + logind lock integration. Presence
-   tier (low-sensitivity "is *a* face there?") dims the screen after ~3s away and
-   locks after ~10s; returning cancels. The watcher just calls
-   `loginctl lock-session`; the daemon reacts to logind's `Lock` signal by wiping
-   the unlock cache — so manual lock, lid-close, and attention-lock all re-lock
-   apps through one DE-neutral path. Re-auth is `once per session` (until a lock)
-   or `every launch`, per `set-reauth`. The attention state machine
-   (`face/attention.py`) and the cache policy (`gate::CachePolicy`) are built and
-   self-tested; the camera watcher, screen-dim overlay, and logind subscription
-   need on-hardware wiring. **Open problem:** the watcher holds the webcam, so it
-   must auto-pause when a video call wants the camera.
-6. 🚧 Settings & enrollment windows. `gui/settings.py` (GTK3, Mint-Y-themed,
-   auth-gated on open) manages locked apps/folders and the auth policy as a thin
-   client over the `applockerd` CLI (`--porcelain` for machine-readable lists).
-   Data layer verified; interactive display + `pkexec` privilege wiring need a
-   desktop session. D-Bus transport (replacing the CLI shell-out) is later.
-7. **Face-at-login**: a `pam_applocker.so` PAM module (LightDM + screen-unlock +
-   sudo), on top of the working face pipeline. Then packaging (`systemd` unit,
-   installer) and the KDE/Qt GUI port.
+## Threat model (the honest version)
+
+Casual local access, full stop. A photo can fool a plain RGB webcam; the liveness
+challenge (blink / head-turn) raises the bar for the login-grade tiers but is
+never claimed to be spoof-proof. Anyone with root or the disk wins. The Private
+folder is real `gocryptfs` encryption *while locked*; everything else is a
+convenient curtain. If you need real at-rest security, use full-disk encryption —
+this is a toy that makes your desktop feel like your phone.
+
+## Docs
+
+- [`CHANGELOG.md`](CHANGELOG.md) — what changed per build.
+- [`plan.md`](plan.md) — the working roadmap (what's next, and why some things are
+  deliberately deferred).
+- [`TESTS.md`](TESTS.md) — manual test checklist.
+- Component notes: [`daemon/README.md`](daemon/README.md),
+  [`face/README.md`](face/README.md).
+
+## License
+
+Personal hobby project — use at your own risk, no warranty. 🙂

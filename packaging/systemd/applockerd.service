@@ -1,0 +1,19 @@
+[Unit]
+Description=AppLocker exec/file gate (fanotify)
+Documentation=file:/usr/share/doc/applocker/README.md
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/applocker/applockerd gate
+Restart=on-failure
+RestartSec=2
+
+# The gate runs as root (fanotify needs it) and drops its GTK prompt + camera
+# recognizer into the active user's graphical session automatically (see
+# daemon/src/session.rs), so it works as a boot service. Enable it with
+# `applocker on` (or `systemctl enable --now applockerd.service`). If it starts
+# before anyone logs in, enforcement simply begins once a session exists.
+
+[Install]
+WantedBy=multi-user.target

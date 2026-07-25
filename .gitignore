@@ -9,3 +9,8 @@ __pycache__/
 # Enrolled face data — never commit
 *.face
 faces/
+pam/target/
+
+# Built packages
+dist/
+packaging/.build-round

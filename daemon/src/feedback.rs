@@ -29,13 +29,16 @@ impl Feedback {
     /// Spawn the window for `app_name`. On any failure returns a dead handle —
     /// the send methods just no-op.
     pub fn spawn(app_name: &str) -> Feedback {
-        let child = Command::new("python3")
-            .arg(locate_feedback_script())
+        let mut cmd = Command::new("python3");
+        cmd.arg(locate_feedback_script())
             .arg("--app")
             .arg(app_name)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // Show the window in the user's session when we're the root service.
+        crate::session::attach(&mut cmd);
+        let child = cmd
             .spawn()
             .map_err(|e| eprintln!("applockerd: no feedback window: {e}"))
             .ok();

@@ -13,9 +13,11 @@
 //!
 //! Matching: for `native` entries we compare the **basename** of the exec'd
 //! binary to the basename of the stored key, so a lock on `steam` catches it
-//! whether it runs from `/usr/bin` or `/usr/local/bin`. Flatpak/Snap entries
-//! can't be matched from a binary path yet (every flatpak execs `flatpak`), so
-//! they're stored but skipped by the gate with a note — see `desktop.rs`.
+//! whether it runs from `/usr/bin` or `/usr/local/bin`. `flatpak` entries match
+//! by the app's install path — a flatpak's real binaries live under
+//! `…/flatpak/app/<app-id>/…`, so the app-id (the stored key) is a path
+//! component we can match on (see `LockList::matches`). `snap` isn't matched
+//! yet (stored but not enforced — the gate notes this).
 
 use std::fs;
 use std::io::Write;
@@ -106,19 +108,57 @@ impl LockList {
     /// (case-insensitive). Returns how many were removed.
     pub fn remove(&mut self, query: &str) -> usize {
         let q = query.to_lowercase();
+        let qbase = base(query).to_lowercase();
         let before = self.apps.len();
-        self.apps
-            .retain(|a| a.key != query && a.name.to_lowercase() != q);
+        // Match the same identities `lock-app` might have stored: exact key,
+        // case-folded key, display name, or the basename (so a native lock on
+        // `steam` vs `/usr/bin/steam` still removes). Lenient on purpose — a
+        // failed remove that leaves a lock in place is worse than an over-match.
+        self.apps.retain(|a| {
+            let k = a.key.to_lowercase();
+            !(a.key == query
+                || k == q
+                || a.name.to_lowercase() == q
+                || base(&a.key).to_lowercase() == qbase)
+        });
         before - self.apps.len()
     }
 
-    /// The locked app matching an exec'd binary path, if any. Only `native`
-    /// entries can match today (basename equality).
+    /// A locked **flatpak** whose app-id appears as a token in the launching
+    /// process' cmdline. Flatpaks exec their real binary inside a bwrap mount
+    /// namespace, so the host path never matches — but the `flatpak`/`bwrap`
+    /// exec's pre-exec cmdline still carries `flatpak run … <app-id> …`. Exact
+    /// token match on the app-id, so unrelated bwrap uses (triggers, the
+    /// system-helper, our own prompt) never false-hit.
+    pub fn matches_flatpak_cmdline(&self, cmdline_tokens: &[String]) -> Option<&LockedApp> {
+        self.apps.iter().find(|a| {
+            a.kind == AppKind::Flatpak && cmdline_tokens.iter().any(|t| t == &a.key)
+        })
+    }
+
+    /// The locked app matching an exec'd binary path, if any.
+    ///
+    /// - `native` — basename equality (a lock on `steam` catches it from any
+    ///   `bin` dir).
+    /// - `flatpak` — the app's real binaries live under
+    ///   `…/flatpak/app/<app-id>/…` (both the system store `/var/lib/flatpak`
+    ///   and the user store `~/.local/share/flatpak`). The app-id is a path
+    ///   component, so we match any exec beneath that app's install dir — this
+    ///   catches the launch whether it came from the menu or `flatpak run`, and
+    ///   the first exec (the app's `bin/<app-id>` wrapper) is enough to prompt.
+    /// - `appimage` — the `.AppImage` file's absolute path. Launching an
+    ///   AppImage execs the file itself (before its internal squashfs mount), so
+    ///   an exact path match on that first exec catches the launch. Precise (no
+    ///   false hits on a same-named file elsewhere), unlike native's basename.
+    /// - `snap` — not handled yet.
     pub fn matches(&self, exec_path: &str) -> Option<&LockedApp> {
         let exe_base = base(exec_path);
-        self.apps
-            .iter()
-            .find(|a| a.kind.is_gateable() && base(&a.key) == exe_base)
+        self.apps.iter().find(|a| match a.kind {
+            AppKind::Native => base(&a.key) == exe_base,
+            AppKind::Flatpak => exec_path.contains(&format!("/flatpak/app/{}/", a.key)),
+            AppKind::AppImage => a.key == exec_path,
+            AppKind::Snap => false,
+        })
     }
 }
 
@@ -148,12 +188,74 @@ mod tests {
     }
 
     #[test]
-    fn flatpak_not_matched_but_stored() {
+    fn flatpak_matched_by_app_install_path() {
         let mut l = LockList::default();
-        l.add(LockedApp { kind: AppKind::Flatpak, key: "com.valvesoftware.Steam".into(), name: "Steam".into() });
-        // Stored, but a flatpak/bwrap exec path can't be matched yet.
-        assert_eq!(l.apps.len(), 1);
+        l.add(LockedApp { kind: AppKind::Flatpak, key: "com.github.tchx84.Flatseal".into(), name: "Flatseal".into() });
+        // The launcher/sandbox helpers execing plain `flatpak` are NOT matched…
         assert!(l.matches("/usr/bin/flatpak").is_none());
+        assert!(l.matches("/usr/bin/bwrap").is_none());
+        // …but the app's real binary under the system store IS.
+        assert!(l.matches(
+            "/var/lib/flatpak/app/com.github.tchx84.Flatseal/current/active/files/bin/com.github.tchx84.Flatseal"
+        ).is_some());
+        // …and under a per-user install too.
+        assert!(l.matches(
+            "/home/teo/.local/share/flatpak/app/com.github.tchx84.Flatseal/x86_64/stable/abc/files/bin/foo"
+        ).is_some());
+        // A different app-id must not match.
+        assert!(l.matches(
+            "/var/lib/flatpak/app/org.other.App/current/active/files/bin/org.other.App"
+        ).is_none());
+    }
+
+    #[test]
+    fn flatpak_matched_by_cmdline_app_id() {
+        // Real case: the app execs inside bwrap so its path is remapped; we match
+        // the launcher's cmdline app-id token instead (see gate probe on metal).
+        let mut l = LockList::default();
+        l.add(LockedApp { kind: AppKind::Flatpak,
+                          key: "org.localsend.localsend_app".into(), name: "LocalSend".into() });
+        let toks = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        // The locked app's launch cmdline → matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=localsend \
+             --file-forwarding org.localsend.localsend_app @@u @@")).is_some());
+        // Unrelated bwrap uses (triggers, system-helper, our own prompt) → NOT matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "bwrap --unshare-ipc --ro-bind / / -- /usr/share/flatpak/triggers/mime-database.trigger")).is_none());
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "python3 /usr/lib/applocker/auth_prompt.py --app AppLocker --methods pin,sudo")).is_none());
+        // A different flatpak's launch → NOT matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "/usr/bin/flatpak run org.other.App")).is_none());
+        // A native lock with the same string is not treated as a flatpak match.
+        let mut n = LockList::default();
+        n.add(native("org.localsend.localsend_app", "x"));
+        assert!(n.matches_flatpak_cmdline(&toks("flatpak run org.localsend.localsend_app")).is_none());
+    }
+
+    #[test]
+    fn appimage_matched_by_exact_path() {
+        let mut l = LockList::default();
+        l.add(LockedApp {
+            kind: AppKind::AppImage,
+            key: "/home/teo/AppImages/viber.appimage".into(),
+            name: "Viber".into(),
+        });
+        // The exact file the AppImage launch execs is matched…
+        assert!(l.matches("/home/teo/AppImages/viber.appimage").is_some());
+        // …but a same-named file elsewhere is NOT (path-precise, unlike native).
+        assert!(l.matches("/tmp/viber.appimage").is_none());
+        // …and the internal squashfs binaries (post-mount) aren't double-gated.
+        assert!(l.matches("/tmp/.mount_viberXY/AppRun").is_none());
+    }
+
+    #[test]
+    fn snap_stored_but_not_matched() {
+        let mut l = LockList::default();
+        l.add(LockedApp { kind: AppKind::Snap, key: "spotify".into(), name: "Spotify".into() });
+        assert_eq!(l.apps.len(), 1);
+        assert!(l.matches("/snap/spotify/current/usr/bin/spotify").is_none());
     }
 
     #[test]

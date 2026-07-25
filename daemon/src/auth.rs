@@ -139,6 +139,7 @@ pub fn run(
         match prompter.prompt(available) {
             PromptResult::Cancelled => return Outcome::Denied,
             PromptResult::Entered { method, secret } => {
+                let mut secret = secret;
                 let ok = match method {
                     Method::Pin => available.pin && fallback.verify_pin(&secret),
                     Method::Password => {
@@ -149,6 +150,9 @@ pub fn run(
                             })
                     }
                 };
+                // Best-effort: don't leave the secret sitting in freed memory.
+                // (NUL bytes are valid UTF-8, so this is safe.)
+                unsafe { secret.as_bytes_mut().fill(0) };
                 if ok {
                     return Outcome::Allowed;
                 }
@@ -168,6 +172,24 @@ impl FaceVerifier for NoFace {
     fn try_match(&mut self) -> bool {
         false
     }
+}
+
+/// Whose password the sudo fallback should check. `SUDO_USER` when we were
+/// launched via sudo; otherwise, when we run as the root service, the active
+/// desktop user (checking *root's* password would be wrong — the person at the
+/// keyboard is the desktop user). Falls back to `root` only when headless.
+fn desktop_user() -> String {
+    if let Some(u) = pam::invoking_user() {
+        if u != "root" {
+            return u;
+        }
+    }
+    if let Some(ctx) = crate::session::SessionCtx::discover() {
+        if ctx.uid != 0 {
+            return ctx.user;
+        }
+    }
+    "root".to_string()
 }
 
 /// The PIN record location: `$APPLOCKER_PIN_FILE` if set, else the system path.
@@ -199,7 +221,7 @@ impl SystemFallback {
         SystemFallback {
             pin_path: default_pin_path(),
             pam_service: "sudo".to_string(),
-            user: pam::invoking_user().unwrap_or_else(|| "root".to_string()),
+            user: desktop_user(),
             allow_pin: policy.allow_pin,
             allow_sudo: policy.allow_sudo,
         }

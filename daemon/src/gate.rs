@@ -97,14 +97,19 @@ pub struct GuiPrompter {
     app_name: String,
     script: PathBuf,
     attempt: u32,
+    /// Whether a real face attempt ran before we fell back to this prompt. Only
+    /// then should the dialog say "Face not recognised"; with face off / not
+    /// enrolled it would be a lie (see gui/auth_prompt.py).
+    face_was_live: bool,
 }
 
 impl GuiPrompter {
-    pub fn new(app_name: &str) -> GuiPrompter {
+    pub fn new(app_name: &str, face_was_live: bool) -> GuiPrompter {
         GuiPrompter {
             app_name: app_name.to_string(),
             script: locate_prompt_script(),
             attempt: 0,
+            face_was_live,
         }
     }
 }
@@ -128,10 +133,16 @@ impl Prompter for GuiPrompter {
         if self.attempt > 0 {
             cmd.arg("--error").arg("Incorrect — try again.");
         }
+        if self.face_was_live {
+            cmd.arg("--face-failed");
+        }
         self.attempt += 1;
 
         // Secret comes back on stdout; keep stderr for our own logging.
         cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+
+        // When we're the root service, show the prompt in the user's session.
+        crate::session::attach(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,

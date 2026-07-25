@@ -62,6 +62,10 @@ class FrameObservation:
 class Config:
     per_step_timeout: float = 8.0  # seconds allowed to complete each step
     yaw_threshold: float = 0.30  # |yaw| past this counts as a deliberate turn
+    # A turn step only *arms* after the head has been seen near centre — so
+    # finishing one turn can't instantly complete the next, and each step is a
+    # deliberate centre → turn motion (user feedback: "too fast, confusing").
+    neutral_threshold: float = 0.15
     # Seconds the face may vanish before we fail. Generous, because Haar loses
     # the face mid-turn on a plain webcam — a real removal still exceeds this.
     max_face_gap: float = 2.5
@@ -72,6 +76,17 @@ def random_challenge(rng: Optional[random.Random] = None) -> List[Action]:
     rng = rng or random.Random()
     turn = rng.choice([Action.TURN_LEFT, Action.TURN_RIGHT])
     steps = [Action.BLINK, turn]
+    rng.shuffle(steps)
+    return steps
+
+
+def turn_challenge(rng: Optional[random.Random] = None) -> List[Action]:
+    """Both head turns, in random order — no blink. The login-tier challenge:
+    blink detection is unreliable on plain webcams (confirmed on real hardware),
+    while yaw from YuNet landmarks is robust. A photo can't turn either way; the
+    random order resists a pre-recorded clip."""
+    rng = rng or random.Random()
+    steps = [Action.TURN_LEFT, Action.TURN_RIGHT]
     rng.shuffle(steps)
     return steps
 
@@ -96,6 +111,13 @@ class LivenessVerifier:
         # blink sub-state: we require open -> closed -> open.
         self._blink_open_seen = False
         self._blink_closed_seen = False
+        # turn sub-state: head seen near centre since this step began.
+        self._turn_armed = False
+
+    @property
+    def completed(self) -> int:
+        """How many challenge steps have been completed so far."""
+        return len(self.steps) if self.status is Status.PASSED else self._i
 
     @property
     def current(self) -> Optional[Action]:
@@ -126,12 +148,15 @@ class LivenessVerifier:
         step = self.steps[self._i]
         if step is Action.BLINK:
             self._eval_blink(obs)
-        elif step is Action.TURN_LEFT:
-            if obs.yaw is not None and obs.yaw <= -self.cfg.yaw_threshold:
-                self._advance()
-        elif step is Action.TURN_RIGHT:
-            if obs.yaw is not None and obs.yaw >= self.cfg.yaw_threshold:
-                self._advance()
+        elif step in (Action.TURN_LEFT, Action.TURN_RIGHT):
+            if obs.yaw is not None:
+                if abs(obs.yaw) <= self.cfg.neutral_threshold:
+                    self._turn_armed = True  # centred: the turn may now count
+                hit = (obs.yaw <= -self.cfg.yaw_threshold
+                       if step is Action.TURN_LEFT
+                       else obs.yaw >= self.cfg.yaw_threshold)
+                if self._turn_armed and hit:
+                    self._advance()
 
         return self.status
 
@@ -153,6 +178,7 @@ class LivenessVerifier:
         self._step_started_at = None  # re-anchored on the next update
         self._blink_open_seen = False
         self._blink_closed_seen = False
+        self._turn_armed = False
         if self._i >= len(self.steps):
             self.status = Status.PASSED
 
@@ -190,10 +216,21 @@ def _selftest() -> int:
         [face(eyes_open=True)] * 3
         + [face(eyes_open=False)] * 2
         + [face(eyes_open=True)] * 2
+        + [face(yaw=0.0)]  # turn steps arm at centre first (deliberate motion)
         + [face(yaw=-0.5)] * 2
     )
     v = run([Action.BLINK, Action.TURN_LEFT], frames)
     check("blink+left passes", v.status is Status.PASSED)
+
+    # 1b. A turn that never passes through centre must NOT count (e.g. still
+    #     turned from the previous step, or a video seeking straight to a turn).
+    v = run([Action.TURN_LEFT], [face(yaw=-0.5)] * 5)
+    check("unarmed turn does not count", v.status is Status.PENDING)
+
+    # 1c. turn_challenge is both turns, order varies with the seed.
+    orders = {tuple(turn_challenge(random.Random(s))) for s in range(20)}
+    check("turn_challenge covers both orders",
+          len(orders) == 2 and all(len(o) == 2 for o in orders))
 
     # 2. A static photo (eyes always open, no turn) never passes. 60 frames at
     #    0.1s = 5.9s, past the 5s per-step timeout on the blink step.

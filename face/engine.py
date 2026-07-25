@@ -53,11 +53,19 @@ import os
 
 #: SFace ONNX model (OpenCV Zoo) for the strong embedding backend.
 SFACE_MODEL = "face_recognition_sface_2021dec.onnx"
-#: YuNet face detector, the **2022mar** version — the 2023mar one needs
-#: OpenCV ≥ 4.7, but 2022mar loads and runs on Ubuntu's 4.6. YuNet handles
-#: tilted / partially occluded faces that Haar misses completely (e.g. head
-#: resting on a hand), and its landmarks enable SFace's proper alignCrop.
-YUNET_MODEL = "face_detection_yunet_2022mar.onnx"
+#: YuNet face detector. Prefer the **2023mar** version (needs OpenCV ≥ 4.7 —
+#: fine on Kubuntu 26.04's 4.10, where the old 2022mar model fails to load);
+#: fall back to **2022mar**, the only version that runs on Mint's old 4.6.
+#: Whichever model file is present *and* actually runs is used at build time
+#: (see SFaceEngine._try_yunet). YuNet handles tilted / partially occluded faces
+#: that Haar misses completely (e.g. head resting on a hand), and its landmarks
+#: enable SFace's proper alignCrop.
+YUNET_MODELS = (
+    "face_detection_yunet_2023mar.onnx",
+    "face_detection_yunet_2022mar.onnx",
+)
+#: The primary model — the one fetch_models.py downloads and probe_env reports.
+YUNET_MODEL = YUNET_MODELS[0]
 
 
 def model_dir() -> str:
@@ -229,10 +237,10 @@ class HaarPixelEngine(FaceEngine):
 class SFaceEngine(FaceEngine):
     """Strong recognition backend — the recommended unlock model.
 
-    - Detection: **YuNet 2022mar** when its model file is present (loads on
-      OpenCV 4.6, robust to tilt/occlusion, provides landmarks for alignment),
-      else **Haar** (via an internal `HaarPixelEngine`), which works with zero
-      downloads but only on upright frontal faces.
+    - Detection: **YuNet** (2023mar on modern OpenCV, 2022mar on 4.6) when a
+      usable model file is present — robust to tilt/occlusion, provides
+      landmarks for alignment — else **Haar** (via an internal `HaarPixelEngine`),
+      which works with zero downloads but only on upright frontal faces.
     - Embedding: **SFace** (`cv2.FaceRecognizerSF`) — a 128-d face descriptor.
       With YuNet the crop is properly 5-point aligned (`alignCrop`); with Haar
       it's a plain resized crop. SFace's canonical cosine threshold is ~0.363.
@@ -257,22 +265,29 @@ class SFaceEngine(FaceEngine):
         self._yunet = self._try_yunet()
 
     def _try_yunet(self):
-        """Load YuNet if its model exists AND actually runs on this OpenCV
-        (verified with a dummy detect — 4.6 rejects newer models at run time)."""
+        """Load the best YuNet whose model file exists AND actually runs on this
+        OpenCV. Version mismatches are only caught at run time (4.6 rejects the
+        newer 2023mar model, 4.10 rejects the old 2022mar one), so each candidate
+        is verified with a dummy detect. Tries them in preference order and
+        returns the first that works, else None (Haar takes over)."""
         import numpy as np
+        import sys
 
-        path = os.path.join(model_dir(), YUNET_MODEL)
-        if not (hasattr(self.cv2, "FaceDetectorYN") and os.path.exists(path)):
+        if not hasattr(self.cv2, "FaceDetectorYN"):
             return None
-        try:
-            det = self.cv2.FaceDetectorYN.create(path, "", (320, 240), 0.7)
-            det.setInputSize((320, 240))
-            det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
-            return det
-        except self.cv2.error as e:
-            import sys
-            sys.stderr.write(f"YuNet unavailable ({e}); detecting with Haar.\n")
-            return None
+        for name in YUNET_MODELS:
+            path = os.path.join(model_dir(), name)
+            if not os.path.exists(path):
+                continue
+            try:
+                det = self.cv2.FaceDetectorYN.create(path, "", (320, 240), 0.7)
+                det.setInputSize((320, 240))
+                det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
+                return det
+            except self.cv2.error as e:
+                sys.stderr.write(f"YuNet model {name} unavailable ({e}); trying next.\n")
+        sys.stderr.write("No usable YuNet model; detecting with Haar.\n")
+        return None
 
     def _yunet_face(self, frame):
         """Best YuNet detection row (box + landmarks) for the frame, or None."""
@@ -285,13 +300,34 @@ class SFaceEngine(FaceEngine):
             return None
         return max(faces, key=lambda f: float(f[-1]))
 
+    @staticmethod
+    def _landmark_yaw(face) -> Optional[float]:
+        """Continuous yaw from YuNet's landmarks: how far the nose sits from the
+        eye midpoint, normalised by the inter-eye distance. 0 ≈ frontal; sign
+        calibrated on real hardware (2026-07-02 debug trace): turning to *your*
+        left reads negative, matching liveness.py's TURN_LEFT. A deliberate
+        turn reads ~±0.4-1.1; the liveness threshold is 0.30."""
+        re_x, re_y = float(face[4]), float(face[5])   # right eye
+        le_x, le_y = float(face[6]), float(face[7])   # left eye
+        nose_x = float(face[8])
+        eye_dist = ((le_x - re_x) ** 2 + (le_y - re_y) ** 2) ** 0.5
+        if eye_dist < 1.0:
+            return None
+        mid_x = (re_x + le_x) / 2.0
+        return (nose_x - mid_x) / eye_dist
+
     def measure(self, frame) -> FrameObservation:
-        obs = self._haar.measure(frame)
-        # Haar misses tilted/occluded faces; if YuNet sees one, trust it for
-        # presence (eyes/yaw stay unknown — Haar couldn't read them).
-        if not obs.face_found and self._yunet_face(frame) is not None:
-            return FrameObservation(face_found=True, eyes_open=None, yaw=None)
-        return obs
+        # YuNet first: robust detection AND a real yaw signal from landmarks
+        # (Haar's profile-cascade yaw was too noisy for the turn challenge).
+        face = self._yunet_face(frame)
+        if face is not None:
+            obs = self._haar.measure(frame)  # eyes signal, if Haar also sees it
+            return FrameObservation(
+                face_found=True,
+                eyes_open=obs.eyes_open if obs.face_found else None,
+                yaw=self._landmark_yaw(face),
+            )
+        return self._haar.measure(frame)
 
     def embed(self, frame) -> Optional[List[float]]:
         face = self._yunet_face(frame)
