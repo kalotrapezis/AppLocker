@@ -63,7 +63,9 @@ machine on a file open.
   behind the face/PIN prompt before they launch (exec-only gate; folders use the
   vault, not a file gate, so it can't deadlock on I/O).
 - 👀 **"Lock when I leave"** — while you're active the camera stays off; once idle
-  it takes the occasional snapshot, and if you've gone it locks the session.
+  it takes the occasional snapshot, and if you've gone it locks the session. It
+  runs all day, so it builds the face models per snapshot and frees them again
+  rather than keeping OpenCV resident.
 - 💡 **Auto screen-brightness** — rides the same camera to nudge brightness by
   time-of-day and room light (optional, off by default).
 - 🔑 **PIN everywhere** — a root auth **broker** runs the face→PIN→sudo routine, so

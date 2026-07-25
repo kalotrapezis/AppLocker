@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import gc
 import json
 import os
 import subprocess
@@ -440,7 +441,7 @@ class IdleMonitor:
 DARK_FLOOR = 8.0
 
 
-def snapshot_face_found(engine, cam_index, warmup=3, samples=4):
+def snapshot_face_found(cam_index, warmup=3, samples=4):
     """Open the camera, grab a few frames (discarding the first `warmup` while
     the sensor auto-exposes), report whether ANY face was seen, then release.
     Returns ``(presence, luma)``: presence is True/False, or None when we're
@@ -449,10 +450,13 @@ def snapshot_face_found(engine, cam_index, warmup=3, samples=4):
     brightness (0-255) of the last usable frame, or None (used for auto-brightness)."""
     import cv2
 
+    engine = None
+
     cap = cv2.VideoCapture(cam_index)
     if not cap.isOpened():
         cap.release()
         return None, None
+    frame = None
     try:
         usable = False  # saw at least one readable, bright-enough frame
         last_luma = None
@@ -467,11 +471,32 @@ def snapshot_face_found(engine, cam_index, warmup=3, samples=4):
                 continue  # too dark to trust the detector
             usable = True
             last_luma = m
-            if engine.measure(frame).face_found:
+            # Keep OpenCV's face models out of the permanent watcher process.
+            # Loading them lazily also avoids doing any model work when every
+            # captured frame is too dark to judge.
+            if engine is None:
+                try:
+                    from engine import build_engine
+                    engine = build_engine()
+                except Exception as e:
+                    print(f"presence: face engine unavailable ({e})", file=sys.stderr)
+                    return None, last_luma
+            try:
+                face_found = engine.measure(frame).face_found
+            except Exception as e:
+                print(f"presence: face engine failed ({e})", file=sys.stderr)
+                return None, last_luma
+            if face_found:
                 return True, m
         return (False if usable else None), last_luma
     finally:
         cap.release()
+        # The engine owns OpenCV classifiers/models and their native buffers.
+        # Drop it after each snapshot rather than retaining it for the watcher's
+        # entire lifetime.
+        del engine
+        del frame
+        gc.collect()
 
 
 class DimOverlay(Gtk.Window):
@@ -541,9 +566,6 @@ def main() -> int:
               "or run with --force)", file=sys.stderr)
         return 2
 
-    from engine import build_engine
-
-    engine = build_engine()
     # --interval (seconds) overrides the config's attention_interval (minutes).
     interval = args.interval if args.interval is not None else conf["interval_min"] * 60
     cfg = Config(idle_after=args.idle_after, interval=interval,
@@ -638,7 +660,7 @@ def main() -> int:
             # present (never locks on it), and we retry next interval.
             with camera_lock(PRESENCE) as got:
                 if got:
-                    found, luma = snapshot_face_found(engine, args.camera)
+                    found, luma = snapshot_face_found(args.camera)
                 else:
                     found, luma = None, None
             now = time.monotonic()
