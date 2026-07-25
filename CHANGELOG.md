@@ -3,6 +3,21 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.2-1 — the presence watcher stops eating all your RAM
+
+### Fixed
+- **The presence watcher no longer holds the face engine resident.** It built the
+  engine once at startup and kept it for the process's entire life — and that
+  process is a per-user autostart that runs all day. The engine owns OpenCV's
+  YuNet/SFace models and their native buffers, so the watcher sat on that memory
+  around the clock while doing camera work for a couple of seconds every
+  interval. On a machine with little headroom it starved everything else.
+  The engine is now built lazily inside each snapshot and dropped when the
+  snapshot ends. Same detection, and building it costs a few hundred
+  milliseconds against a default 10-minute cadence.
+- Related: a snapshot where the face engine can't be built or throws now logs and
+  reports "blind" (which never locks) instead of taking the watcher down.
+
 ## 0.0.2 — settings redesign + presence that actually works on Wayland
 
 A big pass over the Settings window and the two features that were unreliable:
