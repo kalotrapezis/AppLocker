@@ -3,6 +3,57 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.3 — the fail-open hole, bystanders, fingerprint unlock, and a clean uninstall
+
+### Security
+- **A locked app opened anyway if auth took longer than 30 seconds.** The gate's
+  fail-open watchdog (`$APPLOCKER_GATE_TIMEOUT`, default 30s) exists so a hung
+  recognizer can never freeze a launch — but its clock covered the *whole* auth
+  routine. Three `recognize.py` runs (fresh python + OpenCV + ONNX load + 5s
+  camera budget each, 1s apart) burn 18–25s before the PIN dialog even appears,
+  so a wrong PIN or a few seconds of typing fell off the end and the gate
+  ALLOWed. Reported as "Viber opens even when authentication fails".
+  The watchdog now stops at the moment a dialog goes on screen (a human is
+  answering, so the hung-process deadline no longer applies) and switches to a
+  5-minute grace, which still can't block a launch forever. If the auth thread
+  dies without answering, that is a DENY, not an allow.
+- **The unlock cache survived a Plasma screen lock.** The listener only matched
+  logind's `Session.Lock` and `PrepareForSleep`; KDE's locker sets `LockedHint`
+  instead, which arrives as a PropertiesChanged signal. Unlocks therefore lasted
+  until the daemon restarted — lock your screen, walk away, and your unlocked
+  apps were still open to anyone. The listener now also matches `LockedHint`.
+
+### Fixed
+- **Your PC would not unlock with someone standing next to you.** The YuNet
+  detector picked the *highest-confidence* box in the frame, not the nearest
+  one, so a bystander's cleaner face won and the owner was never embedded →
+  `nomatch`. It now takes the largest box (= closest person) above a 0.7 score
+  floor. Matching every visible face would also have "fixed" it, by letting
+  anyone beside you unlock your machine.
+- **Uninstalling actually lets go now.** `prerm` used to disable two services
+  and `postrm` merely printed a warning, so removal left behind: the
+  `pam_applocker.so` line in `/etc/pam.d/kde` (hence an AppLocker unlock button
+  still on the lock screen, pointing at a module dpkg had just deleted), the
+  `.hidden` markers (your folders stayed invisible with no tool left to reveal
+  them), mounted gocryptfs vaults, and the per-user helpers still running until
+  logout. `prerm` now runs `applocker-pam disable all`, kills
+  `/usr/lib/applocker/*` helpers, runs `hidelist.py reveal-all` as each owner,
+  and unmounts their vaults. Per-user data in `~/.config/applocker` is still
+  *not* deleted — it holds face embeddings and encrypted vaults — but `postrm`
+  now says exactly what is there and what deleting it costs.
+
+### Added
+- **Fingerprint unlock.** When `libpam-fprintd` is installed and
+  `fprintd-list $USER` shows an enrolled finger, the unlock prompt offers a
+  **Fingerprint** button beside PIN/Password; the daemon verifies it through a
+  dedicated `/etc/pam.d/applocker-fprintd` stack (`pam_fprintd` alone, 20s
+  timeout) so a touch can never be answered by a password and a broken fprintd
+  can't weaken `sudo`. It also unlocks the stored sudo password in the broker,
+  like face and PIN do. Faster than face, and it works with people around.
+  Known gap: the dialog closes before the reader starts waiting, so there is no
+  on-screen "touch now" hint yet, and there is no Settings toggle — it appears
+  whenever a finger is enrolled.
+
 ## 0.0.2-1 — the presence watcher stops eating all your RAM
 
 ### Fixed

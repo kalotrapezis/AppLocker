@@ -29,6 +29,9 @@ use crate::pin;
 pub enum Method {
     Pin,
     Password,
+    /// Fingerprint reader, verified by PAM (`pam_fprintd`). Carries no secret:
+    /// the prompt just says "use the reader" and the daemon runs the PAM stack.
+    Fingerprint,
 }
 
 /// What the prompter hands back.
@@ -66,6 +69,14 @@ pub trait Fallback {
     fn verify_pin(&self, secret: &str) -> bool;
     /// `Err` means PAM is unavailable — treated as reject, never as accept.
     fn verify_password(&self, secret: &str) -> Result<bool, String>;
+    /// Is a fingerprint reader usable *and* a finger enrolled for this user?
+    fn fingerprint_available(&self) -> bool {
+        false
+    }
+    /// Blocks while the reader waits for a touch. `Err` = unusable, never accept.
+    fn verify_fingerprint(&self) -> Result<bool, String> {
+        Err("fingerprint not supported".to_string())
+    }
 }
 
 /// Which fallbacks to present in the prompt this time.
@@ -73,6 +84,7 @@ pub trait Fallback {
 pub struct Available {
     pub pin: bool,
     pub sudo: bool,
+    pub fingerprint: bool,
 }
 
 /// Tunables for the routine.
@@ -126,8 +138,9 @@ pub fn run(
     let available = Available {
         pin: fallback.pin_available(),
         sudo: fallback.sudo_available(),
+        fingerprint: fallback.fingerprint_available(),
     };
-    if !available.pin && !available.sudo {
+    if !available.pin && !available.sudo && !available.fingerprint {
         eprintln!(
             "applockerd: no fallback available (no PIN set and PAM unusable) — denying. \
              This is a misconfiguration; see recovery in README."
@@ -146,6 +159,13 @@ pub fn run(
                         available.sudo
                             && fallback.verify_password(&secret).unwrap_or_else(|e| {
                                 eprintln!("applockerd: PAM error, treating as reject: {e}");
+                                false
+                            })
+                    }
+                    Method::Fingerprint => {
+                        available.fingerprint
+                            && fallback.verify_fingerprint().unwrap_or_else(|e| {
+                                eprintln!("applockerd: fprintd error, treating as reject: {e}");
                                 false
                             })
                     }
@@ -212,6 +232,31 @@ pub struct SystemFallback {
     pub allow_sudo: bool,
 }
 
+/// PAM service that runs `pam_fprintd` alone (shipped as /etc/pam.d/ by the
+/// package). Separate from `sudo` so a fingerprint touch can never be answered
+/// by a password, and a missing fprintd can't weaken the sudo stack.
+pub const FPRINTD_SERVICE: &str = "applocker-fprintd";
+
+/// Has `user` enrolled at least one finger with fprintd? `fprintd-list` prints
+/// one `- #0: <finger>` line per enrolled finger and exits non-zero when there
+/// is no reader — exactly the "don't offer it" condition.
+///
+/// Wrapped in `timeout` because an unprivileged `fprintd-list` waits on a
+/// polkit prompt that nobody will answer (~25s). We always run as root here, so
+/// that shouldn't happen, but a stalled probe would delay the unlock prompt.
+fn fingerprint_enrolled(user: &str) -> bool {
+    if !std::path::Path::new("/etc/pam.d/applocker-fprintd").is_file() {
+        return false;
+    }
+    match std::process::Command::new("timeout")
+        .args(["3", "fprintd-list", user])
+        .output()
+    {
+        Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).contains("- #"),
+        Err(_) => false,
+    }
+}
+
 impl SystemFallback {
     /// Default locations for the deployed daemon, gated by the saved policy.
     /// `$APPLOCKER_PIN_FILE` overrides the PIN path (used by tests and by
@@ -246,6 +291,18 @@ impl Fallback for SystemFallback {
 
     fn verify_password(&self, secret: &str) -> Result<bool, String> {
         pam::verify_password(&self.pam_service, &self.user, secret)
+    }
+
+    fn fingerprint_available(&self) -> bool {
+        fingerprint_enrolled(&self.user)
+    }
+
+    /// pam_fprintd asks nothing of the conversation (it only sends info
+    /// messages, which `pam.rs` answers with NULL), so the same PAM path works
+    /// with an empty secret. Blocks until the user touches the reader or the
+    /// module times out.
+    fn verify_fingerprint(&self) -> Result<bool, String> {
+        pam::verify_password(FPRINTD_SERVICE, &self.user, "")
     }
 }
 
@@ -359,7 +416,7 @@ mod tests {
             good_pw: "pw",
         };
         assert_eq!(run(&fast_cfg(), &mut face, &mut prompt, &fb), Outcome::Allowed);
-        assert_eq!(prompt.seen_available[0], Available { pin: true, sudo: true });
+        assert_eq!(prompt.seen_available[0], Available { pin: true, sudo: true, fingerprint: false });
     }
 
     #[test]
@@ -430,6 +487,6 @@ mod tests {
         };
         let fb = FakeFallback { pin: false, sudo: true, good_pin: "1234", good_pw: "pw" };
         assert_eq!(run(&fast_cfg(), &mut face, &mut prompt, &fb), Outcome::Denied);
-        assert_eq!(prompt.seen_available[0], Available { pin: false, sudo: true });
+        assert_eq!(prompt.seen_available[0], Available { pin: false, sudo: true, fingerprint: false });
     }
 }

@@ -123,6 +123,9 @@ impl Prompter for GuiPrompter {
         if available.sudo {
             methods.push("sudo");
         }
+        if available.fingerprint {
+            methods.push("fp");
+        }
 
         let mut cmd = Command::new("python3");
         cmd.arg(&self.script)
@@ -163,11 +166,18 @@ impl Prompter for GuiPrompter {
 }
 
 /// Parse the prompt's stdout contract (see gui/auth_prompt.py):
-/// `cancel`, `pin\t<secret>`, or `sudo\t<secret>`.
+/// `cancel`, `fp`, `pin\t<secret>`, or `sudo\t<secret>`.
 fn parse_reply(out: &str) -> PromptResult {
     let line = out.lines().next().unwrap_or("").trim_end_matches('\n');
     if line == "cancel" || line.is_empty() {
         return PromptResult::Cancelled;
+    }
+    // Fingerprint carries no secret — the reader is the secret.
+    if line == "fp" {
+        return PromptResult::Entered {
+            method: Method::Fingerprint,
+            secret: String::new(),
+        };
     }
     if let Some((tag, secret)) = line.split_once('\t') {
         let method = match tag {

@@ -12,14 +12,15 @@ Invoked by the daemon, e.g.::
 
     auth_prompt.py --app "gnome-calculator" --methods pin,sudo [--error "..."]
 
-``--methods`` is a comma list of the fallbacks to offer (``pin`` and/or
-``sudo``); at least one is always present. ``--error`` shows a red hint from the
-previous failed attempt.
+``--methods`` is a comma list of the fallbacks to offer (``pin``, ``sudo``
+and/or ``fp``); at least one of pin/sudo is always present. ``--error`` shows a
+red hint from the previous failed attempt.
 
 On stdout it writes exactly one line and exits 0::
 
     pin\t<secret>       # user chose PIN
     sudo\t<secret>      # user chose sudo password
+    fp                  # user chose the fingerprint reader (no secret)
     cancel              # user cancelled / closed the window
 
 Any other exit (nonzero, no line) is treated by the daemon as a cancel.
@@ -43,7 +44,10 @@ from gi.repository import Gdk, Gtk  # noqa: E402
 class AuthPrompt(Gtk.Window):
     def __init__(self, app_name, methods, error, face_failed=False):
         super().__init__(title="AppLocker")
-        self.result = None  # ("pin"|"sudo", secret) or None
+        self.result = None  # ("pin"|"sudo"|"fp", secret) or None
+        # The reader is its own button, not a radio option — it has no entry.
+        self.has_fp = "fp" in methods
+        methods = [m for m in methods if m != "fp"]
 
         self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
         self.set_keep_above(True)
@@ -74,6 +78,8 @@ class AuthPrompt(Gtk.Window):
             what = "your password"
         subtitle_text = (f"Face not recognised — enter {what}."
                          if face_failed else f"Enter {what} to continue.")
+        if self.has_fp:
+            subtitle_text += " Or touch the fingerprint reader."
         subtitle = Gtk.Label(label=subtitle_text)
         subtitle.set_xalign(0.0)
         subtitle.get_style_context().add_class("dim-label")
@@ -113,6 +119,10 @@ class AuthPrompt(Gtk.Window):
         buttons.set_halign(Gtk.Align.END)
         cancel = Gtk.Button(label="Cancel")
         cancel.connect("clicked", self._on_cancel)
+        if self.has_fp:
+            fp = Gtk.Button(label="Fingerprint")
+            fp.connect("clicked", self._on_fingerprint)
+            buttons.pack_start(fp, False, False, 0)
         unlock = Gtk.Button(label="Unlock")
         unlock.get_style_context().add_class("suggested-action")
         unlock.connect("clicked", self._on_unlock)
@@ -144,6 +154,13 @@ class AuthPrompt(Gtk.Window):
         self.result = (self.method, secret)
         self.close()
 
+    def _on_fingerprint(self, _button):
+        # No secret travels: the daemon runs the pam_fprintd stack and the
+        # reader itself is the prompt. The window closes first, so the touch
+        # happens with the dialog gone (see shortcut note in main()).
+        self.result = ("fp", "")
+        self.close()
+
     def _on_cancel(self, _button):
         self.result = None
         self.close()
@@ -167,16 +184,16 @@ def main():
     parser.add_argument(
         "--methods",
         default="pin",
-        help="comma list of offered fallbacks: pin,sudo",
+        help="comma list of offered fallbacks: pin,sudo,fp",
     )
     parser.add_argument("--error", default="", help="error hint from the last attempt")
     parser.add_argument("--face-failed", action="store_true",
                         help="a live face attempt just failed (tunes the wording)")
     args = parser.parse_args()
 
-    methods = [m for m in args.methods.split(",") if m in ("pin", "sudo")]
-    if not methods:
-        methods = ["sudo"]
+    methods = [m for m in args.methods.split(",") if m in ("pin", "sudo", "fp")]
+    if not any(m in ("pin", "sudo") for m in methods):
+        methods.append("sudo")
 
     win = AuthPrompt(args.app, methods, args.error, face_failed=args.face_failed)
     win.show_all()
@@ -189,6 +206,13 @@ def main():
         return 1
 
     method, secret = win.result
+    if method == "fp":
+        # shortcut: no on-screen "touch the reader now" hint — the dialog is
+        # already gone when PAM starts waiting. Upgrade when the prompt can
+        # talk to the daemon over the socket instead of one line of stdout.
+        sys.stdout.write("fp\n")
+        sys.stdout.flush()
+        return 0
     # One line, tab-separated. secret may contain anything except a newline;
     # GTK entries can't contain a newline, so this framing is safe.
     sys.stdout.write(f"{method}\t{secret}\n")

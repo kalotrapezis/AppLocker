@@ -10,7 +10,7 @@ set -euo pipefail
 # Version is a fixed base + a testing-round letter that bumps every build:
 # 0.0.1-a, 0.0.1-b, ...  Pass an explicit letter to rebuild a round:
 #   packaging/build-deb.sh c
-VERSION_BASE="0.0.2"
+VERSION_BASE="0.0.3"
 ROUND_FILE="$(dirname "$0")/.build-round"
 # APPLOCKER_VERSION overrides the whole version string (for a real release, e.g.
 # APPLOCKER_VERSION=0.0.1 APPLOCKER_RELEASE=1 packaging/build-deb.sh). Otherwise
@@ -64,6 +64,10 @@ done
 install -m 0644 "$REPO/pam/target/release/libpam_applocker.so" \
 	"$STAGE/lib/$TRIPLET/security/pam_applocker.so"
 
+# Fingerprint tier's PAM service (inert without libpam-fprintd installed).
+install -d -m 0755 "$STAGE/etc/pam.d"
+install -m 0644 "$REPO/packaging/pam.d/applocker-fprintd" "$STAGE/etc/pam.d/applocker-fprintd"
+
 # CLI entry point on PATH (so `pkexec applockerd …` and the GUI work).
 ln -s ../lib/applocker/applockerd "$STAGE/usr/bin/applockerd"
 install -m 0755 "$REPO/packaging/bin/applocker-pam" "$STAGE/usr/bin/applocker-pam"
@@ -115,7 +119,7 @@ Section: admin
 Priority: optional
 Architecture: $ARCH
 Depends: python3, python3-opencv, python3-numpy, python3-gi, python3-gi-cairo, python3-cairo, python3-dbus, gir1.2-gtk-3.0, libpam0g, libxss1, pkexec, systemd, gocryptfs, fuse3
-Recommends: v4l-utils
+Recommends: v4l-utils, libpam-fprintd, fprintd
 Installed-Size: $INSTALLED_KB
 Maintainer: AppLocker <kalotrapezis@gmail.com>
 Description: Android-style app & folder locking for Linux, with face unlock
@@ -213,7 +217,10 @@ exit 0
 EOF
 fi
 
-# prerm — turn off the service if the admin enabled it.
+# prerm — LET GO completely. Removing the package used to leave the PAM lines
+# (so the lock screen kept an AppLocker unlock button pointing at a deleted
+# module), the hidden-folder markers (folders invisible forever, with no tool
+# left to reveal them), mounted vaults, and our per-user helpers still running.
 cat > "$STAGE/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
@@ -222,6 +229,31 @@ if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
 		systemctl disable --now applockerd.service >/dev/null 2>&1 || true
 		systemctl disable --now applockerd-broker.service >/dev/null 2>&1 || true
 	fi
+	# 1. PAM: drop our lines while the module still exists. Without this the
+	#    KDE lock screen keeps offering a face/PIN unlock that cannot work.
+	[ -x /usr/bin/applocker-pam ] && /usr/bin/applocker-pam disable all >/dev/null 2>&1 || true
+	# 2. Per-user helpers (watcher, hide-watch, polkit agent, settings) are
+	#    autostarted and would otherwise run until logout.
+	pkill -f /usr/lib/applocker/ >/dev/null 2>&1 || true
+	sleep 1
+	pkill -9 -f /usr/lib/applocker/ >/dev/null 2>&1 || true
+	# 3. Per-user state that would strand the user: revealed folders and
+	#    unmounted vaults. Runs as the owner, best-effort, never fatal.
+	getent passwd | while IFS=: read -r user _ uid _ _ home _; do
+		[ "$uid" -ge 1000 ] 2>/dev/null || continue
+		[ -d "$home/.config/applocker" ] || continue
+		if [ -f "$home/.config/applocker/hidden.json" ]; then
+			su -s /bin/sh "$user" -c \
+				"python3 /usr/lib/applocker/hidelist.py reveal-all" >/dev/null 2>&1 || true
+		fi
+		# gocryptfs mounts under this home, deepest first.
+		awk '$3 ~ /gocryptfs/ { print $2 }' /proc/mounts | sort -r | while read -r mp; do
+			case "$mp" in "$home"/*)
+				su -s /bin/sh "$user" -c "fusermount -u '$mp'" >/dev/null 2>&1 \
+					|| umount -l "$mp" >/dev/null 2>&1 || true ;;
+			esac
+		done
+	done
 fi
 exit 0
 EOF
@@ -236,14 +268,25 @@ if [ "$1" = "purge" ] || [ "$1" = "remove" ]; then
 		echo "      'applocker-pam disable all' BEFORE removing, or edit those files." >&2
 	fi
 	[ "$1" = "purge" ] && rm -rf /etc/applocker
+	# Per-user data is never deleted by a package remove — face embeddings and
+	# ENCRYPTED VAULTS live there, and losing them silently would be worse than
+	# leaving them. Tell the user exactly what to delete, and what it costs.
+	cat <<'MSG'
+note: your AppLocker data is still in ~/.config/applocker (face embeddings,
+      ~37 MB of face models, and any encrypted vaults) plus the log in
+      ~/.cache/applocker. Vaults there are UNREADABLE without AppLocker or
+      gocryptfs, so copy their contents out before deleting:
+          rm -rf ~/.config/applocker ~/.cache/applocker
+MSG
 fi
 exit 0
 EOF
 
 # Track the dev-mode marker as a conffile so deleting it (to enable the real
 # gate) is remembered across upgrades instead of being silently restored.
+printf '/etc/pam.d/applocker-fprintd\n' > "$STAGE/DEBIAN/conffiles"
 if [ "${APPLOCKER_RELEASE:-}" != "1" ]; then
-	printf '/etc/applocker/dev-mode\n' > "$STAGE/DEBIAN/conffiles"
+	printf '/etc/applocker/dev-mode\n' >> "$STAGE/DEBIAN/conffiles"
 fi
 
 chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm" "$STAGE/DEBIAN/postrm"

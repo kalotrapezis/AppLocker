@@ -160,6 +160,56 @@ fn dev_mode() -> bool {
         || std::path::Path::new("/etc/applocker/dev-mode").exists()
 }
 
+/// What the auth thread tells the watchdog thread.
+enum AuthMsg {
+    /// A dialog is now on screen: a human is answering, so the short
+    /// hung-recognizer deadline must stop applying (this was the bypass —
+    /// face attempts ate the 30s and a slow PIN entry failed *open*).
+    Prompting,
+    /// Final verdict.
+    Done(bool),
+}
+
+/// How long to keep an exec held once a prompt is on screen. Generous (a human
+/// is typing), but not infinite: a wedged GTK prompt must not block the launch
+/// forever.
+const PROMPT_GRACE: Duration = Duration::from_secs(300);
+
+/// Wait for the auth verdict. `(allowed, timed_out)`; `timed_out` means we
+/// fail-opened and the result must not be cached.
+fn wait_for_verdict(rx: &std::sync::mpsc::Receiver<AuthMsg>, deadline: Duration) -> (bool, bool) {
+    let mut budget = deadline;
+    loop {
+        match rx.recv_timeout(budget) {
+            Ok(AuthMsg::Done(a)) => return (a, false),
+            // Restart the clock on the longer, human-paced budget.
+            Ok(AuthMsg::Prompting) => budget = PROMPT_GRACE,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return (true, true),
+            // Auth thread died without answering: deny, don't wave it through.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return (false, false),
+        }
+    }
+}
+
+/// Wraps a prompter to announce "a dialog is up" before it blocks on the user.
+struct Announcing<P: auth::Prompter> {
+    inner: P,
+    tx: std::sync::mpsc::Sender<AuthMsg>,
+}
+
+impl<P: auth::Prompter> Announcing<P> {
+    fn new(inner: P, tx: std::sync::mpsc::Sender<AuthMsg>) -> Self {
+        Announcing { inner, tx }
+    }
+}
+
+impl<P: auth::Prompter> auth::Prompter for Announcing<P> {
+    fn prompt(&mut self, available: auth::Available) -> auth::PromptResult {
+        let _ = self.tx.send(AuthMsg::Prompting);
+        self.inner.prompt(available)
+    }
+}
+
 /// Fail-open watchdog: if an auth run doesn't finish within this long, the gate
 /// answers ALLOW and logs it, so a hung recognizer (busy camera, no display)
 /// can't leave an exec blocked forever. `$APPLOCKER_GATE_TIMEOUT` seconds;
@@ -868,8 +918,12 @@ fn spawn_lock_listener(cache: Arc<UnlockCache>) {
             let reader = io::BufReader::new(stdout);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
+                // KDE's screen locker never calls Session.Lock — it sets
+                // LockedHint, which arrives as a PropertiesChanged signal. Match
+                // that too, or the cache survives a Plasma lock.
                 if line.contains(".Session.Lock (")
                     || line.contains("PrepareForSleep (true")
+                    || (line.contains("LockedHint") && line.contains("true"))
                 {
                     cache.wipe();
                     eprintln!("applockerd: session locked — unlock cache wiped.");
@@ -1094,8 +1148,9 @@ fn handle_event(
                 // Wayland-as-root) can never leave this exec blocked forever.
                 // Only the outer thread ever replies, so there's no double-answer
                 // race even when the inner thread finishes late.
-                let (tx, rx) = std::sync::mpsc::channel::<bool>();
+                let (tx, rx) = std::sync::mpsc::channel::<AuthMsg>();
                 let app_inner = app.clone();
+                let tx_prompt = tx.clone();
                 thread::spawn(move || {
                     let (face, attempts, face_live) = face::build();
                     let cfg = face::config_for(attempts);
@@ -1105,20 +1160,23 @@ fn handle_event(
                         Feedback::none()
                     }));
                     let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
-                    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app_inner, face_live), fb);
+                    let mut prompter = Announcing::new(
+                        ClosingPrompter::new(GuiPrompter::new(&app_inner, face_live), fb),
+                        tx_prompt,
+                    );
                     let fallback = SystemFallback::system();
                     let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
                     // If the outer thread already timed out, the receiver is gone
                     // and this send is a harmless no-op.
-                    let _ = tx.send(matches!(outcome, Outcome::Allowed));
+                    let _ = tx.send(AuthMsg::Done(matches!(outcome, Outcome::Allowed)));
                 });
 
                 let (allowed, timed_out) = match fail_open {
-                    Some(d) => match rx.recv_timeout(d) {
-                        Ok(a) => (a, false),
-                        Err(_) => (true, true), // fail-open: allow rather than freeze
+                    Some(d) => wait_for_verdict(&rx, d),
+                    None => match rx.recv() {
+                        Ok(AuthMsg::Done(a)) => (a, false),
+                        _ => (false, false),
                     },
-                    None => (rx.recv().unwrap_or(false), false),
                 };
 
                 // Never cache a fail-open allow — it's a safety escape, not a real
@@ -1210,6 +1268,40 @@ fn respond(fan_fd: RawFd, event_fd: libc::c_int, response: u32, write_lock: &Arc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bypass that let a locked app open on failed auth: face attempts ate
+    /// the 30s watchdog and a human typing a PIN fell off the end into ALLOW.
+    #[test]
+    fn prompt_on_screen_stops_the_fail_open_clock() {
+        let (tx, rx) = std::sync::mpsc::channel::<AuthMsg>();
+        let short = Duration::from_millis(50);
+
+        // Verdict in time: taken as-is.
+        tx.send(AuthMsg::Done(false)).unwrap();
+        assert_eq!(wait_for_verdict(&rx, short), (false, false));
+
+        // Nothing at all within the deadline: fail open, flagged as a timeout
+        // so the caller never caches it.
+        assert_eq!(wait_for_verdict(&rx, short), (true, true));
+
+        // A dialog went up, then the user answered well past the short
+        // deadline — must be the real verdict, not a fail-open allow.
+        let tx2 = tx.clone();
+        thread::spawn(move || {
+            tx2.send(AuthMsg::Prompting).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            tx2.send(AuthMsg::Done(false)).unwrap();
+        });
+        assert_eq!(wait_for_verdict(&rx, short), (false, false));
+    }
+
+    /// Auth thread died without answering: deny, never wave it through.
+    #[test]
+    fn dead_auth_thread_denies() {
+        let (tx, rx) = std::sync::mpsc::channel::<AuthMsg>();
+        drop(tx);
+        assert_eq!(wait_for_verdict(&rx, Duration::from_secs(5)), (false, false));
+    }
 
     #[test]
     fn unescape_mountinfo_handles_octal() {

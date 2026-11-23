@@ -67,6 +67,10 @@ YUNET_MODELS = (
 #: The primary model — the one fetch_models.py downloads and probe_env reports.
 YUNET_MODEL = YUNET_MODELS[0]
 
+# Minimum YuNet confidence for a box to count at all. Above this we pick by
+# size (= proximity), so the person at the keyboard beats a bystander.
+YUNET_MIN_SCORE = 0.7
+
 
 def model_dir() -> str:
     """Where the YuNet/SFace ONNX models live ($APPLOCKER_MODELS or the default).
@@ -298,7 +302,13 @@ class SFaceEngine(FaceEngine):
         _, faces = self._yunet.detect(frame)
         if faces is None or len(faces) == 0:
             return None
-        return max(faces, key=lambda f: float(f[-1]))
+        # Nearest face wins, not the most confident one: with a second person
+        # in frame the sharper background face used to be picked and the owner
+        # was never embedded ("won't open when people are next to me").
+        faces = [f for f in faces if float(f[-1]) >= YUNET_MIN_SCORE]
+        if not len(faces):
+            return None
+        return max(faces, key=lambda f: float(f[2]) * float(f[3]))
 
     @staticmethod
     def _landmark_yaw(face) -> Optional[float]:

@@ -8,6 +8,18 @@ truly ambiguous.
 Target env: **Kubuntu / KDE / Wayland**. Test build is dev-mode (gate can't freeze).
 Version bumps land in `dist/applocker_0.0.1-<letter>_amd64.deb`.
 
+> **Future — GTK4 / libadwaita port:** see [`plan-gtk4.md`](plan-gtk4.md). Phased
+> view-layer rewrite (backend untouched) that makes the UI match the design mockup.
+> Unblocked by Mint moving to Wayland. This is the chosen direction over a Qt port
+> (the old Qt idea was vetoed — GTK already follows the KDE theme; GTK4 keeps that).
+>
+> **A web-based UI was considered and rejected (2026-11-23).** It would mean
+> shipping a browser engine (Electron/webview) plus a localhost server for a
+> settings window and a PIN dialog — ~100 MB of runtime, a new attack surface on
+> the one dialog that gates everything, no KDE theme/accent following, no system
+> font, and a prompt that can't reliably stay modal and keep-above over a Wayland
+> lock screen. GTK4/libadwaita gets the same visual freedom with none of that.
+
 ## Architecture recap (already built)
 - **Broker** (`applockerd serve`, `daemon/src/serve.rs`) — root Unix-socket daemon
   at `/run/applockerd.sock`. Runs the face→PIN→sudo routine and does privileged
@@ -28,6 +40,30 @@ Version bumps land in `dist/applocker_0.0.1-<letter>_amd64.deb`.
 ---
 
 ## P0 — core correctness (do first, in order)
+
+### [x] 0. 0.0.3 — fail-open hole, bystanders, fingerprint, clean uninstall
+Four user reports, all root-caused and fixed (see CHANGELOG 0.0.3):
+- Gate fail-open watchdog covered the whole auth routine → a locked app opened
+  on *failed* auth once face+PIN crossed 30s. Watchdog now stops when a dialog
+  appears (`AuthMsg::Prompting`, `wait_for_verdict`, unit-tested in main.rs).
+- Unlock cache was not wiped by a Plasma lock (KDE sets `LockedHint`, never
+  calls `Session.Lock`). Listener matches both now.
+- YuNet picked the highest-confidence face, not the nearest → a bystander beat
+  the owner. Now largest box above a 0.7 score floor (`face/engine.py`).
+- Uninstall left PAM lines, `.hidden` markers, mounted vaults and running
+  helpers. `prerm` cleans all four; `postrm` explains the per-user data it
+  deliberately keeps.
+- NEW: fingerprint tier via `pam_fprintd` (`/etc/pam.d/applocker-fprintd`,
+  `Method::Fingerprint`, "Fingerprint" button in the prompt).
+- [ ] VERIFY on metal: (a) lock Viber, fail the PIN 3× → it must stay shut;
+  (b) a second person in frame must not stop your own face unlocking;
+  (c) tap the reader at the prompt → unlocks; (d) `apt remove applocker` →
+  no unlock button on the lock screen, folders visible again, no leftover
+  `/usr/lib/applocker` processes.
+- [ ] Fingerprint polish: an on-screen "touch the reader" state (needs the
+  prompt to talk to the daemon over the socket, not one stdout line), and a
+  Settings toggle. Today it is auto-offered whenever a finger is enrolled.
+
 
 ### [x] 1. Add/remove apps — ROOT CAUSE FOUND & FIXED (shipped vm4 / o)
 THE bug: `lock-app`/`unlock-app` call `signal_daemon_reload()` → SIGHUP to every

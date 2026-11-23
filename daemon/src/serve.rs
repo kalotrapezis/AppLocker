@@ -445,12 +445,30 @@ fn get_sudo(reason: &str) -> String {
     let fb = SystemFallback::system();
     // Offer the PIN only when it's usable and not currently locked; the sudo
     // password is always offered as the escape hatch.
-    let available = Available { pin: fb.pin_available() && !locked, sudo: true };
+    let available = Available { pin: fb.pin_available() && !locked, sudo: true, fingerprint: fb.fingerprint_available() };
     let mut prompter = GuiPrompter::new(reason, face_live);
     match prompter.prompt(available) {
         PromptResult::Cancelled => "cancel".to_string(),
         PromptResult::Entered { method: Method::Pin, secret } => {
             if fb.verify_pin(&secret) {
+                store.record_success();
+                match store.load() {
+                    Some(pw) => format!("ok\n{pw}"),
+                    None => "notset".to_string(),
+                }
+            } else {
+                match store.record_failure(now) {
+                    FailOutcome::Denied => "denied".to_string(),
+                    FailOutcome::Locked { secs } => format!("locked {secs}"),
+                    FailOutcome::Destroyed => "destroyed".to_string(),
+                }
+            }
+        }
+        // Fingerprint proves identity like face does, so it unlocks the stored
+        // password the same way the PIN does (and counts as a failure if the
+        // reader rejects, so it can't be used to brute the lockout away).
+        PromptResult::Entered { method: Method::Fingerprint, .. } => {
+            if fb.verify_fingerprint().unwrap_or(false) {
                 store.record_success();
                 match store.load() {
                     Some(pw) => format!("ok\n{pw}"),

@@ -204,7 +204,7 @@ mod tests {
         assert!(!face.try_match());
         let mut p = ClosingPrompter::new(OkPrompt, fb);
         assert!(matches!(
-            p.prompt(Available { pin: true, sudo: true }),
+            p.prompt(Available { pin: true, sudo: true, fingerprint: false }),
             PromptResult::Entered { method: Method::Pin, .. }
         ));
     }
