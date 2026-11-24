@@ -41,6 +41,23 @@ Version bumps land in `dist/applocker_0.0.1-<letter>_amd64.deb`.
 
 ## P0 — core correctness (do first, in order)
 
+### [x] 0d. INSTALLED + VERIFIED ON METAL (0.0.5, 2026-11-24 07:09)
+- `dpkg -i` said "previously unselected package" → AppLocker was genuinely NOT
+  installed any more. The "never lets go" symptom was leftover STATE (PAM lines,
+  .hidden markers, user data), not a live install. 0.0.5's prerm fixes that.
+- Lock-screen face unlock verified on the INSTALLED build: locked 07:09:49 →
+  "face + liveness matched at the lock screen — session unlocked".
+- The watcher only autostarts at LOGIN; started by hand this time with
+  `setsid python3 /usr/lib/applocker/watch_presence.py &`.
+- DO NOT run `applocker-pam enable fingerprint` on this box: Ubuntu's
+  pam-auth-update ALREADY has `pam_fprintd` in /etc/pam.d/common-auth
+  (max-tries=3 timeout=15), which /etc/pam.d/kde @includes — so the greeter
+  already offers the reader, and our tier would stack a second 10s wait in
+  front of it. `enable_one` now detects this and refuses.
+- [ ] ENFORCEMENT IS STILL OFF: `applockerd.service` is disabled/inactive, so
+  locked apps (Viber, Zen, Steam) are NOT gated. Nothing about the Viber fixes
+  can be confirmed until `sudo systemctl enable --now applockerd.service`.
+
 ### [x] 0c. 0.0.5 — AppImage inner exec, fingerprint-first, trust window
 - User's hypothesis about Viber was RIGHT about the mechanism: an AppImage execs
   its real binary from its own FUSE mount, a path the lock never matched. Gate

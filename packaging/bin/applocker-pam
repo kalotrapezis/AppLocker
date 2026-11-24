@@ -96,9 +96,19 @@ enable_one() {
 	fi
 	line="$(line_for "$tier")"
 	mod="$(module_for "$tier")"
-	if [ "$tier" = "fingerprint" ] && ! ls /lib/*/security/pam_fprintd.so >/dev/null 2>&1; then
-		echo "skip fingerprint: pam_fprintd.so not installed (apt install libpam-fprintd)" >&2
-		return 0
+	if [ "$tier" = "fingerprint" ]; then
+		if ! ls /lib/*/security/pam_fprintd.so >/dev/null 2>&1; then
+			echo "skip fingerprint: pam_fprintd.so not installed (apt install libpam-fprintd)" >&2
+			return 0
+		fi
+		# Ubuntu's pam-auth-update already puts pam_fprintd in common-auth, which
+		# /etc/pam.d/kde @includes — adding our own line would make the greeter
+		# wait at the reader TWICE before the password field is usable.
+		if grep -q "pam_fprintd" /etc/pam.d/common-auth 2>/dev/null; then
+			echo "skip fingerprint: already provided system-wide via" >&2
+			echo "      /etc/pam.d/common-auth (pam-auth-update). Nothing to do." >&2
+			return 0
+		fi
 	fi
 	if grep -q "$mod" "$f"; then
 		echo "$tier: already enabled ($f)"; return 0
