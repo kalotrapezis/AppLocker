@@ -797,6 +797,7 @@ fn cmd_auth_test(app: Option<String>) {
     let finger_live = system.fingerprint_available();
     let mut cfg = face::config_for(attempts);
     cfg.cross_reference = face_live && finger_live;
+    cfg.cross_denies = cfg.cross_reference; // mirror the gate
     let show = face_live || finger_live;
     let fb = std::rc::Rc::new(std::cell::RefCell::new(if show {
         Feedback::spawn(&app)
@@ -1204,8 +1205,11 @@ fn handle_event(
                     let system = SystemFallback::system();
                     let finger_live = system.fingerprint_available();
                     let mut cfg = face::config_for(attempts);
-                    // Both biometrics on and usable → make them agree.
+                    // Both biometrics on and usable → make them agree, and a
+                    // locked app stays shut when they don't (no password way
+                    // round it; the broker keeps one so Settings stays usable).
                     cfg.cross_reference = face_live && finger_live;
+                    cfg.cross_denies = cfg.cross_reference;
                     // The window is for the reader too: its wait is silent and
                     // several seconds long, so without it nobody knows to touch.
                     let show = face_live || finger_live;
@@ -1222,8 +1226,16 @@ fn handle_event(
                         ),
                         tx_prompt,
                     );
+                    let after = fb.clone();
                     let fallback = FallbackWithFeedback::new(system, fb);
                     let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
+                    // A strict cross-check refusal has no prompt to explain
+                    // itself, so the window has to say why the app didn't open.
+                    if cfg.cross_denies && matches!(outcome, Outcome::Denied) {
+                        after
+                            .borrow_mut()
+                            .denied("Face and fingerprint must both match");
+                    }
                     // If the outer thread already timed out, the receiver is gone
                     // and this send is a harmless no-op.
                     let _ = tx.send(AuthMsg::Done(matches!(outcome, Outcome::Allowed)));

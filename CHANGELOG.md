@@ -15,15 +15,22 @@ without the face, now gets the PIN/password prompt instead of the app.
 - **Degrades, never blocks**: the rule only switches on when both factors are
   live. No reader attached, no finger enrolled, or face off → the remaining
   factor works alone exactly as before.
-- The PIN/password prompt is still single-factor on purpose. A lock-out-proof
-  fallback has to exist, so cross-checking raises the bar on the *biometric*
-  path rather than pretending to be true 2FA.
+- **A failed cross-check closes the app, full stop** — no PIN/password prompt
+  to get round it. Both on means both must be right.
+- The refusal is shown, not silent: ✕ plus "Face and fingerprint must both
+  match" for 2.2s. A locked app that just fails to open, with nothing on
+  screen, is the exact complaint this whole thread started from.
+- **One deliberate exception:** the broker's paths — Settings and the
+  sudo-password release — still fall through to the prompt. They are how you
+  reach the switch that turns a factor off, so a dead camera or a yanked reader
+  must never strand you there. The CLI escape is `sudo applockerd
+  set-fingerprint off`.
 - Settings says so under Fingerprint unlock, so the stricter behaviour isn't a
   surprise.
 
 Worth knowing on this machine: with a reader that drops off mid-read, "both must
-agree" means more trips to the password box. Turning Fingerprint off in Settings
-returns you to face alone.
+agree" means locked apps will refuse more often. Turning Fingerprint off in
+Settings returns you to face alone.
 
 ## 0.0.15 — a Fingerprint switch in Settings, above Face unlock
 

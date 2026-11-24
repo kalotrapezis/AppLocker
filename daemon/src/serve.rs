@@ -458,8 +458,10 @@ fn get_sudo(reason: &str) -> String {
         }
     };
     if face_live && finger_live {
-        // Cross-reference, same rule as the app gate: the reader and the camera
-        // must agree, or this falls through to the PIN/password prompt.
+        // Cross-reference, same rule as the app gate — except that here a
+        // failure still falls through to the PIN/password prompt. This path
+        // unlocks Settings and the stored sudo password, so a broken camera or
+        // reader must never leave you unable to turn the factors off.
         if fb0.verify_fingerprint().unwrap_or(false) {
             for _ in 0..attempts {
                 if face_v.try_match() {

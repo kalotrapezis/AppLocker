@@ -104,6 +104,14 @@ pub struct Config {
     ///
     /// The caller decides this, since only it knows whether face is live.
     pub cross_reference: bool,
+    /// When a cross-check fails, deny outright instead of offering the
+    /// PIN/password prompt: "if both are on, both have to be right; if they
+    /// fail the app stays closed."
+    ///
+    /// Set for locked apps. Deliberately NOT set for the broker (Settings, the
+    /// sudo-password release), so a broken camera or reader can never leave you
+    /// unable to reach the switch that turns them off.
+    pub cross_denies: bool,
 }
 
 impl Default for Config {
@@ -113,6 +121,7 @@ impl Default for Config {
             face_gap: Duration::from_millis(500),
             fallback_attempts: 3,
             cross_reference: false,
+            cross_denies: false,
         }
     }
 }
@@ -158,6 +167,15 @@ pub fn run(
             return Outcome::Allowed;
         }
         // One of the two said no. Don't let the other stand in for it.
+        if cfg.cross_denies {
+            eprintln!(
+                "applockerd: face and fingerprint are both on and they did not \
+                 both match — denying (no fallback prompt). Turn one off in \
+                 Settings, or `applockerd set-fingerprint off`, to use a single \
+                 factor again."
+            );
+            return Outcome::Denied;
+        }
     } else {
         // Tier 0: the fingerprint reader, when a finger is enrolled. It goes
         // first because it's the fastest factor and needs no camera — touch it
@@ -538,12 +556,18 @@ mod tests {
         Config { cross_reference: true, ..fast_cfg() }
     }
 
+    /// Locked-app flavour: a failed cross-check closes the app, full stop.
+    fn cross_strict_cfg() -> Config {
+        Config { cross_reference: true, cross_denies: true, ..fast_cfg() }
+    }
+
     fn fast_cfg() -> Config {
         Config {
             face_attempts: 3,
             face_gap: Duration::from_millis(0),
             fallback_attempts: 3,
             cross_reference: false,
+            cross_denies: false,
         }
     }
 
@@ -599,6 +623,39 @@ mod tests {
         let mut prompt = ScriptedPrompt { answers: answers(), idx: 0, seen_available: vec![] };
         assert_eq!(
             run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Allowed
+        );
+    }
+
+    /// For a locked app: both on, either fails → stays shut, and the user is
+    /// never offered a password to get round it.
+    #[test]
+    fn strict_cross_reference_denies_without_prompting() {
+        let pin = || vec![entered(Method::Pin, "1234")];
+
+        // finger ✓ + face ✗ → denied, no prompt at all.
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: pin(), idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &FpFallback { touched: true }),
+            Outcome::Denied
+        );
+        assert!(prompt.seen_available.is_empty(), "no way round it");
+
+        // finger ✗ + face ✓ → same.
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: pin(), idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Denied
+        );
+        assert!(prompt.seen_available.is_empty());
+
+        // Both right → in, as always.
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: vec![], idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &FpFallback { touched: true }),
             Outcome::Allowed
         );
     }

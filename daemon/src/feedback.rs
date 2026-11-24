@@ -95,6 +95,18 @@ impl Feedback {
         self.reap();
     }
 
+    /// Show ✕ and the reason, long enough to read, then let the window go.
+    /// Used when the routine refuses outright and there is no prompt to
+    /// explain itself — otherwise the app simply fails to open, silently.
+    pub fn denied(&mut self, why: &str) {
+        if !self.is_live() {
+            return;
+        }
+        self.send(&format!("denied {why}"));
+        std::thread::sleep(DENIED_LINGER);
+        self.reap();
+    }
+
     pub fn close(&mut self) {
         self.send("close");
         self.reap();
@@ -111,6 +123,9 @@ impl Feedback {
 /// How long to leave the ✓ on screen. Must outlast the window's own
 /// `OK_VISIBLE_MS` self-close timer (see gui/unlock_feedback.py), with slack.
 const OK_LINGER: Duration = Duration::from_millis(1400);
+
+/// Must outlast the window's own `DENIED_VISIBLE_MS` (2200ms).
+const DENIED_LINGER: Duration = Duration::from_millis(2400);
 
 impl Drop for Feedback {
     fn drop(&mut self) {
