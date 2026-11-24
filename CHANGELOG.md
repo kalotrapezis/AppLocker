@@ -3,6 +3,46 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.25 — apps, lock screen and files get their own methods
+
+### Added
+- **Per-tier authentication.** Each of the three places AppLocker guards now
+  has its own method set, configured apart:
+
+```
+applockerd set-methods apps       fingerprint,face,pin,password
+applockerd set-methods lockscreen fingerprint,face,both
+applockerd set-methods files      fingerprint,face,both,pin
+```
+
+  `both` means the two biometrics must agree — and liveness drops in that mode
+  on purpose: a second factor is better evidence than a head turn, and asking
+  for both at once is what makes people switch it off.
+- Written to `/etc/applocker/config` as `apps_methods`, `lockscreen_methods`
+  and `files_methods`. **An older config keeps behaving exactly as before**:
+  tiers with no key inherit the global switches (and the lock screen never
+  inherits the PIN — the greeter takes an account password).
+- The gate and `auth-test` run the **apps** tier: its methods, its cross-check,
+  its liveness.
+- The watcher runs the **lock screen** tier. With `both`, the camera stands
+  down unless a fingerprint was accepted recently — that stamp *is* the second
+  factor, since the camera cannot ask the reader itself. (A fingerprint taken
+  by the greeter's own PAM does not stamp, so only app/sudo unlocks open that
+  window.)
+
+### Fixed
+- **Stopping the service now stops the lock-screen face unlock too.** The
+  watcher is a user-session process and kept unlocking the screen after the
+  gate was stopped, which reads as "I turned AppLocker off and it is still
+  doing things". It checks `applockerd.service` (cached 10s) and stands down
+  with it; if it cannot tell, it stays on rather than silently disabling a
+  security feature.
+- **A forgotten prompt no longer wedges the broker.** It serves one request at
+  a time, so an unanswered dialog blocked every later Settings action until the
+  window was closed — which is exactly what happened when Settings refused to
+  open with "broker down". Dialogs are now closed and treated as cancelled
+  after 180s.
+
 ## 0.0.24 — fingerprint enrolment inside Settings, and cards that grey out
 
 ### Added

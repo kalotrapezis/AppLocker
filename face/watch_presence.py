@@ -255,10 +255,71 @@ def trusted_phone_near() -> bool:
 UNLOCK_MARKER = os.path.expanduser("~/.config/applocker/lockscreen-unlock")
 
 
+_SERVICE_CACHE = {"at": 0.0, "on": True}
+
+
+def applocker_enforcing() -> bool:
+    """Is AppLocker's gate service running?
+
+    Stopping the service in Settings is read by people as "AppLocker off", so
+    the lock-screen face unlock stands down with it — otherwise the camera keeps
+    unlocking the screen for an app that is supposedly stopped. Cached for 10s:
+    this is checked on a loop.
+    """
+    now = time.monotonic()
+    if now - _SERVICE_CACHE["at"] < 10.0:
+        return _SERVICE_CACHE["on"]
+    try:
+        r = subprocess.run(["systemctl", "is-active", "applockerd.service"],
+                           capture_output=True, text=True, timeout=5)
+        on = r.stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        on = True   # can't tell → don't silently disable a security feature
+    _SERVICE_CACHE["at"] = now
+    _SERVICE_CACHE["on"] = on
+    return on
+
+
+def read_lockscreen_policy() -> dict:
+    """The `lockscreen_methods` line from the daemon's config.
+
+    Absent (an older config) → inherit the global `face` switch, which is what
+    the daemon does too. Keys mirror policy.rs's TierPolicy.
+    """
+    pol = {"face": False, "fingerprint": False, "require_both": False,
+           "pin": False, "password": True, "_explicit": False}
+    path = os.environ.get("APPLOCKER_CONFIG", "/etc/applocker/config")
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = (p.strip().lower() for p in line.split("=", 1))
+                if k == "face" and not pol["_explicit"]:
+                    pol["face"] = v in _TRUE
+                elif k == "lockscreen_methods":
+                    pol["_explicit"] = True
+                    toks = [t.strip() for t in v.replace("+", ",").split(",")]
+                    pol["face"] = "face" in toks
+                    pol["fingerprint"] = any(t in toks for t in ("fingerprint", "finger", "fp"))
+                    pol["require_both"] = any(t in toks for t in ("both", "require-both"))
+                    pol["pin"] = "pin" in toks
+                    pol["password"] = any(t in toks for t in ("password", "sudo"))
+    except OSError:
+        pass
+    return pol
+
+
 def lockscreen_face_enabled() -> bool:
     """On when the marker file exists, or when the user's existing lock-screen
     face toggle has put pam_applocker into KDE's PAM stack. Two ways in, one
     intent — no second switch to forget about."""
+    if not applocker_enforcing():
+        return False   # service stopped → AppLocker does nothing, including this
+    pol = read_lockscreen_policy()
+    if not pol["face"]:
+        return False   # this tier doesn't accept face at all
     if os.path.exists(UNLOCK_MARKER):
         return True
     try:
@@ -820,10 +881,22 @@ def main() -> int:
                     unlock_state["misses"] = 0
                 # A recent fingerprint, or your phone connected over Bluetooth,
                 # earns a plain glance; otherwise the turn challenge stands.
-                why = ("--unlock-no-liveness" if args.unlock_no_liveness
-                       else "recent fingerprint" if recent_fingerprint()
-                       else "trusted phone connected" if trusted_phone_near()
-                       else None)
+                pol = read_lockscreen_policy()
+                if pol["require_both"]:
+                    # "Face (no liveness) + Fingerprint": the camera cannot ask
+                    # the reader itself, so it stands down unless a fingerprint
+                    # was accepted recently — that stamp IS the second factor.
+                    # (A fingerprint taken by the greeter's own PAM does not
+                    # stamp, so only app/sudo unlocks open this window.)
+                    if not recent_fingerprint():
+                        time.sleep(args.unlock_interval)
+                        continue
+                    why = "fingerprint + face (cross-checked)"
+                else:
+                    why = ("--unlock-no-liveness" if args.unlock_no_liveness
+                           else "recent fingerprint" if recent_fingerprint()
+                           else "trusted phone connected" if trusted_phone_near()
+                           else None)
                 if owner_at_screen(args.camera, 5.0, liveness=why is None) \
                         and unlock_session():
                     how = f"glance ({why})" if why else "face + liveness"

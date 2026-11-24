@@ -155,15 +155,40 @@ impl Prompter for GuiPrompter {
             }
         };
 
-        let mut out = String::new();
+        // Read the reply on a worker so an unanswered dialog can't pin us here.
+        // The broker serves one request at a time, so a forgotten prompt used to
+        // wedge every later Settings action until the window was closed.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
         if let Some(mut stdout) = child.stdout.take() {
-            let _ = stdout.read_to_string(&mut out);
+            std::thread::spawn(move || {
+                let mut out = String::new();
+                let _ = stdout.read_to_string(&mut out);
+                let _ = tx.send(out);
+            });
         }
+        let out = match rx.recv_timeout(PROMPT_TIMEOUT) {
+            Ok(o) => o,
+            Err(_) => {
+                eprintln!(
+                    "applockerd: no answer in {}s — closing the prompt and \
+                     treating it as cancelled.",
+                    PROMPT_TIMEOUT.as_secs()
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return PromptResult::Cancelled;
+            }
+        };
         let _ = child.wait();
 
         parse_reply(&out)
     }
 }
+
+/// How long a dialog may sit unanswered before we close it and call it a
+/// cancel. Generous for a human, bounded for the broker, which serves requests
+/// one at a time and must not be held hostage by a forgotten window.
+const PROMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Parse the prompt's stdout contract (see gui/auth_prompt.py):
 /// `cancel`, `fp`, `pin\t<secret>`, or `sudo\t<secret>`.

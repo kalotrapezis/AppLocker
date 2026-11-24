@@ -26,6 +26,79 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/// What a single tier accepts. The three tiers are deliberately separate: an
+/// app launch, the lock screen and a file vault are different stakes, and the
+/// user asked for them to be configured apart.
+///
+/// `require_both` means the two biometrics must agree. Liveness is dropped in
+/// that mode on purpose — a second factor is stronger evidence than a head
+/// turn, and asking for both at once is what makes people turn it off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierPolicy {
+    pub face: bool,
+    pub fingerprint: bool,
+    pub require_both: bool,
+    pub pin: bool,
+    pub password: bool,
+}
+
+impl TierPolicy {
+    /// Liveness is on unless the tier leans on two factors instead.
+    pub fn liveness(&self) -> bool {
+        !(self.require_both && self.face && self.fingerprint)
+    }
+
+    /// Does this tier have any biometric at all?
+    pub fn any_biometric(&self) -> bool {
+        self.face || self.fingerprint
+    }
+
+    /// Public wrapper so the CLI can parse a user-supplied list.
+    pub fn parse_methods_public(val: &str, into: &mut TierPolicy) {
+        Self::parse_methods(val, into)
+    }
+
+    fn parse_methods(val: &str, into: &mut TierPolicy) {
+        let (mut face, mut fp, mut pin, mut pw, mut both) = (false, false, false, false, false);
+        for tok in val.split(&[',', '+'][..]).map(|t| t.trim()) {
+            match tok {
+                "face" => face = true,
+                "fingerprint" | "finger" | "fp" => fp = true,
+                "pin" => pin = true,
+                "password" | "sudo" => pw = true,
+                "both" | "require-both" => both = true,
+                "" | "none" => {}
+                other => eprintln!("applockerd: unknown method {other:?} — ignored"),
+            }
+        }
+        *into = TierPolicy { face, fingerprint: fp, require_both: both, pin, password: pw };
+    }
+
+    fn to_methods(self) -> String {
+        let mut v = Vec::new();
+        if self.fingerprint {
+            v.push("fingerprint");
+        }
+        if self.face {
+            v.push("face");
+        }
+        if self.require_both {
+            v.push("both");
+        }
+        if self.pin {
+            v.push("pin");
+        }
+        if self.password {
+            v.push("password");
+        }
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(", ")
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     /// Try face recognition before falling back. Off = PIN/sudo only.
@@ -55,6 +128,11 @@ pub struct Policy {
     /// list entirely (nothing prompts on launch) while the list itself is kept,
     /// so the feature can be toggled without losing which apps were chosen.
     pub apps_enabled: bool,
+    /// Per-tier method sets. Absent from an older config file, in which case
+    /// they are derived from the global switches above so nothing changes.
+    pub apps: TierPolicy,
+    pub lockscreen: TierPolicy,
+    pub files: TierPolicy,
 }
 
 /// The intervals the UI offers (minutes between snapshots). A hand-edited value
@@ -82,6 +160,14 @@ impl Default for Policy {
             // harmless, and this keeps existing configs (which never wrote the
             // key) behaving exactly as before the master switch existed.
             apps_enabled: true,
+            // Derived in `load` from the global switches when the per-tier keys
+            // are absent, which is every config written before this existed.
+            apps: TierPolicy { face: false, fingerprint: true, require_both: false,
+                               pin: true, password: true },
+            lockscreen: TierPolicy { face: false, fingerprint: true, require_both: false,
+                                     pin: false, password: true },
+            files: TierPolicy { face: false, fingerprint: true, require_both: false,
+                                pin: true, password: true },
         }
     }
 }
@@ -91,6 +177,9 @@ impl Policy {
     /// line is skipped with a warning rather than bricking auth.
     pub fn load(path: &Path) -> Policy {
         let mut p = Policy::default();
+        // Which tiers the file actually configured; the rest inherit the global
+        // switches, so an older config keeps behaving exactly as it did.
+        let mut seen_tiers: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(_) => return p, // missing/unreadable → defaults
@@ -110,6 +199,18 @@ impl Policy {
                 "face" => p.face_enabled = parse_bool(val).unwrap_or(p.face_enabled),
                 "fingerprint" => {
                     p.allow_fingerprint = parse_bool(val).unwrap_or(p.allow_fingerprint)
+                }
+                "apps_methods" => {
+                    TierPolicy::parse_methods(val, &mut p.apps);
+                    seen_tiers.insert("apps");
+                }
+                "lockscreen_methods" => {
+                    TierPolicy::parse_methods(val, &mut p.lockscreen);
+                    seen_tiers.insert("lockscreen");
+                }
+                "files_methods" => {
+                    TierPolicy::parse_methods(val, &mut p.files);
+                    seen_tiers.insert("files");
                 }
                 "fallback" => {
                     let (pin, sudo) = parse_fallback(val);
@@ -139,6 +240,23 @@ impl Policy {
             eprintln!("applockerd: config has no fallback enabled — forcing both on");
             p.allow_pin = true;
             p.allow_sudo = true;
+        }
+        let inherited = TierPolicy {
+            face: p.face_enabled,
+            fingerprint: p.allow_fingerprint,
+            require_both: false,
+            pin: p.allow_pin,
+            password: p.allow_sudo,
+        };
+        if !seen_tiers.contains("apps") {
+            p.apps = inherited;
+        }
+        if !seen_tiers.contains("lockscreen") {
+            // No PIN at the lock screen: the greeter takes the account password.
+            p.lockscreen = TierPolicy { pin: false, ..inherited };
+        }
+        if !seen_tiers.contains("files") {
+            p.files = inherited;
         }
         p
     }
@@ -171,7 +289,10 @@ impl Policy {
              attention = {}\n\
              attention_interval = {}\n\
              attention_ac_only = {}\n\
-             apps_enabled = {}\n",
+             apps_enabled = {}\n\
+             apps_methods = {}\n\
+             lockscreen_methods = {}\n\
+             files_methods = {}\n",
             if self.face_enabled { "on" } else { "off" },
             if self.allow_fingerprint { "on" } else { "off" },
             fallback.join(", "),
@@ -179,7 +300,10 @@ impl Policy {
             if self.attention_enabled { "on" } else { "off" },
             self.attention_interval_min,
             if self.attention_ac_only { "on" } else { "off" },
-            if self.apps_enabled { "on" } else { "off" }
+            if self.apps_enabled { "on" } else { "off" },
+            self.apps.to_methods(),
+            self.lockscreen.to_methods(),
+            self.files.to_methods()
         );
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -302,6 +426,42 @@ mod tests {
         assert!(!p.face_enabled && p.allow_pin && p.allow_sudo);
     }
 
+    /// Each tier is parsed, written and read back as the user wrote it, and
+    /// "both" is what turns liveness off.
+    #[test]
+    fn tier_methods_roundtrip_and_liveness() {
+        let mut t = TierPolicy { face: false, fingerprint: false, require_both: false,
+                                 pin: false, password: false };
+        TierPolicy::parse_methods("fingerprint, face, both", &mut t);
+        assert!(t.face && t.fingerprint && t.require_both);
+        assert!(!t.liveness(), "two factors replace the head turn");
+        assert!(!t.pin && !t.password);
+        assert_eq!(t.to_methods(), "fingerprint, face, both");
+
+        TierPolicy::parse_methods("face", &mut t);
+        assert!(t.liveness(), "one biometric keeps liveness");
+        assert!(!t.require_both);
+
+        TierPolicy::parse_methods("fp+pin", &mut t);
+        assert!(t.fingerprint && t.pin && !t.face);
+
+        TierPolicy::parse_methods("none", &mut t);
+        assert!(!t.any_biometric() && !t.pin && !t.password);
+    }
+
+    /// An old config with no per-tier keys must behave exactly as before.
+    #[test]
+    fn tiers_inherit_the_global_switches() {
+        let path = tmp("inherit");
+        std::fs::write(&path, "face = on\nfingerprint = off\nfallback = pin\n").unwrap();
+        let p = Policy::load(&path);
+        assert!(p.apps.face && !p.apps.fingerprint && p.apps.pin && !p.apps.password);
+        assert!(p.lockscreen.face, "lock screen inherits face too");
+        assert!(!p.lockscreen.pin, "but never the PIN: the greeter takes a password");
+        assert!(p.files.pin);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn roundtrip_face_off_sudo_only() {
         let path = tmp("sudo_only");
@@ -315,6 +475,12 @@ mod tests {
             attention_interval_min: 2,
             attention_ac_only: false,
             apps_enabled: true,
+            apps: TierPolicy { face: false, fingerprint: true, require_both: false,
+                               pin: true, password: true },
+            lockscreen: TierPolicy { face: false, fingerprint: true, require_both: false,
+                                     pin: false, password: true },
+            files: TierPolicy { face: false, fingerprint: true, require_both: false,
+                                pin: true, password: true },
         };
         pol.save(&path).unwrap();
         let loaded = Policy::load(&path);
@@ -341,6 +507,12 @@ mod tests {
             attention_interval_min: 2,
             attention_ac_only: false,
             apps_enabled: true,
+            apps: TierPolicy { face: false, fingerprint: true, require_both: false,
+                               pin: true, password: true },
+            lockscreen: TierPolicy { face: false, fingerprint: true, require_both: false,
+                                     pin: false, password: true },
+            files: TierPolicy { face: false, fingerprint: true, require_both: false,
+                                pin: true, password: true },
         };
         pol.save(&path).unwrap();
         let loaded = Policy::load(&path);
@@ -361,6 +533,12 @@ mod tests {
             attention_interval_min: 2,
             attention_ac_only: false,
             apps_enabled: true,
+            apps: TierPolicy { face: false, fingerprint: true, require_both: false,
+                               pin: true, password: true },
+            lockscreen: TierPolicy { face: false, fingerprint: true, require_both: false,
+                                     pin: false, password: true },
+            files: TierPolicy { face: false, fingerprint: true, require_both: false,
+                                pin: true, password: true },
         };
         assert!(pol.save(&tmp("empty")).is_err());
     }

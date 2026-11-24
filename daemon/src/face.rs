@@ -112,6 +112,21 @@ pub fn build() -> (Box<dyn FaceVerifier>, u32, bool) {
         Some("0") => false,
         _ => crate::policy::load_default().face_enabled,
     };
+    build_enabled(enabled)
+}
+
+/// Build for a tier that has already decided whether face is in play.
+/// `$APPLOCKER_FACE` still overrides, so the dev escape hatches keep working.
+pub fn build_for(enabled: bool) -> (Box<dyn FaceVerifier>, u32, bool) {
+    let enabled = match std::env::var("APPLOCKER_FACE").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => enabled,
+    };
+    build_enabled(enabled)
+}
+
+fn build_enabled(enabled: bool) -> (Box<dyn FaceVerifier>, u32, bool) {
     let home = effective_home();
     if enabled && has_enrollment(&home) {
         // 3 subprocess runs, 1s apart (user: one miss shouldn't end it) — each

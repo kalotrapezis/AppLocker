@@ -289,6 +289,9 @@ fn main() {
         Some("config") => cmd_config_show(),
         Some("set-face") => cmd_set_face(std::env::args().nth(2)),
         Some("set-fingerprint") => cmd_set_fingerprint(std::env::args().nth(2)),
+        Some("set-methods") => {
+            cmd_set_methods(std::env::args().nth(2), std::env::args().nth(3))
+        }
         Some("session-probe") => cmd_session_probe(),
         Some("set-attention") => cmd_set_attention(std::env::args().nth(2)),
         Some("set-attention-interval") => cmd_set_attention_interval(std::env::args().nth(2)),
@@ -327,6 +330,7 @@ fn cmd_config_show() {
     println!("\nChange with:");
     println!("  applockerd set-face on|off");
     println!("  applockerd set-fingerprint on|off");
+    println!("  applockerd set-methods <apps|lockscreen|files> <fingerprint,face,both,pin,password>");
     println!("  applockerd set-attention on|off");
     println!("  applockerd set-attention-interval 2|5|10|15|30   (minutes between checks)");
     println!("  applockerd set-attention-ac-only on|off          (pause on battery)");
@@ -352,6 +356,44 @@ fn cmd_set_face(arg: Option<String>) {
     if on && !pin::is_set(&auth::default_pin_path()) {
         eprintln!("note: face still needs enrollment (face/enroll.py) to actually run.");
     }
+}
+
+/// `applockerd set-methods <apps|lockscreen|files> <list>`
+///
+/// The list is comma- or plus-separated: fingerprint, face, both, pin,
+/// password. `both` means the two biometrics must agree (and liveness is
+/// dropped, because a second factor is better evidence than a head turn).
+fn cmd_set_methods(tier: Option<String>, list: Option<String>) {
+    let (Some(tier), Some(list)) = (tier, list) else {
+        eprintln!("usage: applockerd set-methods <apps|lockscreen|files> \
+                   <fingerprint,face,both,pin,password>");
+        process::exit(2);
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    let mut parsed = policy::TierPolicy {
+        face: false, fingerprint: false, require_both: false, pin: false, password: false,
+    };
+    policy::TierPolicy::parse_methods_public(&list, &mut parsed);
+    if parsed.require_both && !(parsed.face && parsed.fingerprint) {
+        eprintln!("applockerd: 'both' needs face AND fingerprint in the list");
+        process::exit(2);
+    }
+    if !parsed.pin && !parsed.password && !parsed.any_biometric() {
+        eprintln!("applockerd: that would leave no way in at all");
+        process::exit(2);
+    }
+    match tier.as_str() {
+        "apps" => pol.apps = parsed,
+        "lockscreen" => pol.lockscreen = parsed,
+        "files" => pol.files = parsed,
+        _ => {
+            eprintln!("applockerd: unknown tier {tier:?} (apps|lockscreen|files)");
+            process::exit(2);
+        }
+    }
+    save_policy_or_exit(&pol, &path);
+    println!("{tier}: {}", pol.summary());
 }
 
 fn cmd_set_fingerprint(arg: Option<String>) {
@@ -816,13 +858,15 @@ fn signal_daemon_reload() {
 /// prompt + PIN + PAM end to end: `applockerd auth-test [app-name]`.
 fn cmd_auth_test(app: Option<String>) {
     let app = app.unwrap_or_else(|| "auth-test".to_string());
-    let (face, attempts, face_live) = face::build();
-    let system = SystemFallback::system();
+    // auth-test mirrors the gate, so it must mirror the apps tier too.
+    let tier = policy::load_default().apps;
+    let (face, attempts, face_live) = face::build_for(tier.face);
+    let system = SystemFallback::for_tier(&tier);
     let user = system.user.clone();
     let finger_live = system.fingerprint_available();
     let mut cfg = face::config_for(attempts);
-    cfg.cross_reference = face_live && finger_live;
-    cfg.cross_denies = cfg.cross_reference; // mirror the gate
+    cfg.cross_reference = tier.require_both && face_live && finger_live;
+    cfg.cross_denies = cfg.cross_reference;
     let show = face_live || finger_live;
     let fb = std::rc::Rc::new(std::cell::RefCell::new(if show {
         Feedback::spawn(&app)
@@ -1353,14 +1397,18 @@ fn handle_event(
                 let app_inner = app.clone();
                 let tx_prompt = tx.clone();
                 thread::spawn(move || {
-                    let (face, attempts, face_live) = face::build();
-                    let system = SystemFallback::system();
+                    // Locked apps run the "apps" tier: its own methods, its
+                    // own cross-check setting, its own liveness.
+                    let tier = policy::load_default().apps;
+                    let (face, attempts, face_live) = face::build_for(tier.face);
+                    let system = SystemFallback::for_tier(&tier);
                     let finger_live = system.fingerprint_available();
                     let mut cfg = face::config_for(attempts);
-                    // Both biometrics on and usable → make them agree, and a
-                    // locked app stays shut when they don't (no password way
-                    // round it; the broker keeps one so Settings stays usable).
-                    cfg.cross_reference = face_live && finger_live;
+                    // Cross-check only when this tier asks for it and both
+                    // factors are live; then a locked app stays shut when they
+                    // disagree (the broker keeps a prompt, so Settings stays
+                    // reachable even if a factor dies).
+                    cfg.cross_reference = tier.require_both && face_live && finger_live;
                     cfg.cross_denies = cfg.cross_reference;
                     // The window is for the reader too: its wait is silent and
                     // several seconds long, so without it nobody knows to touch.

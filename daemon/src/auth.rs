@@ -467,6 +467,18 @@ impl SystemFallback {
     /// Default locations for the deployed daemon, gated by the saved policy.
     /// `$APPLOCKER_PIN_FILE` overrides the PIN path (used by tests and by
     /// `set-pin`/`auth-test` so they don't need to touch `/etc`).
+    /// The same, but limited to what one tier accepts.
+    pub fn for_tier(t: &crate::policy::TierPolicy) -> SystemFallback {
+        SystemFallback {
+            pin_path: default_pin_path(),
+            pam_service: password_service(),
+            user: desktop_user(),
+            allow_pin: t.pin,
+            allow_sudo: t.password,
+            allow_fingerprint: t.fingerprint,
+        }
+    }
+
     pub fn system() -> SystemFallback {
         let policy = crate::policy::load_default();
         SystemFallback {
