@@ -76,10 +76,13 @@ class AuthPrompt(Gtk.Window):
             what = "your PIN"
         else:
             what = "your password"
-        subtitle_text = (f"Face not recognised — enter {what}."
-                         if face_failed else f"Enter {what} to continue.")
+        # The reader leads when it's there: it's the fastest factor and it has
+        # already been waiting for a touch since before this dialog opened.
         if self.has_fp:
-            subtitle_text += " Or touch the fingerprint reader."
+            subtitle_text = f"Touch the fingerprint reader, or enter {what}."
+        else:
+            subtitle_text = (f"Face not recognised — enter {what}."
+                             if face_failed else f"Enter {what} to continue.")
         subtitle = Gtk.Label(label=subtitle_text)
         subtitle.set_xalign(0.0)
         subtitle.get_style_context().add_class("dim-label")

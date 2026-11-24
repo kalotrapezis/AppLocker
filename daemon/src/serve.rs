@@ -430,7 +430,16 @@ fn get_sudo(reason: &str) -> String {
     let now = sudopass::now_secs();
     let locked = matches!(store.status(now), LockStatus::Locked { .. });
 
-    // Frictionless path: a face match releases it with no typing.
+    // Frictionless paths, fastest first: the fingerprint reader (no camera, no
+    // typing) and then face. Both are identity proofs, so either releases it.
+    let fb0 = SystemFallback::system();
+    if fb0.fingerprint_available() && fb0.verify_fingerprint().unwrap_or(false) {
+        store.record_success();
+        return match store.load() {
+            Some(pw) => format!("ok\n{pw}"),
+            None => "notset".to_string(),
+        };
+    }
     let (mut face_v, attempts, face_live) = face::build();
     for _ in 0..attempts {
         if face_v.try_match() {

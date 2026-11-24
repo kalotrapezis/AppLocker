@@ -3,6 +3,49 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.5 — fingerprint first, a trust window, and the camera stops idling
+
+### Security
+- **A locked AppImage's inner binary is now gated too.** An AppImage runs its
+  real program out of its own FUSE mount (`/tmp/.mount_viberXXXX/AppRun`) — a
+  path with nothing in common with the `.appimage` file we lock, so an exec in
+  there used to sail straight past. The mount table is the missing link:
+  squashfuse records the image's name as the mount source, so the gate now
+  resolves any exec inside a `fuse.*` mount back to its source image and matches
+  that against the locked list (`LockList::matches_appimage_source`, longest
+  mount point wins, path-boundary checked). This closes "it starts another
+  instance": a stale mount left by an earlier allowed launch, an
+  `--appimage-extract-and-run` leftover, or anything else exec'ing inside an
+  already-mounted image. Found a stale `viber.appimage` mount still sitting in
+  `/tmp` on the dev box while investigating.
+
+### Changed
+- **Fingerprint is the default factor when a finger is enrolled**: reader →
+  face → PIN → password, in the gate *and* in the broker's sudo-password
+  release (which previously went straight to face). The unlock dialog now leads
+  with "Touch the fingerprint reader" instead of mentioning it last.
+- **The camera no longer runs the whole time the screen is locked.** Two bounds:
+  it only looks while the lock screen's display is actually lit (DRM `dpms` from
+  sysfs — free, no camera, and it blanks seconds after you leave and wakes the
+  instant anyone touches the machine), and after 6 misses with the screen
+  continuously on it drops to one look every 30s until the screen blanks and
+  wakes again. Walking up to a dark lock screen costs zero camera time; the old
+  behaviour polled every 5s for 3 minutes then every 30s forever.
+- **Trust window (your idea, and a sound one):** within 20 minutes of an
+  accepted fingerprint, or while a phone listed in
+  `~/.config/applocker/trusted-bt` is *connected* over Bluetooth, the lock
+  screen accepts a plain glance and skips the turn challenge. Outside that, the
+  challenge stands. The daemon stamps `/run/applocker/last-fingerprint` (tmpfs,
+  so a reboot drops the trust; mtime only, no identity in it) on every accepted
+  touch. The log line says which grant was used, so it is never a mystery why it
+  asked for a turn.
+  Caveats, stated rather than hidden: Bluetooth presence is a *weak* signal —
+  "connected" is not "the owner is at the keyboard", and it is nothing like
+  Apple's challenge-response to a worn Watch. That is why it is opt-in per MAC
+  and off until you write that file. And a fingerprint accepted by the *greeter*
+  (the opt-in `pam_fprintd` tier) does not stamp anything, because that path
+  never touches our code — only app/sudo unlocks open the window.
+
 ## 0.0.4 — no button: the lock screen lets you straight in
 
 ### Added

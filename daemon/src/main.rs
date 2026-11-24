@@ -1089,13 +1089,23 @@ fn handle_event(
         let guard = locks.read().unwrap();
         if is_exec {
             let by_path = guard.apps.matches(&path);
-            let matched = by_path.or_else(|| {
-                if is_flatpak_launcher {
-                    guard.apps.matches_flatpak_cmdline(&read_cmdline_tokens(pid))
-                } else {
-                    None
-                }
-            });
+            let matched = by_path
+                .or_else(|| {
+                    if is_flatpak_launcher {
+                        guard.apps.matches_flatpak_cmdline(&read_cmdline_tokens(pid))
+                    } else {
+                        None
+                    }
+                })
+                // A locked AppImage's real binary runs from the image's own FUSE
+                // mount, whose path ("/tmp/.mount_viberXXXX/AppRun") matches
+                // nothing we locked. Catches a second instance started from a
+                // stale mount, --appimage-extract-and-run leftovers, or anything
+                // else exec'ing inside the image after one allowed launch.
+                .or_else(|| {
+                    fuse_mount_source(&path)
+                        .and_then(|src| guard.apps.matches_appimage_source(&src))
+                });
             matched.map(|a| (a.key.clone(), a.name.clone()))
         } else {
             guard.folders.matches(&path).map(|f| (f.path.clone(), f.name.clone()))
@@ -1210,6 +1220,36 @@ fn handle_event(
 /// Is `pid` this daemon or one of its descendants? Walks the PPid chain in
 /// /proc (a handful of small reads; only runs for events that hit a lock). A
 /// vanished process reads as "not ours" — fail closed to the normal auth path.
+/// The mount source backing `path`, if `path` sits inside a FUSE mount — i.e.
+/// the AppImage file whose squashfs an exec is running out of. Longest matching
+/// mount point wins (nested mounts), and only `fuse.*` filesystems count, so a
+/// normal binary on a real disk never consults the lock list this way.
+fn fuse_mount_source(path: &str) -> Option<String> {
+    let mounts = fs::read_to_string("/proc/self/mounts").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(src), Some(mp), Some(fstype)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if !fstype.starts_with("fuse") {
+            continue;
+        }
+        let mp = unescape_mountinfo(mp);
+        if mp == "/" || !path.starts_with(&mp) {
+            continue;
+        }
+        // Require a path boundary so /tmp/.mount_ab can't claim /tmp/.mount_abc.
+        if path.len() > mp.len() && !path[mp.len()..].starts_with('/') {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(len, _)| mp.len() > *len) {
+            best = Some((mp.len(), unescape_mountinfo(src)));
+        }
+    }
+    best.map(|(_, src)| src)
+}
+
 /// Read `/proc/<pid>/cmdline` as its NUL-separated argv tokens (empty on any
 /// failure). Used to spot the flatpak app-id in a `flatpak`/`bwrap` launch.
 fn read_cmdline_tokens(pid: libc::c_int) -> Vec<String> {

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import gc
+import glob
 import json
 import os
 import subprocess
@@ -186,10 +187,66 @@ LOCKSCREEN_PAM = "/etc/pam.d/kde"
 # recognize.py sits next to us both in the repo and in the flat install layout.
 RECOGNIZE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recognize.py")
 
-# Dense attempts right after the lock (you stepped away for a coffee), then a
-# slow trickle so an hour later still works without the camera running flat out.
-UNLOCK_BURST = 180.0
+# The camera must not sit on all the while the screen is locked. Two bounds:
+#   1. we only look when the lock screen's display is actually ON (it blanks
+#      seconds after you walk away, and wakes the moment anyone touches the
+#      machine — a free sysfs read, no camera involved);
+#   2. after UNLOCK_TRIES misses with the screen continuously on (you're sitting
+#      there on your phone), we fall back to UNLOCK_SLOW_GAP until the screen
+#      blanks and wakes again.
+UNLOCK_TRIES = 6
 UNLOCK_SLOW_GAP = 30.0
+
+# A fingerprint touch is spoof-resistant, so for a while afterwards a plain
+# glance is enough and the turn challenge can be skipped (the Apple-style
+# "recent strong factor" trust window). Same for a trusted phone being
+# *connected* over Bluetooth — weaker, hence opt-in by listing its MAC.
+TRUST_WINDOW = 20 * 60
+FP_STAMP = "/run/applocker/last-fingerprint"
+TRUSTED_BT = os.path.expanduser("~/.config/applocker/trusted-bt")
+
+
+def screen_on() -> bool:
+    """Is any display actually lit? The DRM connectors' dpms state, straight
+    from sysfs — no camera, no D-Bus. Unknown (no readable connector) counts as
+    on, so a machine we can't read still gets face unlock."""
+    states = []
+    for f in glob.glob("/sys/class/drm/card*/card*/dpms"):
+        try:
+            with open(f) as fh:
+                states.append(fh.read().strip().lower())
+        except OSError:
+            pass
+    return (not states) or ("on" in states)
+
+
+def recent_fingerprint(window: float = TRUST_WINDOW) -> bool:
+    """Did a fingerprint check pass within `window` seconds? The daemon stamps
+    the file on every accepted touch; it lives on tmpfs, so a reboot clears the
+    trust rather than carrying it over."""
+    try:
+        return (time.time() - os.path.getmtime(FP_STAMP)) < window
+    except OSError:
+        return False
+
+
+def trusted_phone_near() -> bool:
+    """Is a phone from ~/.config/applocker/trusted-bt *connected* (not merely
+    paired) right now? One MAC per line. Empty/missing file → off."""
+    try:
+        with open(TRUSTED_BT) as f:
+            macs = [l.split("#", 1)[0].strip() for l in f]
+    except OSError:
+        return False
+    for mac in [m for m in macs if m]:
+        try:
+            out = subprocess.run(["bluetoothctl", "info", mac],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if "Connected: yes" in out:
+            return True
+    return False
 
 
 # Enabling this needs no root and no PAM edit: just the marker file. The PAM
@@ -211,7 +268,7 @@ def lockscreen_face_enabled() -> bool:
         return False
 
 
-def owner_at_screen(cam_index, timeout: float, liveness: bool) -> bool:
+def owner_at_screen(cam_index, timeout: float, liveness: bool = True) -> bool:
     """One identity check at LOCKSCREEN camera priority. True only on a match;
     every failure (busy camera, no face, not you) is False, so we stay locked.
 
@@ -660,8 +717,8 @@ def main() -> int:
                     help="unlock the screen on a plain face match, no turn "
                          "challenge — faster, but a photo could do it")
     ap.add_argument("--unlock-interval", type=float, default=5.0,
-                    help="seconds between unlock attempts in the first "
-                         f"{int(UNLOCK_BURST)}s after a lock")
+                    help=f"seconds between the first {UNLOCK_TRIES} unlock "
+                         "attempts after the lock screen lights up")
     ap.add_argument("--no-lock", action="store_true",
                     help="testing: log 'would lock' instead of locking the session")
     ap.add_argument("--brightness-once", action="store_true",
@@ -717,6 +774,7 @@ def main() -> int:
     def loop():
         next_snapshot_at = None  # monotonic deadline; None = not scheduled yet
         locked_since = None      # when the current lock started (unlock cadence)
+        unlock_state = {"misses": 0, "dark": False}
         next_brightness_at = time.monotonic()  # fire an initial adjust on startup
         while True:
             # Re-read config each tick so the settings GUI takes effect live:
@@ -748,18 +806,38 @@ def main() -> int:
             if unlock_on and session_locked():
                 if locked_since is None:
                     locked_since = time.monotonic()
-                if session_active():
-                    matched = owner_at_screen(
-                        args.camera, 5.0, not args.unlock_no_liveness)
-                    if matched and unlock_session():
-                        print("presence: face matched at the lock screen — "
-                              "session unlocked", file=sys.stderr)
-                        go_present()
-                        next_snapshot_at = None
-                        locked_since = None
-                        continue
-                dense = time.monotonic() - locked_since < UNLOCK_BURST
-                time.sleep(args.unlock_interval if dense else UNLOCK_SLOW_GAP)
+                if not session_active():
+                    time.sleep(3.0)
+                    continue
+                if not screen_on():
+                    # Lock screen is dark: nobody is looking at it, so there is
+                    # nothing to recognise. Camera stays off; this poll is free.
+                    unlock_state["dark"] = True
+                    time.sleep(3.0)
+                    continue
+                if unlock_state["dark"]:
+                    unlock_state["dark"] = False   # screen just woke → someone's here
+                    unlock_state["misses"] = 0
+                # A recent fingerprint, or your phone connected over Bluetooth,
+                # earns a plain glance; otherwise the turn challenge stands.
+                why = ("--unlock-no-liveness" if args.unlock_no_liveness
+                       else "recent fingerprint" if recent_fingerprint()
+                       else "trusted phone connected" if trusted_phone_near()
+                       else None)
+                if owner_at_screen(args.camera, 5.0, liveness=why is None) \
+                        and unlock_session():
+                    how = f"glance ({why})" if why else "face + liveness"
+                    print(f"presence: {how} matched at the lock screen — "
+                          "session unlocked", file=sys.stderr)
+                    go_present()
+                    next_snapshot_at = None
+                    locked_since = None
+                    unlock_state["misses"] = 0
+                    continue
+                unlock_state["misses"] += 1
+                time.sleep(args.unlock_interval
+                           if unlock_state["misses"] < UNLOCK_TRIES
+                           else UNLOCK_SLOW_GAP)
                 continue
             locked_since = None
 
@@ -845,11 +923,13 @@ def main() -> int:
     if args.no_unlock_face:
         print("lock-screen face unlock: off (--no-unlock-face)", file=sys.stderr)
     else:
-        live = "without" if args.unlock_no_liveness else "with"
-        print(f"lock-screen face unlock: follows the Settings toggle "
-              f"({LOCKSCREEN_PAM}), {live} liveness, every "
-              f"{args.unlock_interval:.0f}s for {int(UNLOCK_BURST)}s then "
-              f"every {int(UNLOCK_SLOW_GAP)}s", file=sys.stderr)
+        live = ("without liveness" if args.unlock_no_liveness
+                else "liveness unless a fingerprint in the last "
+                     f"{int(TRUST_WINDOW / 60)} min or a trusted phone")
+        print(f"lock-screen face unlock: on ({live}); only while the lock "
+              f"screen is lit, {args.unlock_interval:.0f}s apart for "
+              f"{UNLOCK_TRIES} tries, then {int(UNLOCK_SLOW_GAP)}s",
+              file=sys.stderr)
     Gtk.main()
     return 0
 

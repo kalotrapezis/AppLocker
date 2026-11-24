@@ -249,6 +249,23 @@ pub struct SystemFallback {
 /// by a password, and a missing fprintd can't weaken the sudo stack.
 pub const FPRINTD_SERVICE: &str = "applocker-fprintd";
 
+/// Where an accepted fingerprint is stamped. A touch is spoof-resistant, so for
+/// a while afterwards the lock screen accepts a plain glance instead of the turn
+/// challenge (`face/watch_presence.py` reads this). On tmpfs on purpose: a
+/// reboot must not carry the trust over. World-readable, mtime is the whole
+/// payload — it says "a finger was verified at <time>", nothing about whose.
+pub const FP_STAMP: &str = "/run/applocker/last-fingerprint";
+
+fn stamp_fingerprint() {
+    let dir = std::path::Path::new(FP_STAMP).parent();
+    if let Some(d) = dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Err(e) = std::fs::write(FP_STAMP, b"") {
+        eprintln!("applockerd: could not stamp {FP_STAMP}: {e}");
+    }
+}
+
 /// Has `user` enrolled at least one finger with fprintd? `fprintd-list` prints
 /// one `- #0: <finger>` line per enrolled finger and exits non-zero when there
 /// is no reader — exactly the "don't offer it" condition.
@@ -319,7 +336,11 @@ impl Fallback for SystemFallback {
     /// with an empty secret. Blocks until the user touches the reader or the
     /// module times out.
     fn verify_fingerprint(&self) -> Result<bool, String> {
-        pam::verify_password(FPRINTD_SERVICE, &self.user, "")
+        let ok = pam::verify_password(FPRINTD_SERVICE, &self.user, "")?;
+        if ok {
+            stamp_fingerprint();
+        }
+        Ok(ok)
     }
 }
 

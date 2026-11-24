@@ -41,6 +41,33 @@ Version bumps land in `dist/applocker_0.0.1-<letter>_amd64.deb`.
 
 ## P0 — core correctness (do first, in order)
 
+### [x] 0c. 0.0.5 — AppImage inner exec, fingerprint-first, trust window
+- User's hypothesis about Viber was RIGHT about the mechanism: an AppImage execs
+  its real binary from its own FUSE mount, a path the lock never matched. Gate
+  now resolves an exec inside any `fuse.*` mount to its mount SOURCE and matches
+  that (`matches_appimage_source`; source is usually the bare filename). Unit-
+  tested. A stale `viber.appimage` mount was found live in /tmp — exactly the
+  leftover that lets a second instance run unchecked.
+- Could NOT reproduce the open-after-failed-auth live: Viber only stays up while
+  the launching shell lives, and the gate isn't enabled on this host. The 0.0.3
+  watchdog fix and this one are independent; both were real.
+  - [ ] TO CONFIRM with the gate on: lock Viber, fail the PIN 3×, and check the
+    journal for `DENY (auth failed)` plus no second `allow` line for a
+    `/tmp/.mount_*` path.
+- Fingerprint is now the first factor everywhere (gate + broker get-sudo), dialog
+  leads with it. Order: fingerprint → face → PIN → password.
+- Camera duty cycle: only while the lock screen is LIT (DRM dpms, sysfs), 6 fast
+  tries then 30s until the screen blanks and wakes again.
+  - [ ] UNVERIFIED on this hardware: that dpms flips to Off when Plasma blanks
+    the locked screen (it read `On` while awake, which is all I could check with
+    the user at the keyboard). Check with `cat
+    /sys/class/drm/card1/card1-eDP-1/dpms` while the lock screen is dark. If it
+    stays On, the 6-tries backoff still bounds the camera to a look every 30s.
+- Trust window: 20 min after an accepted fingerprint (stamp
+  `/run/applocker/last-fingerprint`, tmpfs) or a connected phone from
+  `~/.config/applocker/trusted-bt` → glance without liveness. Greeter-side
+  fprintd does not stamp (not our code path).
+
 ### [x] 0b. 0.0.4 — "skip the confirmation on login": no button anywhere
 The greeter's Unlock button cannot be removed by a PAM module (plan 2f's open
 question, "why a button, can't it just enter"). Answered by not using PAM for

@@ -160,6 +160,24 @@ impl LockList {
             AppKind::Snap => false,
         })
     }
+
+    /// Does `source` name a locked AppImage? An AppImage runs its real binary
+    /// from its own FUSE mount (`/tmp/.mount_<name>XXXX/AppRun`), a path with
+    /// nothing in common with the `.appimage` file, so an exec in there slips
+    /// past [`matches`]. The mount table is the link: squashfuse records the
+    /// image's name as the mount source, which is what `source` is.
+    ///
+    /// Compared by basename because the source the kernel records is usually
+    /// bare (`viber.appimage`), not the full path we locked.
+    pub fn matches_appimage_source(&self, source: &str) -> Option<&LockedApp> {
+        if source.is_empty() {
+            return None;
+        }
+        let src_base = base(source);
+        self.apps.iter().find(|a| {
+            a.kind == AppKind::AppImage && !src_base.is_empty() && base(&a.key) == src_base
+        })
+    }
 }
 
 /// `$APPLOCKER_LOCKED_APPS`, else `/etc/applocker/locked-apps`.
@@ -176,6 +194,31 @@ mod tests {
 
     fn native(key: &str, name: &str) -> LockedApp {
         LockedApp { kind: AppKind::Native, key: key.into(), name: name.into() }
+    }
+
+    fn appimage(key: &str, name: &str) -> LockedApp {
+        LockedApp { kind: AppKind::AppImage, key: key.into(), name: name.into() }
+    }
+
+    /// A locked AppImage's inner exec (/tmp/.mount_*/AppRun) must still hit the
+    /// lock — found via the mount source, which is typically a bare filename.
+    #[test]
+    fn matches_appimage_through_its_mount_source() {
+        let mut l = LockList::default();
+        l.add(appimage("/home/teo/AppImages/viber.appimage", "Viber"));
+        assert!(l.matches_appimage_source("viber.appimage").is_some());
+        assert!(l.matches_appimage_source("/home/teo/AppImages/viber.appimage").is_some());
+        // Someone else's AppImage, and non-AppImage sources, must not match.
+        assert!(l.matches_appimage_source("winboat.appimage").is_none());
+        assert!(l.matches_appimage_source("").is_none());
+        assert!(l.matches_appimage_source("/dev/loop1").is_none());
+    }
+
+    #[test]
+    fn native_locks_dont_match_mount_sources() {
+        let mut l = LockList::default();
+        l.add(native("/usr/bin/steam", "Steam"));
+        assert!(l.matches_appimage_source("steam").is_none());
     }
 
     #[test]
