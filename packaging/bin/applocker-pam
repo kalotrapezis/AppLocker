@@ -29,7 +29,7 @@ MODULE="pam_applocker.so"
 # never strips the other one's line out of /etc/pam.d/kde.
 module_for() {
 	case "$1" in
-	fingerprint) echo "pam_fprintd.so" ;;
+	fingerprint|sudo-fingerprint) echo "pam_fprintd.so" ;;
 	*)           echo "$MODULE" ;;
 	esac
 }
@@ -39,6 +39,7 @@ file_for() {
 	sudo)        echo /etc/pam.d/sudo ;;           # terminal sudo
 	screenlock)  echo /etc/pam.d/kde ;;            # KDE kscreenlocker PAM service
 	fingerprint) echo /etc/pam.d/kde ;;            # same stack, pam_fprintd
+	sudo-fingerprint) echo /etc/pam.d/sudo ;;      # terminal sudo, pam_fprintd
 	screensaver) echo /etc/pam.d/cinnamon-screensaver ;;
 	lightdm)     echo /etc/pam.d/lightdm ;;
 	*)           echo "" ;;
@@ -66,7 +67,7 @@ line_for() {
 	screenlock)  printf 'auth\tsufficient\t%s\tpriority=lockscreen' "$MODULE" ;;
 	# sufficient + a short timeout: if the reader is ignored or broken, the
 	# stack falls straight through to the password field.
-	fingerprint) printf 'auth\tsufficient\tpam_fprintd.so\ttimeout=10' ;;
+	fingerprint|sudo-fingerprint) printf 'auth\tsufficient\tpam_fprintd.so\ttimeout=10' ;;
 	*)           printf 'auth\tsufficient\t%s' "$MODULE" ;;
 	esac
 }
@@ -96,7 +97,7 @@ enable_one() {
 	fi
 	line="$(line_for "$tier")"
 	mod="$(module_for "$tier")"
-	if [ "$tier" = "fingerprint" ]; then
+	if [ "$tier" = "fingerprint" ] || [ "$tier" = "sudo-fingerprint" ]; then
 		if ! ls /lib/*/security/pam_fprintd.so >/dev/null 2>&1; then
 			echo "skip fingerprint: pam_fprintd.so not installed (apt install libpam-fprintd)" >&2
 			return 0
@@ -154,7 +155,7 @@ disable_one() {
 }
 
 status() {
-	for tier in sudo screenlock fingerprint screensaver lightdm; do
+	for tier in sudo screenlock fingerprint sudo-fingerprint screensaver lightdm; do
 		f="$(file_for "$tier")"
 		mod="$(module_for "$tier")"
 		if [ ! -f "$f" ]; then
@@ -171,7 +172,7 @@ expand() { # "all" → the KDE-relevant live tiers
 	if [ "$1" = "all" ]; then echo "sudo screenlock"; else echo "$1"; fi
 }
 
-USAGE="usage: applocker-pam enable|disable sudo|screenlock|fingerprint|screensaver|lightdm|all
+USAGE="usage: applocker-pam enable|disable sudo|screenlock|fingerprint|sudo-fingerprint|screensaver|lightdm|all
        applocker-pam status"
 
 cmd="${1:-}"

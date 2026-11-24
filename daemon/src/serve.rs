@@ -354,7 +354,7 @@ fn run_ops(ops: &[Vec<String>]) -> Result<(), String> {
             // Root-only; that's why it rides the broker. Whitelist the tier so a
             // client can't pass an arbitrary applocker-pam argument.
             let tier = match op.get(1).map(String::as_str) {
-                Some(t @ ("sudo" | "screenlock" | "fingerprint")) => t,
+                Some(t @ ("sudo" | "screenlock" | "fingerprint" | "sudo-fingerprint")) => t,
                 other => return Err(format!("bad pam tier {other:?}")),
             };
             let action = match op.get(2).map(String::as_str) {

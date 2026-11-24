@@ -308,7 +308,30 @@ def read_lockscreen_policy() -> dict:
                     pol["password"] = any(t in toks for t in ("password", "sudo"))
     except OSError:
         pass
+    # The global switches are masters (policy.rs clamps the same way): a tier
+    # may narrow what is offered, never widen it past them.
+    pol["face"] = pol["face"] and _global_switch("face", path)
+    pol["fingerprint"] = pol["fingerprint"] and _global_switch("fingerprint", path)
+    pol["require_both"] = pol["require_both"] and pol["face"] and pol["fingerprint"]
     return pol
+
+
+def _global_switch(key: str, path: str) -> bool:
+    """One of the master on/off keys (`face`, `fingerprint`); default on for
+    fingerprint, off for face — matching policy.rs's defaults."""
+    default = key == "fingerprint"
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = (p.strip().lower() for p in line.split("=", 1))
+                if k == key:
+                    return v in _TRUE
+    except OSError:
+        pass
+    return default
 
 
 def lockscreen_configured() -> bool:

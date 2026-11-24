@@ -3,6 +3,34 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.29 — master switches master, and the veto stops poisoning honest touches
+
+### Fixed
+- **"Face unlock is off and it still needs it for apps."** True, and my bug: a
+  per-place method list written while face was on kept naming it, and the tier
+  won over the master switch. The globals now **clamp** every tier — a place
+  may narrow what is offered, never widen it past Settings. Same for files
+  ("hide and unhide with face when off"). Clamped in `policy.rs` and in the two
+  Python readers that parse the config themselves, with a test.
+- **"AppLocker itself does not open with finger."** It *was* trying: the
+  journal shows `fingerprint unusable: fprintd disowned the driver's match`.
+  The veto looked back a **whole minute**, so one disowned match made every
+  honest touch in the next 60s look fraudulent too — which is exactly why the
+  finger worked in apps sometimes and never on a retry. It now reads only what
+  the current attempt produced.
+
+### Added
+- **`applocker-pam enable sudo-fingerprint`** — `pam_fprintd` in
+  `/etc/pam.d/sudo`, for "no sudo with Fingerprint in Terminal". Opt-in and
+  **not enabled**: our veto cannot reach that stack, so a fabricated match
+  there grants **root**, not just an app. On a reader that has already produced
+  one, I would leave this off.
+
+### Still as designed
+"Files … no finger": a hide/reveal is silent — it cannot ask you to touch the
+sensor. The reader only counts there through `both`, where a recent accepted
+fingerprint stands in as the second factor.
+
 ## 0.0.28 — the files tier is wired, and the watcher survives a stopped service
 
 - **Hide-and-reveal follows the `files` tier.** The silent camera check now

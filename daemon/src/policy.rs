@@ -241,6 +241,15 @@ impl Policy {
             p.allow_pin = true;
             p.allow_sudo = true;
         }
+        // The global switches are masters: a tier may narrow what is offered,
+        // never widen it past them. Without this, "Face unlock: off" in Settings
+        // left apps and files still asking for a face, because their method
+        // lists were written while it was on.
+        let clamp = |t: &mut TierPolicy, face_on: bool, fp_on: bool| {
+            t.face &= face_on;
+            t.fingerprint &= fp_on;
+            t.require_both &= t.face && t.fingerprint;
+        };
         let inherited = TierPolicy {
             face: p.face_enabled,
             fingerprint: p.allow_fingerprint,
@@ -258,6 +267,10 @@ impl Policy {
         if !seen_tiers.contains("files") {
             p.files = inherited;
         }
+        let (face_on, fp_on) = (p.face_enabled, p.allow_fingerprint);
+        clamp(&mut p.apps, face_on, fp_on);
+        clamp(&mut p.lockscreen, face_on, fp_on);
+        clamp(&mut p.files, face_on, fp_on);
         p
     }
 
@@ -447,6 +460,27 @@ mod tests {
 
         TierPolicy::parse_methods("none", &mut t);
         assert!(!t.any_biometric() && !t.pin && !t.password);
+    }
+
+    /// The global switches are masters: turning face off in Settings must stop
+    /// apps and files asking for it, even though their lists still name it.
+    #[test]
+    fn global_switches_clamp_the_tiers() {
+        let path = tmp("clamp");
+        std::fs::write(
+            &path,
+            "face = off\nfingerprint = on\nfallback = sudo\n\
+             apps_methods = fingerprint, face, password\n\
+             files_methods = fingerprint, face, both, password\n",
+        )
+        .unwrap();
+        let p = Policy::load(&path);
+        assert!(!p.apps.face, "face off globally → not used for apps");
+        assert!(p.apps.fingerprint, "fingerprint stays, it is on globally");
+        assert!(!p.files.face);
+        assert!(!p.files.require_both, "cross-check needs both factors present");
+        assert!(p.files.password, "non-biometric methods are untouched");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// An old config with no per-tier keys must behave exactly as before.

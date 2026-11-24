@@ -189,7 +189,28 @@ def read_files_tier() -> dict:
                     tier["require_both"] = any(t in toks for t in ("both", "require-both"))
     except OSError:
         pass
+    # Masters win, exactly as policy.rs clamps them: "Face unlock: off" in
+    # Settings must stop the silent reveal using a face, whatever the tier line
+    # was written with.
+    tier["face"] = tier["face"] and _global_switch("face", path, False)
+    tier["fingerprint"] = tier["fingerprint"] and _global_switch("fingerprint", path, True)
+    tier["require_both"] = tier["require_both"] and tier["face"] and tier["fingerprint"]
     return tier
+
+
+def _global_switch(key: str, path: str, default: bool) -> bool:
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = (p.strip().lower() for p in line.split("=", 1))
+                if k == key:
+                    return v in ("on", "true", "1", "yes", "enabled")
+    except OSError:
+        pass
+    return default
 
 
 def recent_fingerprint(window: float = FP_TRUST_WINDOW) -> bool:

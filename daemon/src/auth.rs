@@ -370,10 +370,29 @@ fn log_disowns_the_match(log: &str) -> bool {
     BOGUS_MATCH_MARKERS.iter().any(|m| log.contains(m))
 }
 
-/// Did fprintd disown a match in the last minute? Root-only read, bounded.
-fn fprintd_disowned_recent_match() -> bool {
+/// Journal cutoff string for "since this attempt started". A whole-minute
+/// window used to poison honest touches: one disowned match made every retry
+/// in the next 60s look fraudulent too, which is why unlocking by finger
+/// seemed to work sometimes and never on a second try.
+fn journal_cutoff(since: std::time::SystemTime) -> String {
+    let secs = since
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    std::process::Command::new("date")
+        .args(["-d", &format!("@{secs}"), "+%Y-%m-%d %H:%M:%S"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "-30sec".to_string())
+}
+
+/// Did fprintd disown the match for *this* attempt? Root-only read, bounded.
+fn fprintd_disowned_match_since(since: std::time::SystemTime) -> bool {
+    let cutoff = journal_cutoff(since);
     match std::process::Command::new("journalctl")
-        .args(["-u", "fprintd", "--no-pager", "-S", "-1min"])
+        .args(["-u", "fprintd", "--no-pager", "-S", &cutoff])
         .output()
     {
         Ok(o) => log_disowns_the_match(&String::from_utf8_lossy(&o.stdout)),
@@ -521,6 +540,8 @@ impl Fallback for SystemFallback {
     /// with an empty secret. Blocks until the user touches the reader or the
     /// module times out.
     fn verify_fingerprint(&self) -> Result<bool, String> {
+        // Timestamp first: the veto must only read what this attempt produced.
+        let started = std::time::SystemTime::now();
         let ok = match pam::verify_password(FPRINTD_SERVICE, &self.user, "") {
             Ok(v) => v,
             Err(e) => {
@@ -533,7 +554,7 @@ impl Fallback for SystemFallback {
         // reported a match providing a scanned print that is not matching any in
         // the gallery" at the same seconds. libfprint knows the match was
         // rubbish; PAM just doesn't pass that on. So we ask the log.
-        if ok && fprintd_disowned_recent_match() {
+        if ok && fprintd_disowned_match_since(started) {
             // Err, not Ok(false): the reader is not *rejecting* anyone, it is
             // malfunctioning. The difference matters when both factors are
             // required — a broken reader must step aside, not lock you out.
