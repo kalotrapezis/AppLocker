@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
-use applockerd::auth::{self, Fallback, Outcome, SystemFallback};
+use applockerd::auth::{self, FaceVerifier, Fallback, Outcome, SystemFallback};
 use applockerd::desktop::{self, AppKind};
 use applockerd::face;
 use applockerd::feedback::{ClosingPrompter, FaceWithFeedback, Feedback, FallbackWithFeedback};
@@ -828,7 +828,11 @@ fn cmd_auth_test(app: Option<String>) {
     } else {
         Feedback::none()
     }));
-    let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
+    let mut face: Box<dyn FaceVerifier> = if face_live {
+        Box::new(FaceWithFeedback::new(face, fb.clone(), attempts))
+    } else {
+        face
+    };
     let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app, face_live), fb.clone());
     let fallback = FallbackWithFeedback::new(system, fb);
     let pol = policy::load_default();
@@ -839,7 +843,7 @@ fn cmd_auth_test(app: Option<String>) {
         pol.summary(),
     );
 
-    match auth::run(&cfg, &mut face, &mut prompter, &fallback) {
+    match auth::run(&cfg, face.as_mut(), &mut prompter, &fallback) {
         Outcome::Allowed => println!("ALLOWED"),
         Outcome::Denied => {
             println!("DENIED");
@@ -1253,7 +1257,14 @@ fn handle_event(
                     } else {
                         Feedback::none()
                     }));
-                    let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
+                    // Only narrate a face check that is really happening: with
+                    // face off the verifier is a stub, and the window used to
+                    // play "Looking for you… ✕" over nothing at all.
+                    let mut face: Box<dyn FaceVerifier> = if face_live {
+                        Box::new(FaceWithFeedback::new(face, fb.clone(), attempts))
+                    } else {
+                        face
+                    };
                     let mut prompter = Announcing::new(
                         ClosingPrompter::new(
                             GuiPrompter::new(&app_inner, face_live),
@@ -1263,7 +1274,7 @@ fn handle_event(
                     );
                     let after = fb.clone();
                     let fallback = FallbackWithFeedback::new(system, fb);
-                    let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
+                    let outcome = auth::run(&cfg, face.as_mut(), &mut prompter, &fallback);
                     // A strict cross-check refusal has no prompt to explain
                     // itself, so the window has to say why the app didn't open.
                     if cfg.cross_denies && matches!(outcome, Outcome::Denied) {

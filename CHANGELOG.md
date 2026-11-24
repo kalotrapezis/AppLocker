@@ -3,6 +3,19 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.20 — with face off, stop pretending to look for a face
+
+Reported: "I have face off and it still checks face and finger." The camera was
+genuinely not running — `matching against N profile(s)` never appears in the
+journal with face off — but the feedback window still played "Looking for you…"
+and then a red ✕, because 0.0.14 wrapped the verifier in `FaceWithFeedback`
+unconditionally. With face disabled that verifier is a stub, so the window was
+narrating a check that did not exist, and the ✕ looked like a failed face scan
+holding the unlock up.
+
+The wrapper is now only used when face is actually live. With face off and the
+reader on, the window shows the reader and nothing else.
+
 ## 0.0.19 — a broken reader steps aside instead of locking you out
 
 Reported straight after 0.0.16 went in: "cross check does not work for apps, it

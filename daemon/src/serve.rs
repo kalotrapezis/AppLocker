@@ -304,11 +304,15 @@ fn authenticate(reason: &str) -> bool {
     } else {
         Feedback::none()
     }));
-    let mut face = FaceWithFeedback::new(face_v, fb.clone(), attempts);
+    let mut face: Box<dyn FaceVerifier> = if face_live {
+        Box::new(FaceWithFeedback::new(face_v, fb.clone(), attempts))
+    } else {
+        face_v
+    };
     let mut prompter = ClosingPrompter::new(GuiPrompter::new(reason, face_live), fb.clone());
     let fallback = FallbackWithFeedback::new(system, fb);
     matches!(
-        auth::run(&cfg, &mut face, &mut prompter, &fallback),
+        auth::run(&cfg, face.as_mut(), &mut prompter, &fallback),
         Outcome::Allowed
     )
 }
@@ -449,7 +453,11 @@ fn get_sudo(reason: &str) -> String {
     ));
     let fb0 = FallbackWithFeedback::new(fb0, win.clone());
     let finger_live = fb0.fingerprint_available();
-    let mut face_v = FaceWithFeedback::new(face_v, win.clone(), attempts);
+    let mut face_v: Box<dyn FaceVerifier> = if face_live {
+        Box::new(FaceWithFeedback::new(face_v, win.clone(), attempts))
+    } else {
+        face_v
+    };
     let release = |store: &sudopass::Store| -> String {
         store.record_success();
         match store.load() {
