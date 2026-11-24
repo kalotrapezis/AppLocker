@@ -87,6 +87,20 @@ and that looked like a bypass. NOT the watchdog (0.0.3), NOT the AppImage mount
 - [ ] THE REAL FIX for the original complaint: show a brief "Face recognised"
   confirmation on an allow, so a silent pass doesn't read as "no lock at all".
 
+### [ ] 0j. THREAT MODEL IS "a child tries to open it" (user, 2026-11-24)
+Changes what matters: patience beats cleverness, so nothing may open by waiting.
+- [x] 0.0.17: an ignored prompt now DENIES (was: 5-min grace then fail-OPEN).
+  Fail-open survives only for the case where nobody could be asked yet.
+- [ ] DECIDE: the pre-prompt fail-open (60s, hung camera / no GUI) still ALLOWS.
+  For child-proofing it arguably should deny — a lock that opens when it
+  malfunctions is not a lock. Downside: a broken auth stack makes every locked
+  app unlaunchable until `systemctl stop applockerd`.
+- [ ] GAP: AppImages are locked by path (+ mount-source basename since 0.0.5).
+  Copying is caught, RENAMING is not: `cp viber.appimage ~/game.appimage` runs
+  unlocked. Fix = match on content hash (cache by inode+mtime), not name.
+- [ ] Consider: a child can also just wait for a parent-unlocked session. The
+  `reauth = every launch` setting (already on here) is what limits that.
+
 ### [!] 0i. FINGERPRINT BYPASS — REAL, OBSERVED, now opt-in (0.0.12)
 14:29:13-16: three locked Zen launches `allow (auth passed)` with NO finger, NO
 face (no `matching against` lines), NO dialog, NO password. fprintd logged three

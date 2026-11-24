@@ -179,13 +179,37 @@ const PROMPT_GRACE: Duration = Duration::from_secs(300);
 /// Wait for the auth verdict. `(allowed, timed_out)`; `timed_out` means we
 /// fail-opened and the result must not be cached.
 fn wait_for_verdict(rx: &std::sync::mpsc::Receiver<AuthMsg>, deadline: Duration) -> (bool, bool) {
+    wait_for_verdict_with_grace(rx, deadline, PROMPT_GRACE)
+}
+
+/// The testable form: `grace` is how long a dialog on screen gets.
+fn wait_for_verdict_with_grace(
+    rx: &std::sync::mpsc::Receiver<AuthMsg>,
+    deadline: Duration,
+    grace: Duration,
+) -> (bool, bool) {
     let mut budget = deadline;
+    let mut asked = false;
     loop {
         match rx.recv_timeout(budget) {
             Ok(AuthMsg::Done(a)) => return (a, false),
-            // Restart the clock on the longer, human-paced budget.
-            Ok(AuthMsg::Prompting) => budget = PROMPT_GRACE,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return (true, true),
+            // A dialog is up: restart the clock on the human-paced budget.
+            Ok(AuthMsg::Prompting) => {
+                asked = true;
+                budget = grace;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Fail OPEN only while nobody could be asked — a hung
+                // recognizer, no display. Once a dialog has been put in front
+                // of someone and ignored, that is an answer: deny. Otherwise
+                // the lock is beaten by waiting, which is exactly what a child
+                // locked out of an app will do.
+                if asked {
+                    println!("DENY (prompt ignored for {}s)", grace.as_secs());
+                    return (false, false);
+                }
+                return (true, true);
+            }
             // Auth thread died without answering: deny, don't wave it through.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return (false, false),
         }
@@ -1383,6 +1407,19 @@ mod tests {
         // Nothing at all within the deadline: fail open, flagged as a timeout
         // so the caller never caches it.
         assert_eq!(wait_for_verdict(&rx, short), (true, true));
+
+        // An ignored dialog must NOT become an allow: waiting it out is the
+        // obvious way for someone locked out to beat the lock.
+        let (tx_ignored, rx_ignored) = std::sync::mpsc::channel::<AuthMsg>();
+        tx_ignored.send(AuthMsg::Prompting).unwrap();
+        // Keep the sender alive so this is a timeout, not a disconnect.
+        let held = tx_ignored;
+        assert_eq!(
+            wait_for_verdict_with_grace(&rx_ignored, short, Duration::from_millis(60)),
+            (false, false),
+            "an unanswered prompt denies"
+        );
+        drop(held);
 
         // A dialog went up, then the user answered well past the short
         // deadline — must be the real verdict, not a fail-open allow.

@@ -3,6 +3,28 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.17 — an ignored prompt is a "no", not a "yes" after five minutes
+
+The purpose of the locks turns out to be keeping a child out of certain apps.
+Against that, the enemy is not cleverness — it is **patience**. And 0.0.3's
+prompt grace handed it over: once a dialog was on screen the deadline became
+five minutes, and the timeout still **allowed**. Launch a locked app, walk away,
+come back in five minutes, and it had opened itself.
+
+- A timeout **after** a prompt was shown now denies, and logs `DENY (prompt
+  ignored for 300s)`. Being asked and not answering is an answer.
+- A timeout **before** anyone could be asked still fails open, which is what
+  that watchdog was for: a hung recognizer or no display, where nobody is being
+  given the choice at all.
+
+### Known gap for this threat model (not fixed yet)
+An AppImage is locked by its **path**, plus its mount-source basename since
+0.0.5. So copying `viber.appimage` somewhere else is still caught, but
+**renaming it is not** — `cp viber.appimage ~/game.appimage` runs unlocked.
+Closing that properly means matching on content (a hash of the image, cached by
+inode+mtime) rather than a name. Worth doing if the child is old enough to think
+of it.
+
 ## 0.0.16 — with both biometrics on, they are cross-checked
 
 Asked for directly: "if fingerprint and face is on, cross reference". So when
