@@ -307,6 +307,7 @@ mod tests {
         let path = tmp("sudo_only");
         let pol = Policy {
             face_enabled: false,
+            allow_fingerprint: true,
             allow_pin: false,
             allow_sudo: true,
             reauth_every_time: false,
@@ -320,7 +321,7 @@ mod tests {
         assert_eq!(loaded, pol);
         assert_eq!(
             loaded.summary(),
-            "face off, fallback: sudo, re-auth: once per session, attention off, apps on"
+            "face off, fingerprint on, fallback: sudo, re-auth: once per session, attention off, apps on"
         );
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
@@ -332,6 +333,7 @@ mod tests {
         let path = tmp("face_both");
         let pol = Policy {
             face_enabled: true,
+            allow_fingerprint: true,
             allow_pin: true,
             allow_sudo: true,
             reauth_every_time: true,
@@ -351,6 +353,7 @@ mod tests {
     fn empty_fallback_rejected_on_save() {
         let pol = Policy {
             face_enabled: true,
+            allow_fingerprint: true,
             allow_pin: false,
             allow_sudo: false,
             reauth_every_time: false,
