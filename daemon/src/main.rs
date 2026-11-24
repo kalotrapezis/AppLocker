@@ -48,6 +48,7 @@
 //! enforcement (`applocker on`) is validated in a throwaway VM, not the host.
 
 use std::ffi::CString;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::time::Duration;
@@ -926,7 +927,18 @@ fn cmd_gate(adhoc: Option<String>) {
         // someone started it in dev mode. A clean exit just stops.
         process::exit(0);
     }
-    if let Err(e) = mark_scope(fan_fd, &mark, mask) {
+    let mut marked_devices = HashSet::new();
+    if mark.filesystem {
+        // Every local filesystem, not just the one holding `/`: /tmp is a
+        // separate tmpfs, so a gate that marks only `/` is dodged by copying
+        // the app there and running it. Found exactly that way.
+        let n = mark_all_filesystems(fan_fd, mask, &mut marked_devices);
+        if n == 0 {
+            eprintln!("applockerd: fanotify_mark failed on every filesystem");
+            process::exit(1);
+        }
+        spawn_mount_watcher(fan_fd, mask, marked_devices.clone());
+    } else if let Err(e) = mark_scope(fan_fd, &mark, mask) {
         eprintln!("applockerd: fanotify_mark failed: {e}");
         process::exit(1);
     }
@@ -936,7 +948,11 @@ fn cmd_gate(adhoc: Option<String>) {
 
     let fail_open = fail_open_timeout();
     if mark.filesystem {
-        eprintln!("applockerd: gating {n_apps} app(s) on / (WHOLE SYSTEM, exec-only).");
+        eprintln!(
+            "applockerd: gating {n_apps} app(s) on {} filesystem(s) (WHOLE SYSTEM, \
+             exec-only); new mounts are gated as they appear.",
+            marked_devices.len()
+        );
     } else {
         eprintln!("applockerd: *** TEST SCOPE *** gating only the '{}' mount — the rest of", mark.path);
         eprintln!("applockerd: the system is NOT gated and cannot freeze. {n_apps} app(s).");
@@ -1013,6 +1029,103 @@ fn init_fanotify() -> std::io::Result<RawFd> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(fd)
+}
+
+/// Filesystem types worth gating. `tmpfs` is in deliberately — /tmp is tmpfs,
+/// and "copy it to /tmp and run it there" is the simplest way past a gate that
+/// only marks `/`. squashfs is in for snaps.
+const GATED_FSTYPES: [&str; 13] = [
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "zfs", "vfat", "exfat", "ntfs3",
+    "tmpfs", "squashfs", "udf",
+];
+
+/// Every local filesystem the gate should mark, as (device-id, mount point),
+/// one entry per filesystem — the first mount point seen for each device.
+///
+/// Pseudo filesystems (proc, sysfs, cgroup…) hold nothing executable we care
+/// about. Network mounts are skipped on purpose: a permission event answered
+/// across an unresponsive server is a hang. FUSE is skipped too — our handler
+/// resolves the event path through /proc, and a FUSE daemon blocked behind our
+/// own pending event is a deadlock; locked AppImages are already matched by
+/// their mount *source* instead.
+fn gateable_filesystems() -> Vec<(String, String)> {
+    match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(mi) => parse_gateable(&mi),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Pure half of [`gateable_filesystems`], so the mountinfo parsing is testable.
+fn parse_gateable(mi: &str) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for line in mi.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // id parent major:minor root MOUNTPOINT opts... - FSTYPE source opts
+        let Some(sep) = f.iter().position(|w| *w == "-") else {
+            continue;
+        };
+        if f.len() < 3 || sep + 1 >= f.len() {
+            continue;
+        }
+        let (dev, mount_point, fstype) = (f[2], unescape_mountinfo(f[4]), f[sep + 1]);
+        if !GATED_FSTYPES.contains(&fstype) {
+            continue;
+        }
+        if seen.insert(dev.to_string()) {
+            out.push((dev.to_string(), mount_point));
+        }
+    }
+    out
+}
+
+
+/// Mark every gateable filesystem. Returns how many are now marked; failures
+/// are logged and skipped rather than fatal, so one odd mount can't stop the
+/// gate protecting everything else.
+fn mark_all_filesystems(
+    fan_fd: RawFd,
+    mask: u64,
+    already: &mut HashSet<String>,
+) -> usize {
+    let mut added = 0;
+    for (dev, mount_point) in gateable_filesystems() {
+        if already.contains(&dev) {
+            continue;
+        }
+        let spec = MarkSpec { path: mount_point.clone(), filesystem: true };
+        match mark_scope(fan_fd, &spec, mask) {
+            Ok(()) => {
+                already.insert(dev);
+                added += 1;
+                println!("mark   {mount_point}");
+            }
+            Err(e) => eprintln!("applockerd: could not gate {mount_point}: {e}"),
+        }
+    }
+    added
+}
+
+/// Watch for new mounts (a USB stick, a fresh tmpfs) and gate them too.
+/// `poll` on mountinfo wakes on any mount-table change; the 5s timeout is a
+/// belt-and-braces re-scan in case that wake is missed.
+fn spawn_mount_watcher(fan_fd: RawFd, mask: u64, already: HashSet<String>) {
+    thread::spawn(move || {
+        let mut known = already;
+        let Ok(file) = fs::File::open("/proc/self/mountinfo") else {
+            eprintln!("applockerd: cannot watch for new mounts; they will not be gated");
+            return;
+        };
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+        loop {
+            let mut pfd = libc::pollfd { fd, events: libc::POLLPRI | libc::POLLERR, revents: 0 };
+            unsafe { libc::poll(&mut pfd, 1, 5_000) };
+            let n = mark_all_filesystems(fan_fd, mask, &mut known);
+            if n > 0 {
+                println!("mark   {n} newly mounted filesystem(s) now gated");
+            }
+        }
+    });
 }
 
 fn mark_scope(fan_fd: RawFd, spec: &MarkSpec, mask: u64) -> std::io::Result<()> {
@@ -1474,6 +1587,38 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<AuthMsg>();
         drop(tx);
         assert_eq!(wait_for_verdict(&rx, Duration::from_secs(5)), (false, false));
+    }
+
+    /// /tmp is a separate tmpfs; missing it is how a locked app got run from
+    /// there with no gate event at all.
+    #[test]
+    fn gateable_picks_real_filesystems_including_tmp() {
+        let mi = "\
+25 30 0:23 / /proc rw,relatime - proc proc rw
+26 30 0:24 / /sys rw,relatime - sysfs sysfs rw
+30 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw
+41 30 0:45 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw
+42 30 0:45 / /tmp/again rw - tmpfs tmpfs rw
+48 30 0:46 / /run rw - tmpfs tmpfs rw
+60 30 7:1 / /snap/core/1 ro - squashfs /dev/loop1 ro
+70 30 0:60 / /mnt/nas rw - nfs4 server:/export rw
+80 30 0:61 / /tmp/.mount_viberXX ro - fuse.viber.appimage viber.appimage ro
+90 30 8:1 / /mnt/my\\040stick rw - vfat /dev/sdb1 rw
+";
+        let got = parse_gateable(mi);
+        let points: Vec<&str> = got.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(points.contains(&"/"), "root");
+        assert!(points.contains(&"/tmp"), "tmpfs /tmp — the hole this closes");
+        assert!(points.contains(&"/run"));
+        assert!(points.contains(&"/snap/core/1"), "squashfs (snaps)");
+        assert!(points.contains(&"/mnt/my stick"), "octal-escaped mount point");
+        assert!(!points.contains(&"/proc") && !points.contains(&"/sys"), "pseudo fs skipped");
+        assert!(!points.contains(&"/mnt/nas"), "network fs skipped (hang risk)");
+        assert!(
+            !points.iter().any(|m| m.starts_with("/tmp/.mount_")),
+            "FUSE skipped (deadlock risk); AppImages are matched by mount source"
+        );
+        assert!(!points.contains(&"/tmp/again"), "one mark per filesystem, not per mount");
     }
 
     #[test]

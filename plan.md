@@ -87,6 +87,16 @@ and that looked like a bypass. NOT the watchdog (0.0.3), NOT the AppImage mount
 - [ ] THE REAL FIX for the original complaint: show a brief "Face recognised"
   confirmation on an allow, so a silent pass doesn't read as "no lock at all".
 
+### [x] 0k. 0.0.22 — THE GATE ONLY MARKED `/` (biggest hole of the day)
+/tmp is tmpfs = a different filesystem, so `cp app /tmp && /tmp/app` produced
+NO fanotify event at all. Every protection built today was bypassed by it.
+Found by testing the rename defence: the copy ran, journal silent.
+- Now marks every local fs (one per device) incl. tmpfs and squashfs, and gates
+  new mounts as they appear (poll on /proc/self/mountinfo + 5s backstop).
+- Skipped on purpose: pseudo fs, network (hang risk), FUSE (deadlock risk —
+  AppImages covered by mount-source matching instead).
+- Parser unit-tested (octal escapes, dedupe per device, each skip rule).
+
 ### [ ] 0j. THREAT MODEL IS "a child tries to open it" (user, 2026-11-24)
 Changes what matters: patience beats cleverness, so nothing may open by waiting.
 - [x] 0.0.17: an ignored prompt now DENIES (was: 5-min grace then fail-OPEN).

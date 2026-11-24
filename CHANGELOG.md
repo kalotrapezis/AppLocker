@@ -3,6 +3,27 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.22 — the gate covers every filesystem, not just `/`
+
+The hole behind everything else: **`/tmp` is tmpfs, a different filesystem, and
+the gate only marked `/`.** No fanotify event was generated there at all, so
+copying a locked app to `/tmp` and running it walked past the lock, the
+cross-check and the content matching alike. Found while testing the rename
+defence — the copy ran, and the journal had nothing to say about it.
+
+- Every local filesystem is marked now (one mark per device, not per mount):
+  ext2/3/4, xfs, btrfs, f2fs, zfs, vfat, exfat, ntfs3, **tmpfs**, squashfs
+  (snaps), udf.
+- **New mounts are gated as they appear** — a USB stick plugged in later is
+  covered, via `poll` on `/proc/self/mountinfo` with a 5s backstop re-scan.
+- Deliberately skipped, each for a reason: pseudo filesystems (nothing
+  executable worth gating), **network** mounts (answering a permission event
+  across an unresponsive server is a hang), and **FUSE** (our handler resolves
+  the event path through /proc, and a FUSE daemon blocked behind our own
+  pending event is a deadlock — locked AppImages are already matched by their
+  mount *source* instead).
+- One filesystem failing to mark is logged and skipped, not fatal.
+
 ## 0.0.21 — a dead reader stops costing you six seconds per launch
 
 "If face is off and fingerprint is disconnected go to sudo." It already did —
