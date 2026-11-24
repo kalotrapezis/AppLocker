@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=AppLocker hidden-files auto-reveal
+Comment=Reveals hidden files with a silent face check when you open the folder (idle if nothing is hidden)
+Exec=python3 /usr/lib/applocker/hide_watch.py
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

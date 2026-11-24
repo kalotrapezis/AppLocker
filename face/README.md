@@ -75,10 +75,13 @@ through to the PIN/sudo prompt, so a broken camera never locks you out.
 Recognition and presence are **deliberately different strengths**:
 
 - **Recognition (unlock) — strong.** "Is this *me*?" Runs only when you unlock.
-- **Presence (attention) — lenient, identity-blind.** "Is *a* face there?" Runs
-  continuously while unlocked (`attention.py`). It never checks *who* — so it
-  doesn't react to a passer-by, and a glance down at the screen doesn't lock you
-  (any detected frame resets the absence clock). Using the strong identity model
+- **Presence (attention) — lenient, identity-blind.** "Is *a* face there?" The
+  camera is **not** held open: the watcher (`watch_presence.py`) only wakes it
+  once the session goes idle (no keyboard/mouse), grabs a *single* frame every
+  couple of minutes, and releases it. It never checks *who* — so it doesn't
+  react to a passer-by — and a single empty snapshot only dims (warns); it takes
+  `--misses` empty snapshots in a row to lock, so a glance down never locks you
+  (`attention.py` counts consecutive misses). Using the strong identity model
   here would fight you constantly; that's the whole point of the split.
 
 ## Recognition backends

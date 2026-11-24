@@ -1,0 +1,57 @@
+#!/bin/sh
+# applocker — one command to turn AppLocker on or off.
+#
+#   sudo applocker on       # enforce locked apps + folders (the GATE only)
+#   sudo applocker off      # stop the gate and remove any PAM hooks left behind
+#   applocker status        # what's currently active
+#
+# "on" now enables ONLY the gate service. It deliberately does NOT touch PAM
+# (/etc/pam.d/*) — that path can lock you out of login/sudo and is the wrong
+# integration on KDE. Face/PIN on the lockscreen or for `sudo` is a separate,
+# explicit, later step done by hand in a VM with a root TTY open:
+#   sudo applocker-pam enable sudo        # (advanced; risk of lockout)
+set -eu
+
+need_root() {
+	[ "$(id -u)" -eq 0 ] || { echo "applocker: run as root (use sudo)" >&2; exit 1; }
+}
+
+case "${1:-}" in
+on)
+	need_root
+	echo "==> gate service (locked apps + folders)"
+	systemctl enable --now applockerd.service
+	# The broker (PIN/face for Settings + sudo autocomplete) is safe and separate.
+	systemctl enable --now applockerd-broker.service 2>/dev/null || true
+	cat <<'MSG'
+
+AppLocker gate is ON: locked apps/folders are enforced (face → PIN → sudo).
+This did NOT touch PAM — your login and terminal `sudo` are unchanged.
+
+If launches still aren't blocked, you're on a DEV build (the gate is a no-op so
+it can't freeze). Check:  journalctl -u applockerd.service -e
+and install the RELEASE build to actually enforce (VM only, snapshot first).
+
+Undo:  sudo applocker off
+MSG
+	;;
+off)
+	need_root
+	systemctl disable --now applockerd.service 2>/dev/null || true
+	# Still remove any PAM hooks a previous (old) `on` may have installed, so this
+	# is always a clean, safe undo even after the Mint-era script ran.
+	applocker-pam disable all 2>/dev/null || true
+	applockerd set-attention off >/dev/null || true
+	echo "AppLocker is OFF (gate stopped; any PAM hooks removed)."
+	;;
+status)
+	printf 'gate service: '
+	systemctl is-active applockerd.service 2>/dev/null || echo inactive
+	echo "policy: $(applockerd config 2>/dev/null | sed -n '2p' | sed 's/^ *//')"
+	applocker-pam status
+	;;
+*)
+	echo "usage: applocker on|off|status" >&2
+	exit 2
+	;;
+esac

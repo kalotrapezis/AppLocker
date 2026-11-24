@@ -156,6 +156,91 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// ── authenticated encryption (machine-local secret-box) ──────────────────────
+//
+// We can't pull in `aes-gcm` (no crates.io), so we build a small authenticated
+// cipher from the HMAC-SHA256 we already have: a CTR-style keystream (HMAC as a
+// PRF over nonce‖counter) with **encrypt-then-MAC**. This is standard,
+// well-understood construction — the security rests on HMAC-SHA256 being a PRF,
+// not on anything home-grown in the cipher itself.
+//
+// Scope: this protects the stored sudo password *at rest* against a leaked file
+// / backup, on top of the file being root-owned `0600`. The key is machine-local
+// (see sudopass.rs). It is NOT meant to withstand an attacker who already has
+// root on this box (they can read the key too) — nothing at rest can.
+
+/// Fill `n` bytes from the kernel CSPRNG. Panics only if `/dev/urandom` is
+/// unreadable, which on Linux means the system is too broken to continue.
+pub fn rand_bytes(n: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
+    let mut buf = vec![0u8; n];
+    f.read_exact(&mut buf).expect("read /dev/urandom");
+    buf
+}
+
+/// Derive the keystream for `len` bytes: HMAC(enc_key, nonce‖counter) blocks.
+fn keystream(enc_key: &[u8; 32], nonce: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 32);
+    let mut counter: u32 = 0;
+    while out.len() < len {
+        let mut msg = Vec::with_capacity(nonce.len() + 4);
+        msg.extend_from_slice(nonce);
+        msg.extend_from_slice(&counter.to_be_bytes());
+        out.extend_from_slice(&hmac_sha256(enc_key, &msg));
+        counter += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+const NONCE_LEN: usize = 16;
+const TAG_LEN: usize = 32;
+
+/// Encrypt `plaintext` under a 32-byte machine key. Output layout:
+/// `nonce(16) ‖ ciphertext ‖ tag(32)`. Each call uses a fresh random nonce.
+pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    let enc_key = hmac_sha256(key, b"applocker-enc-v1");
+    let mac_key = hmac_sha256(key, b"applocker-mac-v1");
+    let nonce = rand_bytes(NONCE_LEN);
+    let ks = keystream(&enc_key, &nonce, plaintext.len());
+    let ct: Vec<u8> = plaintext.iter().zip(&ks).map(|(p, k)| p ^ k).collect();
+
+    // MAC covers nonce ‖ ciphertext (encrypt-then-MAC).
+    let mut mac_input = Vec::with_capacity(NONCE_LEN + ct.len());
+    mac_input.extend_from_slice(&nonce);
+    mac_input.extend_from_slice(&ct);
+    let tag = hmac_sha256(&mac_key, &mac_input);
+
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len() + TAG_LEN);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    out.extend_from_slice(&tag);
+    out
+}
+
+/// Decrypt a blob produced by [`seal`]. Returns `None` if the tag doesn't verify
+/// (wrong key or tampering) — never a partially-decrypted result.
+pub fn open(key: &[u8; 32], blob: &[u8]) -> Option<Vec<u8>> {
+    if blob.len() < NONCE_LEN + TAG_LEN {
+        return None;
+    }
+    let enc_key = hmac_sha256(key, b"applocker-enc-v1");
+    let mac_key = hmac_sha256(key, b"applocker-mac-v1");
+    let (nonce, rest) = blob.split_at(NONCE_LEN);
+    let (ct, tag) = rest.split_at(rest.len() - TAG_LEN);
+
+    let mut mac_input = Vec::with_capacity(NONCE_LEN + ct.len());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(ct);
+    let expected = hmac_sha256(&mac_key, &mac_input);
+    if !ct_eq(&expected, tag) {
+        return None;
+    }
+    let ks = keystream(&enc_key, nonce, ct.len());
+    Some(ct.iter().zip(&ks).map(|(c, k)| c ^ k).collect())
+}
+
 // ── hex helpers ───────────────────────────────────────────────────────────────
 
 pub fn to_hex(bytes: &[u8]) -> String {
@@ -247,5 +332,35 @@ mod tests {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn seal_open_roundtrip() {
+        let key = [7u8; 32];
+        for pt in [&b""[..], b"x", b"correct horse battery staple", &[0u8; 100][..]] {
+            let blob = seal(&key, pt);
+            assert_eq!(open(&key, &blob).as_deref(), Some(pt));
+        }
+    }
+
+    #[test]
+    fn seal_uses_fresh_nonce() {
+        // Same key + plaintext must not produce identical ciphertext (random nonce).
+        let key = [1u8; 32];
+        assert_ne!(seal(&key, b"same"), seal(&key, b"same"));
+    }
+
+    #[test]
+    fn open_rejects_tamper_and_wrong_key() {
+        let key = [3u8; 32];
+        let mut blob = seal(&key, b"secret");
+        // Wrong key → None.
+        assert!(open(&[4u8; 32], &blob).is_none());
+        // Flip a ciphertext byte → tag fails → None.
+        let mid = blob.len() / 2;
+        blob[mid] ^= 0x01;
+        assert!(open(&key, &blob).is_none());
+        // Truncated blob → None.
+        assert!(open(&key, &blob[..10]).is_none());
     }
 }

@@ -29,6 +29,9 @@ use crate::pin;
 pub enum Method {
     Pin,
     Password,
+    /// Fingerprint reader, verified by PAM (`pam_fprintd`). Carries no secret:
+    /// the prompt just says "use the reader" and the daemon runs the PAM stack.
+    Fingerprint,
 }
 
 /// What the prompter hands back.
@@ -66,6 +69,14 @@ pub trait Fallback {
     fn verify_pin(&self, secret: &str) -> bool;
     /// `Err` means PAM is unavailable — treated as reject, never as accept.
     fn verify_password(&self, secret: &str) -> Result<bool, String>;
+    /// Is a fingerprint reader usable *and* a finger enrolled for this user?
+    fn fingerprint_available(&self) -> bool {
+        false
+    }
+    /// Blocks while the reader waits for a touch. `Err` = unusable, never accept.
+    fn verify_fingerprint(&self) -> Result<bool, String> {
+        Err("fingerprint not supported".to_string())
+    }
 }
 
 /// Which fallbacks to present in the prompt this time.
@@ -73,6 +84,7 @@ pub trait Fallback {
 pub struct Available {
     pub pin: bool,
     pub sudo: bool,
+    pub fingerprint: bool,
 }
 
 /// Tunables for the routine.
@@ -85,6 +97,21 @@ pub struct Config {
     /// How many wrong PIN/password entries before we give up (Cancel always
     /// gives up immediately).
     pub fallback_attempts: u32,
+    /// Both biometrics are on AND usable, so make them agree: the reader and
+    /// the camera must *both* accept before the frictionless path opens
+    /// anything. Either one failing drops to the PIN/password prompt — which
+    /// still works alone, because a lock-out-proof fallback has to exist.
+    ///
+    /// The caller decides this, since only it knows whether face is live.
+    pub cross_reference: bool,
+    /// When a cross-check fails, deny outright instead of offering the
+    /// PIN/password prompt: "if both are on, both have to be right; if they
+    /// fail the app stays closed."
+    ///
+    /// Set for locked apps. Deliberately NOT set for the broker (Settings, the
+    /// sudo-password release), so a broken camera or reader can never leave you
+    /// unable to reach the switch that turns them off.
+    pub cross_denies: bool,
 }
 
 impl Default for Config {
@@ -93,8 +120,23 @@ impl Default for Config {
             face_attempts: 3,
             face_gap: Duration::from_millis(500),
             fallback_attempts: 3,
+            cross_reference: false,
+            cross_denies: false,
         }
     }
+}
+
+/// Face recognition, up to `cfg.face_attempts` tries with a gap between them.
+fn face_matches(cfg: &Config, face: &mut dyn FaceVerifier) -> bool {
+    for attempt in 0..cfg.face_attempts {
+        if face.try_match() {
+            return true;
+        }
+        if attempt + 1 < cfg.face_attempts {
+            thread::sleep(cfg.face_gap);
+        }
+    }
+    false
 }
 
 /// Run the full routine. Returns [`Outcome::Allowed`] the moment any factor
@@ -109,16 +151,77 @@ pub fn run(
     prompter: &mut dyn Prompter,
     fallback: &dyn Fallback,
 ) -> Outcome {
-    // Tier 1: recognition, up to N attempts.
-    for attempt in 0..cfg.face_attempts {
-        if face.try_match() {
-            return Outcome::Allowed;
+    // Cross-reference: both biometrics on and usable, so neither opens the lock
+    // alone — the reader and the camera have to agree. A photo without the
+    // finger, or a lifted print without the face, gets nothing; both land on
+    // the PIN/password prompt instead.
+    if cfg.cross_reference {
+        match fallback.verify_fingerprint() {
+            // Reader works and accepted: face must agree too.
+            Ok(true) => {
+                if face_matches(cfg, face) {
+                    return Outcome::Allowed;
+                }
+            }
+            // Reader works and said no. Both are required, so that settles it.
+            Ok(false) => {}
+            // Reader is BROKEN, not rejecting: errors, disconnects, matches
+            // libfprint disowns. Treating that as "no" would lock the owner out
+            // of their own apps whenever the hardware plays up — "if only one
+            // is enabled we keep the one" applies to a factor that has dropped
+            // out, however it dropped out. Face alone decides this round.
+            Err(e) => {
+                eprintln!(
+                    "applockerd: fingerprint unusable ({e}) — not counting it \
+                     this time; face alone decides."
+                );
+                if face_matches(cfg, face) {
+                    return Outcome::Allowed;
+                }
+                // Face failed too: fall through to the prompt like any
+                // single-factor denial, rather than the strict refusal.
+                return prompt_loop(cfg, prompter, fallback);
+            }
         }
-        if attempt + 1 < cfg.face_attempts {
-            thread::sleep(cfg.face_gap);
+        // One of the two said no. Don't let the other stand in for it.
+        if cfg.cross_denies {
+            eprintln!(
+                "applockerd: face and fingerprint are both on and they did not \
+                 both match — denying (no fallback prompt). Turn one off in \
+                 Settings, or `applockerd set-fingerprint off`, to use a single \
+                 factor again."
+            );
+            return Outcome::Denied;
+        }
+    } else {
+        // Tier 0: the fingerprint reader, when a finger is enrolled. It goes
+        // first because it's the fastest factor and needs no camera — touch it
+        // and you're in. Ignore it and it falls through to face, then the
+        // prompt (where it's offered again as a button).
+        if fallback.fingerprint_available() {
+            match fallback.verify_fingerprint() {
+                Ok(true) => return Outcome::Allowed,
+                Ok(false) => {}
+                Err(e) => eprintln!("applockerd: fingerprint unusable: {e}"),
+            }
+        }
+
+        // Tier 1: recognition, up to N attempts.
+        if face_matches(cfg, face) {
+            return Outcome::Allowed;
         }
     }
 
+    prompt_loop(cfg, prompter, fallback)
+}
+
+/// Tier 2: the PIN / password prompt, shared by the normal path and by the
+/// cross-check's "the reader dropped out" escape.
+fn prompt_loop(
+    cfg: &Config,
+    prompter: &mut dyn Prompter,
+    fallback: &dyn Fallback,
+) -> Outcome {
     // Tier 2: fallback. The always-one-fallback invariant: if neither is
     // configured we must not silently deny — that would be a lock-out. Treat it
     // as a misconfiguration and deny loudly (the installer guarantees a PIN, so
@@ -126,8 +229,9 @@ pub fn run(
     let available = Available {
         pin: fallback.pin_available(),
         sudo: fallback.sudo_available(),
+        fingerprint: fallback.fingerprint_available(),
     };
-    if !available.pin && !available.sudo {
+    if !available.pin && !available.sudo && !available.fingerprint {
         eprintln!(
             "applockerd: no fallback available (no PIN set and PAM unusable) — denying. \
              This is a misconfiguration; see recovery in README."
@@ -135,10 +239,19 @@ pub fn run(
         return Outcome::Denied;
     }
 
-    for _ in 0..cfg.fallback_attempts {
+    // Attempts are a brute-force budget, so only *guessable* answers spend one.
+    // A fingerprint can't be guessed, and on flaky reader hardware (libfprint
+    // driver errors) it fails for reasons that have nothing to do with the
+    // person — eating a password try for that is just punishing the user.
+    let mut tries_left = cfg.fallback_attempts;
+    while tries_left > 0 {
         match prompter.prompt(available) {
             PromptResult::Cancelled => return Outcome::Denied,
             PromptResult::Entered { method, secret } => {
+                if method != Method::Fingerprint {
+                    tries_left -= 1;
+                }
+                let mut secret = secret;
                 let ok = match method {
                     Method::Pin => available.pin && fallback.verify_pin(&secret),
                     Method::Password => {
@@ -148,7 +261,17 @@ pub fn run(
                                 false
                             })
                     }
+                    Method::Fingerprint => {
+                        available.fingerprint
+                            && fallback.verify_fingerprint().unwrap_or_else(|e| {
+                                eprintln!("applockerd: fprintd error, treating as reject: {e}");
+                                false
+                            })
+                    }
                 };
+                // Best-effort: don't leave the secret sitting in freed memory.
+                // (NUL bytes are valid UTF-8, so this is safe.)
+                unsafe { secret.as_bytes_mut().fill(0) };
                 if ok {
                     return Outcome::Allowed;
                 }
@@ -170,6 +293,24 @@ impl FaceVerifier for NoFace {
     }
 }
 
+/// Whose password the sudo fallback should check. `SUDO_USER` when we were
+/// launched via sudo; otherwise, when we run as the root service, the active
+/// desktop user (checking *root's* password would be wrong — the person at the
+/// keyboard is the desktop user). Falls back to `root` only when headless.
+fn desktop_user() -> String {
+    if let Some(u) = pam::invoking_user() {
+        if u != "root" {
+            return u;
+        }
+    }
+    if let Some(ctx) = crate::session::SessionCtx::discover() {
+        if ctx.uid != 0 {
+            return ctx.user;
+        }
+    }
+    "root".to_string()
+}
+
 /// The PIN record location: `$APPLOCKER_PIN_FILE` if set, else the system path.
 pub fn default_pin_path() -> PathBuf {
     match std::env::var_os("APPLOCKER_PIN_FILE") {
@@ -188,20 +329,184 @@ pub struct SystemFallback {
     pub allow_pin: bool,
     /// Policy switch: offer the sudo-password fallback at all.
     pub allow_sudo: bool,
+    /// Policy switch: try the fingerprint reader at all.
+    pub allow_fingerprint: bool,
+}
+
+/// PAM service that runs `pam_fprintd` alone (shipped as /etc/pam.d/ by the
+/// package). Separate from `sudo` so a fingerprint touch can never be answered
+/// by a password, and a missing fprintd can't weaken the sudo stack.
+pub const FPRINTD_SERVICE: &str = "applocker-fprintd";
+
+/// PAM service for checking a *typed* password. Ours when the package shipped
+/// it (pam_unix only — see the file's comment), else the distro's `sudo` stack.
+pub const PASSWORD_SERVICE: &str = "applocker-password";
+
+fn password_service() -> String {
+    if std::path::Path::new("/etc/pam.d/applocker-password").is_file() {
+        PASSWORD_SERVICE.to_string()
+    } else {
+        "sudo".to_string()
+    }
+}
+
+/// Where an accepted fingerprint is stamped. A touch is spoof-resistant, so for
+/// a while afterwards the lock screen accepts a plain glance instead of the turn
+/// challenge (`face/watch_presence.py` reads this). On tmpfs on purpose: a
+/// reboot must not carry the trust over. World-readable, mtime is the whole
+/// payload — it says "a finger was verified at <time>", nothing about whose.
+pub const FP_STAMP: &str = "/run/applocker/last-fingerprint";
+
+/// libfprint's own words when a driver claims a match it cannot justify. When
+/// this is in fprintd's log for the attempt we just made, the PAM success is
+/// not evidence of anything and must not open a lock.
+const BOGUS_MATCH_MARKERS: [&str; 2] = [
+    "not matching any in the gallery",
+    "fp_print_equal", // "should not be reached" — same event, different line
+];
+
+/// Pure half of the veto, so it can be tested without a reader.
+fn log_disowns_the_match(log: &str) -> bool {
+    BOGUS_MATCH_MARKERS.iter().any(|m| log.contains(m))
+}
+
+/// Journal cutoff string for "since this attempt started". A whole-minute
+/// window used to poison honest touches: one disowned match made every retry
+/// in the next 60s look fraudulent too, which is why unlocking by finger
+/// seemed to work sometimes and never on a second try.
+fn journal_cutoff(since: std::time::SystemTime) -> String {
+    let secs = since
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    std::process::Command::new("date")
+        .args(["-d", &format!("@{secs}"), "+%Y-%m-%d %H:%M:%S"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "-30sec".to_string())
+}
+
+/// Did fprintd disown the match for *this* attempt? Root-only read, bounded.
+fn fprintd_disowned_match_since(since: std::time::SystemTime) -> bool {
+    let cutoff = journal_cutoff(since);
+    match std::process::Command::new("journalctl")
+        .args(["-u", "fprintd", "--no-pager", "-S", &cutoff])
+        .output()
+    {
+        Ok(o) => log_disowns_the_match(&String::from_utf8_lossy(&o.stdout)),
+        // Can't read the log → can't veto. Say so rather than silently trusting.
+        Err(e) => {
+            eprintln!("applockerd: cannot check fprintd's log ({e}); \
+                       accepting the reader's word for this attempt");
+            false
+        }
+    }
+}
+
+/// Set when the reader proves unusable, so the next unlock doesn't wait at it
+/// again. tmpfs, like the trust stamp: a reboot forgets.
+pub const FP_UNUSABLE_STAMP: &str = "/run/applocker/fingerprint-unusable";
+
+/// How long to leave a dead reader alone before trying it again.
+const FP_COOLDOWN_SECS: u64 = 60;
+
+fn stamp_unusable() {
+    if let Some(d) = std::path::Path::new(FP_UNUSABLE_STAMP).parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(FP_UNUSABLE_STAMP, b"");
+}
+
+/// Did the reader fail us within the cooldown? Then it is "disconnected" as far
+/// as this unlock is concerned: with no face either, go straight to the prompt
+/// instead of making the user watch the reader do nothing for six seconds.
+fn fingerprint_recently_unusable() -> bool {
+    let Ok(meta) = std::fs::metadata(FP_UNUSABLE_STAMP) else {
+        return false;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < FP_COOLDOWN_SECS)
+}
+
+fn stamp_fingerprint() {
+    let dir = std::path::Path::new(FP_STAMP).parent();
+    if let Some(d) = dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Err(e) = std::fs::write(FP_STAMP, b"") {
+        eprintln!("applockerd: could not stamp {FP_STAMP}: {e}");
+    }
+}
+
+/// Has `user` enrolled at least one finger with fprintd? `fprintd-list` prints
+/// one `- #0: <finger>` line per enrolled finger and exits non-zero when there
+/// is no reader — exactly the "don't offer it" condition.
+///
+/// Wrapped in `timeout` because an unprivileged `fprintd-list` waits on a
+/// polkit prompt that nobody will answer (~25s). We always run as root here, so
+/// that shouldn't happen, but a stalled probe would delay the unlock prompt.
+fn fingerprint_enrolled(user: &str) -> bool {
+    // A reader that just failed is treated as absent until the cooldown is up.
+    if fingerprint_recently_unusable() {
+        return false;
+    }
+    // On by default again (`APPLOCKER_FP=0` disables), because the bypass this
+    // tier produced on 2026-11-24 now has a specific guard rather than a blanket
+    // ban: `verify_fingerprint` throws away any PAM success that fprintd's own
+    // log disowns ("not matching any in the gallery"). That was exactly the
+    // failure — three allows with no finger on the reader.
+    //
+    // The three behaviours this gives, which is what was asked for:
+    //   reader absent / unenrolled  → tier skipped, straight to face or PIN
+    //   reader back                 → used again at the next unlock, no restart
+    //   reader lying                → success vetoed, falls back to face / PIN
+    //
+    // Note what it does NOT cover: the system's own fingerprint PAM (sudo, the
+    // KDE greeter) has no such veto and cannot get one from here.
+    if std::env::var("APPLOCKER_FP").map(|v| v == "0").unwrap_or(false) {
+        return false;
+    }
+    if !std::path::Path::new("/etc/pam.d/applocker-fprintd").is_file() {
+        return false;
+    }
+    match std::process::Command::new("timeout")
+        .args(["3", "fprintd-list", user])
+        .output()
+    {
+        Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).contains("- #"),
+        Err(_) => false,
+    }
 }
 
 impl SystemFallback {
     /// Default locations for the deployed daemon, gated by the saved policy.
     /// `$APPLOCKER_PIN_FILE` overrides the PIN path (used by tests and by
     /// `set-pin`/`auth-test` so they don't need to touch `/etc`).
+    /// The same, but limited to what one tier accepts.
+    pub fn for_tier(t: &crate::policy::TierPolicy) -> SystemFallback {
+        SystemFallback {
+            pin_path: default_pin_path(),
+            pam_service: password_service(),
+            user: desktop_user(),
+            allow_pin: t.pin,
+            allow_sudo: t.password,
+            allow_fingerprint: t.fingerprint,
+        }
+    }
+
     pub fn system() -> SystemFallback {
         let policy = crate::policy::load_default();
         SystemFallback {
             pin_path: default_pin_path(),
-            pam_service: "sudo".to_string(),
-            user: pam::invoking_user().unwrap_or_else(|| "root".to_string()),
+            pam_service: password_service(),
+            user: desktop_user(),
             allow_pin: policy.allow_pin,
             allow_sudo: policy.allow_sudo,
+            allow_fingerprint: policy.allow_fingerprint,
         }
     }
 }
@@ -224,6 +529,54 @@ impl Fallback for SystemFallback {
 
     fn verify_password(&self, secret: &str) -> Result<bool, String> {
         pam::verify_password(&self.pam_service, &self.user, secret)
+    }
+
+    fn fingerprint_available(&self) -> bool {
+        self.allow_fingerprint && fingerprint_enrolled(&self.user)
+    }
+
+    /// pam_fprintd asks nothing of the conversation (it only sends info
+    /// messages, which `pam.rs` answers with NULL), so the same PAM path works
+    /// with an empty secret. Blocks until the user touches the reader or the
+    /// module times out.
+    fn verify_fingerprint(&self) -> Result<bool, String> {
+        // Timestamp first: the veto must only read what this attempt produced.
+        let started = std::time::SystemTime::now();
+        let ok = match pam::verify_password(FPRINTD_SERVICE, &self.user, "") {
+            Ok(v) => v,
+            Err(e) => {
+                stamp_unusable(); // PAM itself couldn't run it — don't retry for a minute
+                return Err(e);
+            }
+        };
+        // A PAM success is not the end of it. On 2026-11-24 this reader produced
+        // three successes with no finger on it, while libfprint logged "Driver
+        // reported a match providing a scanned print that is not matching any in
+        // the gallery" at the same seconds. libfprint knows the match was
+        // rubbish; PAM just doesn't pass that on. So we ask the log.
+        // OFF by default, and here is why. On this class of reader the match
+        // happens ON THE CHIP, and libfprint logs "a scanned print that is not
+        // matching any in the gallery" because it cannot map the chip's answer
+        // back to its own record. That line accompanies ORDINARY, CORRECT
+        // authentications: proved on 2026-11-24 at 20:11:33, when a real finger
+        // opened `sudo` (no veto in that path) in the same second the line was
+        // logged. Vetoing on it therefore rejected almost every genuine touch,
+        // which is exactly what "it does not open with my finger" was.
+        //
+        // Keep it available for hardware where the line really does mean a
+        // fabricated match: APPLOCKER_FP_VETO=1.
+        let veto_on = std::env::var("APPLOCKER_FP_VETO").map(|v| v == "1").unwrap_or(false);
+        if ok && veto_on && fprintd_disowned_match_since(started) {
+            // Err, not Ok(false): the reader is not *rejecting* anyone, it is
+            // malfunctioning. The difference matters when both factors are
+            // required — a broken reader must step aside, not lock you out.
+            stamp_unusable();
+            return Err("fprintd disowned the driver's match (flaky reader)".to_string());
+        }
+        if ok {
+            stamp_fingerprint();
+        }
+        Ok(ok)
     }
 }
 
@@ -267,6 +620,44 @@ mod tests {
         good_pin: &'static str,
         good_pw: &'static str,
     }
+
+    /// Fallback with a reader attached; `touched` decides what it reports.
+    /// `broken` makes it report the hardware as unusable instead.
+    struct FpFallback {
+        touched: bool,
+    }
+
+    struct BrokenReader;
+    impl Fallback for BrokenReader {
+        fn pin_available(&self) -> bool { true }
+        fn sudo_available(&self) -> bool { false }
+        fn verify_pin(&self, s: &str) -> bool { s == "1234" }
+        fn verify_password(&self, _s: &str) -> Result<bool, String> { Ok(false) }
+        fn fingerprint_available(&self) -> bool { true }
+        fn verify_fingerprint(&self) -> Result<bool, String> {
+            Err("flaky reader".to_string())
+        }
+    }
+    impl Fallback for FpFallback {
+        fn pin_available(&self) -> bool {
+            true
+        }
+        fn sudo_available(&self) -> bool {
+            false
+        }
+        fn verify_pin(&self, secret: &str) -> bool {
+            secret == "1234"
+        }
+        fn verify_password(&self, _secret: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn fingerprint_available(&self) -> bool {
+            true
+        }
+        fn verify_fingerprint(&self) -> Result<bool, String> {
+            Ok(self.touched)
+        }
+    }
     impl Fallback for FakeFallback {
         fn pin_available(&self) -> bool {
             self.pin
@@ -282,11 +673,22 @@ mod tests {
         }
     }
 
+    fn cross_cfg() -> Config {
+        Config { cross_reference: true, ..fast_cfg() }
+    }
+
+    /// Locked-app flavour: a failed cross-check closes the app, full stop.
+    fn cross_strict_cfg() -> Config {
+        Config { cross_reference: true, cross_denies: true, ..fast_cfg() }
+    }
+
     fn fast_cfg() -> Config {
         Config {
             face_attempts: 3,
             face_gap: Duration::from_millis(0),
             fallback_attempts: 3,
+            cross_reference: false,
+            cross_denies: false,
         }
     }
 
@@ -295,6 +697,182 @@ mod tests {
             method,
             secret: s.to_string(),
         }
+    }
+
+    /// Touching the reader gets you in with no dialog and no camera — that's
+    /// the "no button" path.
+    #[test]
+    fn fingerprint_allows_before_face_or_prompt() {
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: vec![], idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&fast_cfg(), &mut face, &mut prompt, &FpFallback { touched: true }),
+            Outcome::Allowed
+        );
+        assert_eq!(face.idx, 0, "face must not run once the reader accepted");
+        assert!(prompt.seen_available.is_empty());
+    }
+
+    /// With both biometrics on, neither opens the lock by itself.
+    #[test]
+    fn cross_reference_needs_both() {
+        let answers = || vec![entered(Method::Pin, "1234")];
+
+        // finger ✓ + face ✓ → straight in, no prompt.
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: vec![], idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: true }),
+            Outcome::Allowed
+        );
+        assert!(prompt.seen_available.is_empty(), "no prompt when both agree");
+
+        // finger ✓ + face ✗ → must NOT open on the finger alone.
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: answers(), idx: 0, seen_available: vec![] };
+        run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: true });
+        assert_eq!(prompt.seen_available.len(), 1, "face failed → prompt");
+
+        // finger ✗ + face ✓ → must NOT open on the face alone.
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: answers(), idx: 0, seen_available: vec![] };
+        run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: false });
+        assert_eq!(prompt.seen_available.len(), 1, "finger failed → prompt");
+
+        // The PIN still gets you in: the fallback must never be two-factor.
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: answers(), idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Allowed
+        );
+    }
+
+    /// The cooldown predicate: no stamp → the reader is fair game.
+    #[test]
+    fn no_unusable_stamp_means_the_reader_is_tried() {
+        // The real path writes to /run; with no stamp present this must be
+        // false so a working reader is never skipped.
+        if !std::path::Path::new(FP_UNUSABLE_STAMP).exists() {
+            assert!(!fingerprint_recently_unusable());
+        }
+    }
+
+    /// A reader that is broken (not rejecting) must step aside rather than
+    /// lock the owner out: face alone decides, and the PIN still works.
+    #[test]
+    fn broken_reader_does_not_block_the_owner() {
+        // Face matches → in, despite "both required".
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: vec![], idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &BrokenReader),
+            Outcome::Allowed
+        );
+        assert!(prompt.seen_available.is_empty(), "no prompt needed");
+
+        // Face fails too → the ordinary prompt, not the strict refusal.
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt {
+            answers: vec![entered(Method::Pin, "1234")],
+            idx: 0,
+            seen_available: vec![],
+        };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &BrokenReader),
+            Outcome::Allowed
+        );
+        assert_eq!(prompt.seen_available.len(), 1, "prompted, not refused");
+    }
+
+    /// For a locked app: both on, either fails → stays shut, and the user is
+    /// never offered a password to get round it.
+    #[test]
+    fn strict_cross_reference_denies_without_prompting() {
+        let pin = || vec![entered(Method::Pin, "1234")];
+
+        // finger ✓ + face ✗ → denied, no prompt at all.
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: pin(), idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &FpFallback { touched: true }),
+            Outcome::Denied
+        );
+        assert!(prompt.seen_available.is_empty(), "no way round it");
+
+        // finger ✗ + face ✓ → same.
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: pin(), idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Denied
+        );
+        assert!(prompt.seen_available.is_empty());
+
+        // Both right → in, as always.
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: vec![], idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &FpFallback { touched: true }),
+            Outcome::Allowed
+        );
+    }
+
+    /// The veto's *pattern matching* still works; it is simply off by default
+    /// now, because on match-on-chip readers that log line accompanies honest
+    /// successes (see verify_fingerprint).
+    #[test]
+    fn a_disowned_match_is_not_a_match() {
+        let bogus = "fprintd[123]: Driver reported a match providing a scanned \
+                     print that is not matching any in the gallery.";
+        assert!(log_disowns_the_match(bogus));
+        assert!(log_disowns_the_match(
+            "file ../libfprint/fp-print.c: line 636 (fp_print_equal): should not be reached"
+        ));
+        // Ordinary noise, including a plain disconnect, must NOT veto a success.
+        assert!(!log_disowns_the_match("Read failed: device was disconnected, aborting"));
+        assert!(!log_disowns_the_match("Started fprintd.service"));
+        assert!(!log_disowns_the_match(""));
+    }
+
+    /// A failing reader must not burn the password-attempt budget: the user
+    /// still gets all three typed tries after the finger fails.
+    #[test]
+    fn failed_fingerprint_does_not_spend_a_password_try() {
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt {
+            answers: vec![
+                entered(Method::Fingerprint, ""), // reader error / wrong finger
+                entered(Method::Fingerprint, ""), // again
+                entered(Method::Pin, "0000"),     // wrong  (try 1)
+                entered(Method::Pin, "9999"),     // wrong  (try 2)
+                entered(Method::Pin, "1234"),     // right  (try 3)
+            ],
+            idx: 0,
+            seen_available: vec![],
+        };
+        assert_eq!(
+            run(&fast_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Allowed
+        );
+        assert_eq!(prompt.seen_available.len(), 5, "all five prompts shown");
+    }
+
+    /// Ignoring the reader must not deny — it falls through to face, then the
+    /// prompt, which still offers the reader as a button.
+    #[test]
+    fn unused_fingerprint_falls_through_to_the_prompt() {
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt {
+            answers: vec![entered(Method::Pin, "1234")],
+            idx: 0,
+            seen_available: vec![],
+        };
+        assert_eq!(
+            run(&fast_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Allowed
+        );
+        assert_eq!(prompt.seen_available[0].fingerprint, true);
     }
 
     #[test]
@@ -337,7 +915,7 @@ mod tests {
             good_pw: "pw",
         };
         assert_eq!(run(&fast_cfg(), &mut face, &mut prompt, &fb), Outcome::Allowed);
-        assert_eq!(prompt.seen_available[0], Available { pin: true, sudo: true });
+        assert_eq!(prompt.seen_available[0], Available { pin: true, sudo: true, fingerprint: false });
     }
 
     #[test]
@@ -408,6 +986,6 @@ mod tests {
         };
         let fb = FakeFallback { pin: false, sudo: true, good_pin: "1234", good_pw: "pw" };
         assert_eq!(run(&fast_cfg(), &mut face, &mut prompt, &fb), Outcome::Denied);
-        assert_eq!(prompt.seen_available[0], Available { pin: false, sudo: true });
+        assert_eq!(prompt.seen_available[0], Available { pin: false, sudo: true, fingerprint: false });
     }
 }

@@ -13,13 +13,16 @@
 //!
 //! Matching: for `native` entries we compare the **basename** of the exec'd
 //! binary to the basename of the stored key, so a lock on `steam` catches it
-//! whether it runs from `/usr/bin` or `/usr/local/bin`. Flatpak/Snap entries
-//! can't be matched from a binary path yet (every flatpak execs `flatpak`), so
-//! they're stored but skipped by the gate with a note — see `desktop.rs`.
+//! whether it runs from `/usr/bin` or `/usr/local/bin`. `flatpak` entries match
+//! by the app's install path — a flatpak's real binaries live under
+//! `…/flatpak/app/<app-id>/…`, so the app-id (the stored key) is a path
+//! component we can match on (see `LockList::matches`). `snap` isn't matched
+//! yet (stored but not enforced — the gate notes this).
 
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::desktop::{base, AppKind, DesktopApp};
@@ -106,20 +109,136 @@ impl LockList {
     /// (case-insensitive). Returns how many were removed.
     pub fn remove(&mut self, query: &str) -> usize {
         let q = query.to_lowercase();
+        let qbase = base(query).to_lowercase();
         let before = self.apps.len();
-        self.apps
-            .retain(|a| a.key != query && a.name.to_lowercase() != q);
+        // Match the same identities `lock-app` might have stored: exact key,
+        // case-folded key, display name, or the basename (so a native lock on
+        // `steam` vs `/usr/bin/steam` still removes). Lenient on purpose — a
+        // failed remove that leaves a lock in place is worse than an over-match.
+        self.apps.retain(|a| {
+            let k = a.key.to_lowercase();
+            !(a.key == query
+                || k == q
+                || a.name.to_lowercase() == q
+                || base(&a.key).to_lowercase() == qbase)
+        });
         before - self.apps.len()
     }
 
-    /// The locked app matching an exec'd binary path, if any. Only `native`
-    /// entries can match today (basename equality).
+    /// A locked **flatpak** whose app-id appears as a token in the launching
+    /// process' cmdline. Flatpaks exec their real binary inside a bwrap mount
+    /// namespace, so the host path never matches — but the `flatpak`/`bwrap`
+    /// exec's pre-exec cmdline still carries `flatpak run … <app-id> …`. Exact
+    /// token match on the app-id, so unrelated bwrap uses (triggers, the
+    /// system-helper, our own prompt) never false-hit.
+    pub fn matches_flatpak_cmdline(&self, cmdline_tokens: &[String]) -> Option<&LockedApp> {
+        self.apps.iter().find(|a| {
+            a.kind == AppKind::Flatpak && cmdline_tokens.iter().any(|t| t == &a.key)
+        })
+    }
+
+    /// The locked app matching an exec'd binary path, if any.
+    ///
+    /// - `native` — basename equality (a lock on `steam` catches it from any
+    ///   `bin` dir).
+    /// - `flatpak` — the app's real binaries live under
+    ///   `…/flatpak/app/<app-id>/…` (both the system store `/var/lib/flatpak`
+    ///   and the user store `~/.local/share/flatpak`). The app-id is a path
+    ///   component, so we match any exec beneath that app's install dir — this
+    ///   catches the launch whether it came from the menu or `flatpak run`, and
+    ///   the first exec (the app's `bin/<app-id>` wrapper) is enough to prompt.
+    /// - `appimage` — the `.AppImage` file's absolute path. Launching an
+    ///   AppImage execs the file itself (before its internal squashfs mount), so
+    ///   an exact path match on that first exec catches the launch. Precise (no
+    ///   false hits on a same-named file elsewhere), unlike native's basename.
+    /// - `snap` — not handled yet.
     pub fn matches(&self, exec_path: &str) -> Option<&LockedApp> {
         let exe_base = base(exec_path);
-        self.apps
-            .iter()
-            .find(|a| a.kind.is_gateable() && base(&a.key) == exe_base)
+        self.apps.iter().find(|a| match a.kind {
+            AppKind::Native => base(&a.key) == exe_base,
+            AppKind::Flatpak => exec_path.contains(&format!("/flatpak/app/{}/", a.key)),
+            AppKind::AppImage => a.key == exec_path,
+            AppKind::Snap => false,
+        })
     }
+
+    /// Does this exec have the *content* of a locked AppImage, whatever it is
+    /// called? Locking by path is defeated by `cp viber.appimage game.appimage`
+    /// — a rename is the first thing anyone locked out will try.
+    ///
+    /// Compared by (size, SHA-256 of the first [`FINGERPRINT_BYTES`]) rather
+    /// than the whole image: a 200 MB hash per launch would be absurd, and a
+    /// copy is byte-identical, so a prefix plus the exact size separates real
+    /// images from each other perfectly well. This is theft-of-a-name
+    /// protection, not collision resistance.
+    pub fn matches_appimage_content(&self, exec_path: &str) -> Option<&LockedApp> {
+        let want = fingerprint(Path::new(exec_path))?;
+        self.apps.iter().find(|a| {
+            a.kind == AppKind::AppImage
+                && fingerprint(Path::new(&a.key)).is_some_and(|known| known == want)
+        })
+    }
+
+    /// Does `source` name a locked AppImage? An AppImage runs its real binary
+    /// from its own FUSE mount (`/tmp/.mount_<name>XXXX/AppRun`), a path with
+    /// nothing in common with the `.appimage` file, so an exec in there slips
+    /// past [`matches`]. The mount table is the link: squashfuse records the
+    /// image's name as the mount source, which is what `source` is.
+    ///
+    /// Compared by basename because the source the kernel records is usually
+    /// bare (`viber.appimage`), not the full path we locked.
+    pub fn matches_appimage_source(&self, source: &str) -> Option<&LockedApp> {
+        if source.is_empty() {
+            return None;
+        }
+        let src_base = base(source);
+        self.apps.iter().find(|a| {
+            a.kind == AppKind::AppImage && !src_base.is_empty() && base(&a.key) == src_base
+        })
+    }
+}
+
+/// How much of an AppImage to hash. Enough to be unique in practice, small
+/// enough to read in milliseconds.
+const FINGERPRINT_BYTES: usize = 1 << 20; // 1 MiB
+
+/// `size:hex` for `path`, or `None` if it can't be read. Cached per
+/// (path, size, mtime) so a locked 200 MB image is read once, not per launch.
+fn fingerprint(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let meta = fs::metadata(path).ok()?;
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let key = path.to_string_lossy().into_owned();
+
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u64, u64, String)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(c) = cache.lock() {
+        if let Some((s, m, fp)) = c.get(&key) {
+            if *s == size && *m == mtime {
+                return Some(fp.clone());
+            }
+        }
+    }
+
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; FINGERPRINT_BYTES.min(size as usize)];
+    f.read_exact(&mut buf).ok()?;
+    let digest = crate::crypto::sha256(&buf);
+    let fp = format!(
+        "{size}:{}",
+        digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, (size, mtime, fp.clone()));
+    }
+    Some(fp)
 }
 
 /// `$APPLOCKER_LOCKED_APPS`, else `/etc/applocker/locked-apps`.
@@ -138,6 +257,58 @@ mod tests {
         LockedApp { kind: AppKind::Native, key: key.into(), name: name.into() }
     }
 
+    fn appimage(key: &str, name: &str) -> LockedApp {
+        LockedApp { kind: AppKind::AppImage, key: key.into(), name: name.into() }
+    }
+
+    /// Renaming a locked AppImage must not unlock it.
+    #[test]
+    fn appimage_matched_by_content_not_name() {
+        let dir = std::env::temp_dir().join(format!("applocker-fp-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let original = dir.join("viber.appimage");
+        let renamed = dir.join("totally-not-viber.appimage");
+        let other = dir.join("other.appimage");
+        fs::write(&original, b"AI\x02 pretend image contents").unwrap();
+        fs::write(&renamed, b"AI\x02 pretend image contents").unwrap(); // byte-identical copy
+        fs::write(&other, b"AI\x02 a different program entirely").unwrap();
+
+        let mut l = LockList::default();
+        l.add(appimage(original.to_str().unwrap(), "Viber"));
+
+        assert!(
+            l.matches_appimage_content(renamed.to_str().unwrap()).is_some(),
+            "a renamed copy is still the locked app"
+        );
+        assert!(
+            l.matches_appimage_content(other.to_str().unwrap()).is_none(),
+            "a different image is not"
+        );
+        assert!(l.matches_appimage_content("/nonexistent").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A locked AppImage's inner exec (/tmp/.mount_*/AppRun) must still hit the
+    /// lock — found via the mount source, which is typically a bare filename.
+    #[test]
+    fn matches_appimage_through_its_mount_source() {
+        let mut l = LockList::default();
+        l.add(appimage("/home/teo/AppImages/viber.appimage", "Viber"));
+        assert!(l.matches_appimage_source("viber.appimage").is_some());
+        assert!(l.matches_appimage_source("/home/teo/AppImages/viber.appimage").is_some());
+        // Someone else's AppImage, and non-AppImage sources, must not match.
+        assert!(l.matches_appimage_source("winboat.appimage").is_none());
+        assert!(l.matches_appimage_source("").is_none());
+        assert!(l.matches_appimage_source("/dev/loop1").is_none());
+    }
+
+    #[test]
+    fn native_locks_dont_match_mount_sources() {
+        let mut l = LockList::default();
+        l.add(native("/usr/bin/steam", "Steam"));
+        assert!(l.matches_appimage_source("steam").is_none());
+    }
+
     #[test]
     fn matches_by_basename() {
         let mut l = LockList::default();
@@ -148,12 +319,74 @@ mod tests {
     }
 
     #[test]
-    fn flatpak_not_matched_but_stored() {
+    fn flatpak_matched_by_app_install_path() {
         let mut l = LockList::default();
-        l.add(LockedApp { kind: AppKind::Flatpak, key: "com.valvesoftware.Steam".into(), name: "Steam".into() });
-        // Stored, but a flatpak/bwrap exec path can't be matched yet.
-        assert_eq!(l.apps.len(), 1);
+        l.add(LockedApp { kind: AppKind::Flatpak, key: "com.github.tchx84.Flatseal".into(), name: "Flatseal".into() });
+        // The launcher/sandbox helpers execing plain `flatpak` are NOT matched…
         assert!(l.matches("/usr/bin/flatpak").is_none());
+        assert!(l.matches("/usr/bin/bwrap").is_none());
+        // …but the app's real binary under the system store IS.
+        assert!(l.matches(
+            "/var/lib/flatpak/app/com.github.tchx84.Flatseal/current/active/files/bin/com.github.tchx84.Flatseal"
+        ).is_some());
+        // …and under a per-user install too.
+        assert!(l.matches(
+            "/home/teo/.local/share/flatpak/app/com.github.tchx84.Flatseal/x86_64/stable/abc/files/bin/foo"
+        ).is_some());
+        // A different app-id must not match.
+        assert!(l.matches(
+            "/var/lib/flatpak/app/org.other.App/current/active/files/bin/org.other.App"
+        ).is_none());
+    }
+
+    #[test]
+    fn flatpak_matched_by_cmdline_app_id() {
+        // Real case: the app execs inside bwrap so its path is remapped; we match
+        // the launcher's cmdline app-id token instead (see gate probe on metal).
+        let mut l = LockList::default();
+        l.add(LockedApp { kind: AppKind::Flatpak,
+                          key: "org.localsend.localsend_app".into(), name: "LocalSend".into() });
+        let toks = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        // The locked app's launch cmdline → matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=localsend \
+             --file-forwarding org.localsend.localsend_app @@u @@")).is_some());
+        // Unrelated bwrap uses (triggers, system-helper, our own prompt) → NOT matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "bwrap --unshare-ipc --ro-bind / / -- /usr/share/flatpak/triggers/mime-database.trigger")).is_none());
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "python3 /usr/lib/applocker/auth_prompt.py --app AppLocker --methods pin,sudo")).is_none());
+        // A different flatpak's launch → NOT matched.
+        assert!(l.matches_flatpak_cmdline(&toks(
+            "/usr/bin/flatpak run org.other.App")).is_none());
+        // A native lock with the same string is not treated as a flatpak match.
+        let mut n = LockList::default();
+        n.add(native("org.localsend.localsend_app", "x"));
+        assert!(n.matches_flatpak_cmdline(&toks("flatpak run org.localsend.localsend_app")).is_none());
+    }
+
+    #[test]
+    fn appimage_matched_by_exact_path() {
+        let mut l = LockList::default();
+        l.add(LockedApp {
+            kind: AppKind::AppImage,
+            key: "/home/teo/AppImages/viber.appimage".into(),
+            name: "Viber".into(),
+        });
+        // The exact file the AppImage launch execs is matched…
+        assert!(l.matches("/home/teo/AppImages/viber.appimage").is_some());
+        // …but a same-named file elsewhere is NOT (path-precise, unlike native).
+        assert!(l.matches("/tmp/viber.appimage").is_none());
+        // …and the internal squashfs binaries (post-mount) aren't double-gated.
+        assert!(l.matches("/tmp/.mount_viberXY/AppRun").is_none());
+    }
+
+    #[test]
+    fn snap_stored_but_not_matched() {
+        let mut l = LockList::default();
+        l.add(LockedApp { kind: AppKind::Snap, key: "spotify".into(), name: "Spotify".into() });
+        assert_eq!(l.apps.len(), 1);
+        assert!(l.matches("/snap/spotify/current/usr/bin/spotify").is_none());
     }
 
     #[test]

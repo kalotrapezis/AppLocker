@@ -1,0 +1,26 @@
+[Unit]
+Description=AppLocker auth broker (PIN/face for privileged changes)
+Documentation=file:/usr/share/doc/applocker/README.md
+After=multi-user.target
+# Never give up and leave the broker stuck 'failed' (which strands Settings with
+# a dead socket). Always keep trying to bring it back.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/applocker/applockerd serve
+Restart=always
+RestartSec=1
+
+# The broker runs as root but NEVER touches fanotify, so — unlike the gate
+# (applockerd.service) — it cannot freeze input and is safe to leave running.
+# It listens on /run/applockerd.sock and, for each request from the desktop
+# user, runs the face→PIN→sudo auth routine and performs the change as root.
+# This is what lets the PIN (not just the sudo password) authorise Settings,
+# Add-app, Apply and the gate on/off — without polkit/pkexec. It drops its
+# GTK prompt into the active graphical session (see daemon/src/session.rs).
+#
+# Unlike the gate, this unit is safe to enable by default and the .deb does so.
+
+[Install]
+WantedBy=multi-user.target

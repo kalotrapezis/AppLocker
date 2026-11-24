@@ -8,9 +8,12 @@ makes no decision (mirrors the philosophy of auth_prompt.py).
 
 Protocol — one command per line on **stdin** (the daemon holds the pipe):
 
+    finger              # the fingerprint reader is waiting for a touch
     scanning            # show the "looking for you" state
     fail <n> <total>    # attempt n of total failed: shake, show ✕
-    ok                  # matched: show green ✓, then self-close
+    denied <text>       # refused outright: show ✕ and why, then self-close
+    ok                  # matched: show green ✓, then self-close (~1.2s; an
+                        # EOF after this does NOT cut it short)
     close               # go away now (e.g. falling back to the PIN prompt)
 
 EOF on stdin also closes the window, so a crashed daemon can't leave it stuck
@@ -24,6 +27,14 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk  # noqa: E402
+
+
+# How long the ✓ stays up. Long enough to actually register — the original
+# 700ms, after a 1-2s scan, was easy to miss entirely, which is what made a
+# working face unlock feel like no lock at all.
+OK_VISIBLE_MS = 1200
+# A refusal needs longer than a success: the user has to read it.
+DENIED_VISIBLE_MS = 2200
 
 
 class FeedbackWindow(Gtk.Window):
@@ -56,8 +67,23 @@ class FeedbackWindow(Gtk.Window):
         box.pack_start(self.subtitle, False, False, 0)
 
         self.set_default_size(220, -1)
+        self.quitting = False   # True once the ✓ owns the shutdown
 
     # ── states ────────────────────────────────────────────────────────────
+    def show_finger(self):
+        # The reader waits in silence for several seconds; without this nobody
+        # knows it is live, so they wait for the password box instead.
+        self.icon.set_markup("<span size='400%'>☝</span>")
+        self.status.set_text("Touch the fingerprint reader")
+
+    def show_denied(self, why):
+        # A refusal with no reason on screen is how "the lock does nothing" got
+        # reported in the first place. Say what happened.
+        self.icon.set_markup("<span size='400%' foreground='#c0392b'>✕</span>")
+        self.status.set_text(why or "Not recognised")
+        self.quitting = True
+        GLib.timeout_add(DENIED_VISIBLE_MS, Gtk.main_quit)
+
     def show_scanning(self):
         self.icon.set_markup("<span size='400%'>👤</span>")
         self.status.set_text("Looking for you…")
@@ -70,7 +96,11 @@ class FeedbackWindow(Gtk.Window):
     def show_ok(self):
         self.icon.set_markup("<span size='400%' foreground='#27ae60'>✓</span>")
         self.status.set_text("Welcome back")
-        GLib.timeout_add(700, Gtk.main_quit)
+        # Own the shutdown from here: a stdin EOF arriving right behind the "ok"
+        # must not cut the tick short (that bug made every successful face
+        # unlock look silent).
+        self.quitting = True
+        GLib.timeout_add(OK_VISIBLE_MS, Gtk.main_quit)
 
     def _shake(self):
         # Nudge the window left/right for ~300ms — the classic "wrong" gesture.
@@ -99,13 +129,19 @@ def main():
     def on_stdin(fd, condition):
         line = sys.stdin.readline()
         if not line:  # EOF: daemon went away — never linger on screen
+            if win.quitting:
+                return False   # ✓ is up; its own timer closes us
             Gtk.main_quit()
             return False
         parts = line.strip().split()
         if not parts:
             return True
         cmd = parts[0]
-        if cmd == "scanning":
+        if cmd == "denied":
+            win.show_denied(" ".join(parts[1:]))
+        elif cmd == "finger":
+            win.show_finger()
+        elif cmd == "scanning":
             win.show_scanning()
         elif cmd == "fail":
             n = int(parts[1]) if len(parts) > 1 else 1

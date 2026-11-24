@@ -13,11 +13,12 @@
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::time::Duration;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 
-use crate::auth::{Available, FaceVerifier, Prompter, PromptResult};
+use crate::auth::{Available, FaceVerifier, Prompter, PromptResult, Fallback};
 
 /// A handle on one feedback-window process. Dropping it closes the window
 /// (stdin EOF), so it can never outlive the auth attempt.
@@ -29,13 +30,16 @@ impl Feedback {
     /// Spawn the window for `app_name`. On any failure returns a dead handle —
     /// the send methods just no-op.
     pub fn spawn(app_name: &str) -> Feedback {
-        let child = Command::new("python3")
-            .arg(locate_feedback_script())
+        let mut cmd = Command::new("python3");
+        cmd.arg(locate_feedback_script())
             .arg("--app")
             .arg(app_name)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // Show the window in the user's session when we're the root service.
+        crate::session::attach(&mut cmd);
+        let child = cmd
             .spawn()
             .map_err(|e| eprintln!("applockerd: no feedback window: {e}"))
             .ok();
@@ -65,13 +69,41 @@ impl Feedback {
         self.send("scanning");
     }
 
+    /// "Touch the fingerprint reader" — the reader is waiting, silently.
+    pub fn finger(&mut self) {
+        self.send("finger");
+    }
+
     pub fn fail(&mut self, attempt: u32, total: u32) {
         self.send(&format!("fail {attempt} {total}"));
     }
 
-    /// Show the green check; the window closes itself shortly after.
+    /// Show the green check, and let it be *seen*: the window displays the ✓ for
+    /// ~700ms and quits by itself, so we wait instead of reaping.
+    ///
+    /// This used to `send("ok")` then `reap()` straight away — and reap drops
+    /// the child's stdin, whose EOF makes the window quit at once. The tick was
+    /// therefore never on screen for more than a flash, which is exactly why a
+    /// successful face unlock looked like nothing had happened and the lock
+    /// looked broken. Costs ~0.9s on a successful unlock; that is the feature.
     pub fn ok(&mut self) {
+        if !self.is_live() {
+            return;
+        }
         self.send("ok");
+        std::thread::sleep(OK_LINGER);
+        self.reap();
+    }
+
+    /// Show ✕ and the reason, long enough to read, then let the window go.
+    /// Used when the routine refuses outright and there is no prompt to
+    /// explain itself — otherwise the app simply fails to open, silently.
+    pub fn denied(&mut self, why: &str) {
+        if !self.is_live() {
+            return;
+        }
+        self.send(&format!("denied {why}"));
+        std::thread::sleep(DENIED_LINGER);
         self.reap();
     }
 
@@ -87,6 +119,13 @@ impl Feedback {
         }
     }
 }
+
+/// How long to leave the ✓ on screen. Must outlast the window's own
+/// `OK_VISIBLE_MS` self-close timer (see gui/unlock_feedback.py), with slack.
+const OK_LINGER: Duration = Duration::from_millis(1400);
+
+/// Must outlast the window's own `DENIED_VISIBLE_MS` (2200ms).
+const DENIED_LINGER: Duration = Duration::from_millis(2400);
 
 impl Drop for Feedback {
     fn drop(&mut self) {
@@ -129,6 +168,50 @@ impl FaceVerifier for FaceWithFeedback {
 
 /// Wraps a [`Prompter`]: the first time the PIN/sudo dialog is about to show,
 /// close the feedback window (after a beat, so the last shake/✕ is visible).
+/// Wraps the real [`Fallback`] so the reader's silent wait is visible: the
+/// window says "Touch the fingerprint reader" while PAM blocks, and shows the ✓
+/// if the touch is accepted. Everything else passes straight through.
+///
+/// Without this the fingerprint tier is a few seconds of nothing at all — which
+/// is how a working reader ends up looking broken.
+pub struct FallbackWithFeedback<F: Fallback> {
+    inner: F,
+    fb: SharedFeedback,
+}
+
+impl<F: Fallback> FallbackWithFeedback<F> {
+    pub fn new(inner: F, fb: SharedFeedback) -> Self {
+        FallbackWithFeedback { inner, fb }
+    }
+}
+
+impl<F: Fallback> Fallback for FallbackWithFeedback<F> {
+    fn pin_available(&self) -> bool {
+        self.inner.pin_available()
+    }
+    fn sudo_available(&self) -> bool {
+        self.inner.sudo_available()
+    }
+    fn verify_pin(&self, secret: &str) -> bool {
+        self.inner.verify_pin(secret)
+    }
+    fn verify_password(&self, secret: &str) -> Result<bool, String> {
+        self.inner.verify_password(secret)
+    }
+    fn fingerprint_available(&self) -> bool {
+        self.inner.fingerprint_available()
+    }
+
+    fn verify_fingerprint(&self) -> Result<bool, String> {
+        self.fb.borrow_mut().finger();
+        let out = self.inner.verify_fingerprint();
+        if matches!(out, Ok(true)) {
+            self.fb.borrow_mut().ok();
+        }
+        out
+    }
+}
+
 pub struct ClosingPrompter<P: Prompter> {
     inner: P,
     fb: SharedFeedback,
@@ -191,6 +274,37 @@ mod tests {
         }
     }
 
+    /// The window wrapper must never change a verdict — it only narrates.
+    #[test]
+    fn fallback_wrapper_passes_verdicts_through() {
+        struct Fake {
+            fp: Result<bool, String>,
+        }
+        impl Fallback for Fake {
+            fn pin_available(&self) -> bool { true }
+            fn sudo_available(&self) -> bool { false }
+            fn verify_pin(&self, s: &str) -> bool { s == "1234" }
+            fn verify_password(&self, _s: &str) -> Result<bool, String> { Ok(false) }
+            fn fingerprint_available(&self) -> bool { true }
+            fn verify_fingerprint(&self) -> Result<bool, String> { self.fp.clone() }
+        }
+        let none = || std::rc::Rc::new(std::cell::RefCell::new(Feedback::none()));
+
+        let ok = FallbackWithFeedback::new(Fake { fp: Ok(true) }, none());
+        assert_eq!(ok.verify_fingerprint(), Ok(true));
+        assert!(ok.verify_pin("1234") && !ok.verify_pin("0000"));
+        assert!(ok.pin_available() && !ok.sudo_available());
+
+        let bad = FallbackWithFeedback::new(Fake { fp: Ok(false) }, none());
+        assert_eq!(bad.verify_fingerprint(), Ok(false));
+
+        let broken = FallbackWithFeedback::new(
+            Fake { fp: Err("no reader".into()) },
+            none(),
+        );
+        assert!(broken.verify_fingerprint().is_err(), "errors stay errors");
+    }
+
     #[test]
     fn dead_feedback_is_harmless() {
         // With no child process, the whole decorator stack must behave exactly
@@ -201,7 +315,7 @@ mod tests {
         assert!(!face.try_match());
         let mut p = ClosingPrompter::new(OkPrompt, fb);
         assert!(matches!(
-            p.prompt(Available { pin: true, sudo: true }),
+            p.prompt(Available { pin: true, sudo: true, fingerprint: false }),
             PromptResult::Entered { method: Method::Pin, .. }
         ));
     }

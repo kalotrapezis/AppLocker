@@ -10,9 +10,9 @@ Once present, `engine.build_engine()` auto-selects the SFace backend; until then
 it falls back to the Haar-pixel v0. This only affects *unlock* recognition — the
 presence/attention tier is lenient and identity-blind regardless.
 
-Detection uses the **2022mar** YuNet (pinned to an old opencv_zoo commit): the
-current 2023mar model needs OpenCV ≥ 4.7 and fails to load on Ubuntu's 4.6,
-while 2022mar runs fine and handles tilted/occluded faces Haar can't.
+Detection uses the **2023mar** YuNet (needs OpenCV ≥ 4.7, which Kubuntu 26.04's
+4.10 satisfies). On an old 4.6 box the engine falls back to the 2022mar model if
+you drop it in manually; both are handled by SFaceEngine._try_yunet.
 
 Note: OpenCV Zoo stores models with git-LFS, so we fetch from the `media.`
 GitHub host (the `raw.` host returns a tiny LFS *pointer*, not the model). We
@@ -28,12 +28,9 @@ import urllib.request
 from engine import SFACE_MODEL, YUNET_MODEL, model_dir
 
 BASE = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models"
-# The 4.6-compatible YuNet lives at a pinned pre-2023 commit (small file, not LFS).
-YUNET_COMMIT = "91fb0290f50896f38a0ab1e558b74b16bc009428"
 SOURCES = {
     SFACE_MODEL: f"{BASE}/face_recognition_sface/{SFACE_MODEL}",
-    YUNET_MODEL: ("https://github.com/opencv/opencv_zoo/raw/"
-                  f"{YUNET_COMMIT}/models/face_detection_yunet/{YUNET_MODEL}"),
+    YUNET_MODEL: f"{BASE}/face_detection_yunet/{YUNET_MODEL}",
 }
 MIN_BYTES = 50_000  # both models are >>50 KB; smaller means we got an LFS pointer
 

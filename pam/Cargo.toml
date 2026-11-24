@@ -1,0 +1,12 @@
+[package]
+name = "pam_applocker"
+version = "0.0.1"
+edition = "2021"
+
+# A PAM module is a plain shared object the stack dlopens; no Rust deps at all
+# (same no-crates.io constraint as the daemon).
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"

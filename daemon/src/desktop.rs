@@ -22,6 +22,10 @@ pub enum AppKind {
     Native,
     Flatpak,
     Snap,
+    /// A single self-mounting AppImage file. The launch execs the `.AppImage`
+    /// file itself (before it FUSE-mounts its squashfs), so we can gate it by
+    /// that file's absolute path — see `LockList::matches`.
+    AppImage,
 }
 
 impl AppKind {
@@ -30,6 +34,7 @@ impl AppKind {
             AppKind::Native => "native",
             AppKind::Flatpak => "flatpak",
             AppKind::Snap => "snap",
+            AppKind::AppImage => "appimage",
         }
     }
 
@@ -38,13 +43,16 @@ impl AppKind {
             "native" => Some(AppKind::Native),
             "flatpak" => Some(AppKind::Flatpak),
             "snap" => Some(AppKind::Snap),
+            "appimage" => Some(AppKind::AppImage),
             _ => None,
         }
     }
 
-    /// Can the exec-gate match this kind from a binary path today?
+    /// Can the exec-gate match this kind from a binary path today? Native by
+    /// basename; Flatpak by its app-install path; AppImage by the file's
+    /// absolute path (the `.AppImage` exec IS the launch). Snap isn't handled yet.
     pub fn is_gateable(&self) -> bool {
-        matches!(self, AppKind::Native)
+        matches!(self, AppKind::Native | AppKind::Flatpak | AppKind::AppImage)
     }
 }
 
@@ -60,12 +68,62 @@ pub struct DesktopApp {
     pub key: String,
 }
 
+/// The home directory whose per-user `.desktop` files we should read. When the
+/// daemon runs as root — the GUI locks apps via `pkexec applockerd lock-app` —
+/// `$HOME` is root's, but the app the user picked lives in *their*
+/// `~/.local/share/applications` (integrated AppImages, user-installed flatpaks).
+/// Resolve the invoking user's home from `PKEXEC_UID` (pkexec) or `SUDO_USER`
+/// (sudo) so those apps are actually found; otherwise fall back to `$HOME`.
+fn user_home() -> Option<PathBuf> {
+    if unsafe { libc::geteuid() } == 0 {
+        if let Some(h) = std::env::var("PKEXEC_UID")
+            .ok()
+            .and_then(|u| u.parse::<u32>().ok())
+            .and_then(home_of_uid)
+        {
+            return Some(h);
+        }
+        if let Some(h) = std::env::var("SUDO_USER")
+            .ok()
+            .filter(|u| !u.is_empty() && u != "root")
+            .and_then(|u| home_of_name(&u))
+        {
+            return Some(h);
+        }
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn home_of_uid(uid: u32) -> Option<PathBuf> {
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() { None } else { pw_dir(pw) }
+    }
+}
+
+fn home_of_name(name: &str) -> Option<PathBuf> {
+    let c = std::ffi::CString::new(name).ok()?;
+    unsafe {
+        let pw = libc::getpwnam(c.as_ptr());
+        if pw.is_null() { None } else { pw_dir(pw) }
+    }
+}
+
+unsafe fn pw_dir(pw: *const libc::passwd) -> Option<PathBuf> {
+    let dir = (*pw).pw_dir;
+    if dir.is_null() {
+        return None;
+    }
+    Some(PathBuf::from(
+        std::ffi::CStr::from_ptr(dir).to_string_lossy().into_owned(),
+    ))
+}
+
 /// The standard XDG application directories, most-specific first (user overrides
 /// system), including the flatpak/snap export dirs.
 fn app_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = user_home() {
         dirs.push(home.join(".local/share/applications"));
         dirs.push(home.join(".local/share/flatpak/exports/share/applications"));
     }
@@ -253,6 +311,14 @@ fn resolve_tokens(toks: &[String], depth: u32) -> Option<(AppKind, String)> {
         }
     }
 
+    // An AppImage is a single executable file; launching it execs the file
+    // itself, so gate it by its absolute path. `argv0` is that path (the
+    // .desktop's Exec points straight at it, possibly behind an `env` wrapper
+    // we've already skipped above).
+    if base(argv0).to_ascii_lowercase().ends_with(".appimage") {
+        return Some((AppKind::AppImage, argv0.clone()));
+    }
+
     if b == "flatpak" && rest.iter().any(|t| t == "run") {
         let run_at = rest.iter().position(|t| t == "run").unwrap();
         let appid = rest[run_at + 1..].iter().rev().find(|t| !t.starts_with('-'))?;
@@ -340,9 +406,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_appimage() {
+        // Viber's real integrated launcher: an `env` wrapper around the file.
+        assert_eq!(
+            resolve_exec("env DESKTOPINTEGRATION=1 /home/teo/AppImages/viber.appimage"),
+            Some((AppKind::AppImage, "/home/teo/AppImages/viber.appimage".to_string()))
+        );
+        // Run directly, and case-insensitive extension.
+        assert_eq!(
+            resolve_exec("/opt/apps/Foo-1.2.3.AppImage %U"),
+            Some((AppKind::AppImage, "/opt/apps/Foo-1.2.3.AppImage".to_string()))
+        );
+        assert!(AppKind::AppImage.is_gateable());
+        assert_eq!(AppKind::from_tag(AppKind::AppImage.as_str()), Some(AppKind::AppImage));
+    }
+
+    #[test]
     fn kind_gateability() {
         assert!(AppKind::Native.is_gateable());
-        assert!(!AppKind::Flatpak.is_gateable());
+        assert!(AppKind::Flatpak.is_gateable()); // now matched by app-install path
+        assert!(!AppKind::Snap.is_gateable());
         assert_eq!(AppKind::from_tag(AppKind::Snap.as_str()), Some(AppKind::Snap));
     }
 

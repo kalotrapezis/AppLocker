@@ -1,0 +1,82 @@
+#!/bin/sh
+# applocker-test-scope — set up (or tear down) a dev-safe sandbox for testing the
+# app/file gate WITHOUT risking a system-wide freeze.
+#
+# The gate normally marks all of `/` as a blocking fanotify permission gate: if
+# the daemon stalls, every exec on the machine hangs (that's the freeze). In test
+# scope the daemon marks ONE private mount instead (via $APPLOCKER_GATE_SCOPE),
+# so a bug can only ever block execs *inside the sandbox* — your desktop, shell,
+# and SDDM are never in the blocking path.
+#
+# This script makes that private mount: a bind-mount of a scratch dir onto
+# itself, which the kernel treats as its own mount so FAN_MARK_MOUNT scopes to
+# exactly that subtree. Nothing here persists — a reboot drops the mount.
+#
+#   sudo applocker-test-scope up      # create the sandbox + a sample locked app
+#   sudo applocker-test-scope gate    # run the gate scoped to the sandbox
+#   sudo applocker-test-scope down    # unmount and remove it
+#   applocker-test-scope env          # print the env (for advanced/manual use)
+#
+# Typical session (see TESTS.md §"Dev-safe gate test"):
+#   sudo applocker-test-scope up
+#   sudo applocker-test-scope gate    # Ctrl-C to stop; only the sandbox is gated
+#   # …then in another terminal:  /tmp/applocker-test/bin/lockme  (it prompts)
+#   sudo applocker-test-scope down
+#
+# NB: `sudo -E applockerd …` does NOT work — sudoers strips the environment, so
+# $APPLOCKER_GATE_SCOPE is lost and the daemon (rightly) refuses to gate all of /.
+# The `gate` subcommand sets the env *inside* this already-root script instead.
+set -eu
+
+DIR="${APPLOCKER_TEST_DIR:-/tmp/applocker-test}"
+
+case "${1:-}" in
+up)
+	[ "$(id -u)" -eq 0 ] || { echo "run as root: sudo applocker-test-scope up" >&2; exit 1; }
+	mkdir -p "$DIR/bin" "$DIR/vault"
+	# Bind-mount the dir onto itself so it becomes a distinct mount point.
+	if ! mountpoint -q "$DIR"; then
+		mount --bind "$DIR" "$DIR"
+	fi
+	# A harmless "app" to lock: a copy of /bin/true that just exits 0.
+	cp -f /bin/true "$DIR/bin/lockme"
+	# A sample file to lock behind the file-gate.
+	echo "secret test file" > "$DIR/vault/secret.txt"
+	chmod -R a+rx "$DIR/bin"
+	echo "sandbox ready at $DIR (its own mount: $(mountpoint -q "$DIR" && echo yes || echo NO))"
+	echo "  sample app:  $DIR/bin/lockme   (a copy of /bin/true)"
+	echo "  sample file: $DIR/vault/secret.txt"
+	echo "Next: sudo applocker-test-scope gate   (then run \$DIR/bin/lockme elsewhere)."
+	;;
+gate)
+	[ "$(id -u)" -eq 0 ] || { echo "run as root: sudo applocker-test-scope gate" >&2; exit 1; }
+	mountpoint -q "$DIR" || { echo "no sandbox — run 'sudo applocker-test-scope up' first" >&2; exit 1; }
+	APPLOCKER="${APPLOCKER_BIN:-applockerd}"
+	# Set the scope env HERE (we're already root), so it survives — unlike
+	# `sudo -E applockerd`, where sudoers strips it. Ad-hoc lock the sample app
+	# basename "lockme"; gate only the sandbox mount; short fail-open watchdog.
+	echo "gating only $DIR — Ctrl-C to stop. Launch $DIR/bin/lockme in another terminal."
+	APPLOCKER_GATE_SCOPE="$DIR" \
+	APPLOCKER_CONFIG="$DIR/config" \
+	APPLOCKER_GATE_TIMEOUT="${APPLOCKER_GATE_TIMEOUT:-15}" \
+		exec "$APPLOCKER" lockme
+	;;
+down)
+	[ "$(id -u)" -eq 0 ] || { echo "run as root: sudo applocker-test-scope down" >&2; exit 1; }
+	if mountpoint -q "$DIR"; then umount "$DIR" || umount -l "$DIR"; fi
+	rm -rf "$DIR"
+	echo "sandbox removed."
+	;;
+env)
+	# Meant to be eval'd. Scope + a scratch config so we never touch the real one,
+	# and a short fail-open so even a hung auth clears in a few seconds.
+	echo "export APPLOCKER_TEST_DIR='$DIR'"
+	echo "export APPLOCKER_GATE_SCOPE='$DIR'"
+	echo "export APPLOCKER_CONFIG='$DIR/config'"
+	echo "export APPLOCKER_GATE_TIMEOUT='15'"
+	;;
+*)
+	echo "usage: applocker-test-scope up|gate|down|env" >&2
+	exit 2
+	;;
+esac
