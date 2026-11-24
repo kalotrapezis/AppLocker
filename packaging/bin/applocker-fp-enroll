@@ -42,7 +42,7 @@ check() {
 	i=1
 	while [ "$i" -le 5 ]; do
 		printf '  press %d of 5… ' "$i"
-		if fprintd-verify "$USER_NAME" 2>/dev/null | grep -q "verify-match"; then
+		if LC_ALL=C fprintd-verify "$USER_NAME" 2>/dev/null | grep -q "verify-match"; then
 			echo "match"
 			hits=$((hits + 1))
 		else
@@ -63,7 +63,7 @@ if [ "$CHECK_ONLY" = yes ]; then
 fi
 
 echo "Currently enrolled:"
-fprintd-list "$USER_NAME" 2>/dev/null | grep -E '^ - #' || echo "  (nothing)"
+LC_ALL=C fprintd-list "$USER_NAME" 2>/dev/null | grep -E '^ - #' || echo "  (nothing)"
 echo
 
 if [ "$RESET" = yes ]; then
@@ -79,7 +79,7 @@ done_any=no
 for slot in $SLOTS; do
 	hint=$(echo "$HINTS" | sed -n "${n}p")
 	echo "── round $n of 3 — hold it $hint"
-	if fprintd-enroll -f "$slot" "$USER_NAME"; then
+	if LC_ALL=C fprintd-enroll -f "$slot" "$USER_NAME"; then
 		done_any=yes
 	else
 		echo "   round $n failed (flaky reader?) — carrying on" >&2
@@ -91,7 +91,7 @@ done
 [ "$done_any" = yes ] || { echo "Nothing was enrolled." >&2; exit 1; }
 
 echo "Now enrolled:"
-fprintd-list "$USER_NAME" 2>/dev/null | grep -E '^ - #' || true
+LC_ALL=C fprintd-list "$USER_NAME" 2>/dev/null | grep -E '^ - #' || true
 echo
 echo "Checking how reliably it reads back:"
 check
