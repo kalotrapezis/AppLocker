@@ -10,7 +10,7 @@ set -euo pipefail
 # Version is a fixed base + a testing-round letter that bumps every build:
 # 0.0.1-a, 0.0.1-b, ...  Pass an explicit letter to rebuild a round:
 #   packaging/build-deb.sh c
-VERSION_BASE="0.0.6"
+VERSION_BASE="0.0.8"
 ROUND_FILE="$(dirname "$0")/.build-round"
 # APPLOCKER_VERSION overrides the whole version string (for a real release, e.g.
 # APPLOCKER_VERSION=0.0.1 APPLOCKER_RELEASE=1 packaging/build-deb.sh). Otherwise
@@ -67,6 +67,7 @@ install -m 0644 "$REPO/pam/target/release/libpam_applocker.so" \
 # Fingerprint tier's PAM service (inert without libpam-fprintd installed).
 install -d -m 0755 "$STAGE/etc/pam.d"
 install -m 0644 "$REPO/packaging/pam.d/applocker-fprintd" "$STAGE/etc/pam.d/applocker-fprintd"
+install -m 0644 "$REPO/packaging/pam.d/applocker-password" "$STAGE/etc/pam.d/applocker-password"
 
 # CLI entry point on PATH (so `pkexec applockerd …` and the GUI work).
 ln -s ../lib/applocker/applockerd "$STAGE/usr/bin/applockerd"
@@ -285,7 +286,7 @@ EOF
 
 # Track the dev-mode marker as a conffile so deleting it (to enable the real
 # gate) is remembered across upgrades instead of being silently restored.
-printf '/etc/pam.d/applocker-fprintd\n' > "$STAGE/DEBIAN/conffiles"
+printf '/etc/pam.d/applocker-fprintd\n/etc/pam.d/applocker-password\n' > "$STAGE/DEBIAN/conffiles"
 if [ "${APPLOCKER_RELEASE:-}" != "1" ]; then
 	printf '/etc/applocker/dev-mode\n' >> "$STAGE/DEBIAN/conffiles"
 fi

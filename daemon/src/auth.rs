@@ -160,10 +160,18 @@ pub fn run(
         return Outcome::Denied;
     }
 
-    for _ in 0..cfg.fallback_attempts {
+    // Attempts are a brute-force budget, so only *guessable* answers spend one.
+    // A fingerprint can't be guessed, and on flaky reader hardware (libfprint
+    // driver errors) it fails for reasons that have nothing to do with the
+    // person — eating a password try for that is just punishing the user.
+    let mut tries_left = cfg.fallback_attempts;
+    while tries_left > 0 {
         match prompter.prompt(available) {
             PromptResult::Cancelled => return Outcome::Denied,
             PromptResult::Entered { method, secret } => {
+                if method != Method::Fingerprint {
+                    tries_left -= 1;
+                }
                 let mut secret = secret;
                 let ok = match method {
                     Method::Pin => available.pin && fallback.verify_pin(&secret),
@@ -249,6 +257,18 @@ pub struct SystemFallback {
 /// by a password, and a missing fprintd can't weaken the sudo stack.
 pub const FPRINTD_SERVICE: &str = "applocker-fprintd";
 
+/// PAM service for checking a *typed* password. Ours when the package shipped
+/// it (pam_unix only — see the file's comment), else the distro's `sudo` stack.
+pub const PASSWORD_SERVICE: &str = "applocker-password";
+
+fn password_service() -> String {
+    if std::path::Path::new("/etc/pam.d/applocker-password").is_file() {
+        PASSWORD_SERVICE.to_string()
+    } else {
+        "sudo".to_string()
+    }
+}
+
 /// Where an accepted fingerprint is stamped. A touch is spoof-resistant, so for
 /// a while afterwards the lock screen accepts a plain glance instead of the turn
 /// challenge (`face/watch_presence.py` reads this). On tmpfs on purpose: a
@@ -299,7 +319,7 @@ impl SystemFallback {
         let policy = crate::policy::load_default();
         SystemFallback {
             pin_path: default_pin_path(),
-            pam_service: "sudo".to_string(),
+            pam_service: password_service(),
             user: desktop_user(),
             allow_pin: policy.allow_pin,
             allow_sudo: policy.allow_sudo,
@@ -451,6 +471,29 @@ mod tests {
         );
         assert_eq!(face.idx, 0, "face must not run once the reader accepted");
         assert!(prompt.seen_available.is_empty());
+    }
+
+    /// A failing reader must not burn the password-attempt budget: the user
+    /// still gets all three typed tries after the finger fails.
+    #[test]
+    fn failed_fingerprint_does_not_spend_a_password_try() {
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt {
+            answers: vec![
+                entered(Method::Fingerprint, ""), // reader error / wrong finger
+                entered(Method::Fingerprint, ""), // again
+                entered(Method::Pin, "0000"),     // wrong  (try 1)
+                entered(Method::Pin, "9999"),     // wrong  (try 2)
+                entered(Method::Pin, "1234"),     // right  (try 3)
+            ],
+            idx: 0,
+            seen_available: vec![],
+        };
+        assert_eq!(
+            run(&fast_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Allowed
+        );
+        assert_eq!(prompt.seen_available.len(), 5, "all five prompts shown");
     }
 
     /// Ignoring the reader must not deny — it falls through to face, then the
