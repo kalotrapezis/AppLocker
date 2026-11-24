@@ -54,8 +54,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::auth::{self, Available, Fallback, Method, Outcome, PromptResult, Prompter,
-                  SystemFallback};
+use crate::auth::{self, Available, FaceVerifier, Fallback, Method, Outcome, PromptResult,
+                  Prompter, SystemFallback};
 use crate::face;
 use crate::feedback::{ClosingPrompter, FaceWithFeedback, Feedback};
 use crate::gate::GuiPrompter;
@@ -440,7 +440,15 @@ fn get_sudo(reason: &str) -> String {
             None => "notset".to_string(),
         };
     }
-    let (mut face_v, attempts, face_live) = face::build();
+    // Same feedback window as authenticate(): without it a face match here is
+    // completely silent, which reads as "nothing happened".
+    let (face_v, attempts, face_live) = face::build();
+    let win = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+        Feedback::spawn(reason)
+    } else {
+        Feedback::none()
+    }));
+    let mut face_v = FaceWithFeedback::new(face_v, win.clone(), attempts);
     for _ in 0..attempts {
         if face_v.try_match() {
             store.record_success();
@@ -455,7 +463,8 @@ fn get_sudo(reason: &str) -> String {
     // Offer the PIN only when it's usable and not currently locked; the sudo
     // password is always offered as the escape hatch.
     let available = Available { pin: fb.pin_available() && !locked, sudo: true, fingerprint: fb.fingerprint_available() };
-    let mut prompter = GuiPrompter::new(reason, face_live);
+    // ClosingPrompter dismisses the window before the dialog appears.
+    let mut prompter = ClosingPrompter::new(GuiPrompter::new(reason, face_live), win);
     match prompter.prompt(available) {
         PromptResult::Cancelled => "cancel".to_string(),
         PromptResult::Entered { method: Method::Pin, secret } => {

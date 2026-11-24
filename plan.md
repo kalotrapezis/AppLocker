@@ -52,11 +52,14 @@ just opened, which is exactly what "the lock did nothing" looks like.
 - MEASURED: window lifetime 0.18s before (GTK startup only, nothing drawn) →
   1.38s after. Control: EOF with no tick still exits in 0.18s, so nothing
   lingers.
-- [ ] STILL SILENT: the fingerprint tier (runs before any window exists) and the
-  BROKER's face path — serve.rs calls face::build() directly and never wraps it
-  in FaceWithFeedback, so Settings/sudo-release face unlocks show nothing. Same
-  class of bug, different path. Wiring the broker to the feedback window is the
-  next real UX win.
+- [x] Broker `get_sudo()` (polkit sudo-password release) now uses the same
+  FaceWithFeedback + ClosingPrompter pair. CORRECTION to my earlier note: the
+  broker's main `authenticate()` always had the window — only get_sudo lacked
+  it. Needed `FaceVerifier` in scope in serve.rs for the trait method.
+- [ ] STILL SILENT: the fingerprint tier, which runs before any window exists
+  (auth::run tier 0), so a touch-to-unlock is instant and unconfirmed. Fixing it
+  means handing the feedback handle to the Fallback trait — a wider change than
+  the others, so it waits for a reason beyond tidiness.
 
 ### [x] 0g. 0.0.9 — upgrades apply without a reboot
 `postinst` try-restarted only the broker, so with the gate on an upgrade left

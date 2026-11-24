@@ -21,10 +21,18 @@ real release, **0.0.1**.
   1–2s scan was easy to miss, which was half the problem. A successful face
   unlock therefore costs ~1.4s more; that delay *is* the feature.
 
-### Still silent (follow-ups, noted in plan.md)
-- The fingerprint tier shows nothing at all — it runs before any window exists.
-- The broker's own face path (Settings, sudo-password release) never spawns the
-  feedback window; only the gate and `auth-test` do.
+### Also fixed
+- **The sudo-password release had no feedback window.** The broker's main
+  `authenticate()` (Settings changes) always had one — my first note here said
+  otherwise, which was wrong — but `get_sudo()`, the path the polkit agent uses
+  to release your stored sudo password, ran its own face loop with no window at
+  all. It now uses the same `FaceWithFeedback` + `ClosingPrompter` pair.
+
+### Still silent (follow-up, noted in plan.md)
+- The fingerprint tier shows nothing at all — it runs before any window exists,
+  so a touch-to-unlock is instant and unconfirmed. Needs the window spawned
+  before the reader tier, which means threading the handle into the `Fallback`
+  trait.
 
 ## 0.0.9 — an upgrade now takes effect without a reboot
 
