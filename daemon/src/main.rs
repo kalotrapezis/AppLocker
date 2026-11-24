@@ -1164,6 +1164,17 @@ fn handle_event(
                 .or_else(|| {
                     fuse_mount_source(&path)
                         .and_then(|src| guard.apps.matches_appimage_source(&src))
+                })
+                // Last: the same image under a different name. `cp
+                // viber.appimage game.appimage` is the obvious way round a
+                // path-based lock, and costs nothing to close — only files
+                // that really are AppImages get fingerprinted.
+                .or_else(|| {
+                    if is_appimage_file(&path) {
+                        guard.apps.matches_appimage_content(&path)
+                    } else {
+                        None
+                    }
                 });
             matched.map(|a| (a.key.clone(), a.name.clone()))
         } else {
@@ -1300,6 +1311,20 @@ fn handle_event(
 /// Is `pid` this daemon or one of its descendants? Walks the PPid chain in
 /// /proc (a handful of small reads; only runs for events that hit a lock). A
 /// vanished process reads as "not ours" — fail closed to the normal auth path.
+/// Is this file an AppImage? Type-2 images are ELFs with "AI\x02" at offset 8.
+/// Checked before any hashing so ordinary binaries are never read for it.
+fn is_appimage_file(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 11];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    &head[0..4] == b"\x7fELF" && &head[8..11] == b"AI\x02"
+}
+
 /// The mount source backing `path`, if `path` sits inside a FUSE mount — i.e.
 /// the AppImage file whose squashfs an exec is running out of. Longest matching
 /// mount point wins (nested mounts), and only `fuse.*` filesystems count, so a

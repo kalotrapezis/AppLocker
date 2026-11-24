@@ -95,9 +95,10 @@ Changes what matters: patience beats cleverness, so nothing may open by waiting.
   For child-proofing it arguably should deny — a lock that opens when it
   malfunctions is not a lock. Downside: a broken auth stack makes every locked
   app unlaunchable until `systemctl stop applockerd`.
-- [ ] GAP: AppImages are locked by path (+ mount-source basename since 0.0.5).
-  Copying is caught, RENAMING is not: `cp viber.appimage ~/game.appimage` runs
-  unlocked. Fix = match on content hash (cache by inode+mtime), not name.
+- [x] CLOSED (0.0.18): AppImages are matched by content as well as path —
+  size + SHA-256 of the first 1 MiB, cached per (path, size, mtime). 4.9 ms on
+  the real 199 MB image, and only files with the AppImage magic are hashed.
+  Verified against a real renamed 200 MB copy.
 - [ ] Consider: a child can also just wait for a parent-unlocked session. The
   `reauth = every launch` setting (already on here) is what limits that.
 

@@ -3,6 +3,26 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.18 — renaming an AppImage no longer unlocks it
+
+`cp viber.appimage game.appimage` used to run unlocked: AppImages were matched
+by path. They are now also matched by **content**, so the same program opens the
+same lock whatever it is called.
+
+- Fingerprint is `size` + SHA-256 of the **first 1 MiB**, not the whole image:
+  hashing 200 MB per launch would be absurd, and a copy is byte-identical, so a
+  prefix plus the exact size tells real images apart perfectly well. This is
+  theft-of-a-name protection, not collision resistance — say so plainly.
+- **4.9 ms** measured on the real 199 MB Viber image, then cached per
+  (path, size, mtime), so a relaunch costs nothing and an edited image is
+  re-read automatically.
+- Only files that really are AppImages are ever fingerprinted (ELF with
+  `AI\x02` at offset 8, an 11-byte read), so ordinary binaries pay nothing.
+- Checked last, after path, flatpak app-id and FUSE mount source.
+
+Verified on the real file: a 200 MB copy under a different name produced an
+identical fingerprint, and an unrelated AppImage did not.
+
 ## 0.0.17 — an ignored prompt is a "no", not a "yes" after five minutes
 
 The purpose of the locks turns out to be keeping a child out of certain apps.
