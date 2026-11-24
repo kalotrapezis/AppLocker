@@ -3,6 +3,54 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.12 — the fingerprint tier is OFF by default (it produced a real bypass)
+
+### Security — this is the actual "it opens even when auth fails"
+At 14:29 on 2026-11-24, three locked Zen Browser launches were allowed with **no
+finger, no face, no dialog and no password**:
+
+```
+14:29:13 auth   pid=28983  Zen Browser (prompting)
+14:29:15 allow (auth passed)  pid=28983  /usr/bin/bwrap      (3 of these in 3s)
+```
+
+`fprintd`, at those same three seconds:
+
+```
+14:29:15 Driver reported a match providing a scanned print that is not matching any in the gallery.   (x3)
+```
+
+Three bogus driver "matches" → three `auth passed`. No camera ran (no
+`matching against N profile(s)` lines), no dialog appeared, and the user
+confirmed no finger was on the reader. A flaky libfprint driver (Chipsailing
+CS9711) handed PAM a success nobody asked for — and PAM success is all this code
+can see from the inside.
+
+**The fingerprint tier is opt-in now** (`APPLOCKER_FP=1`), not opt-out. A lock
+must fail safe, and a factor that can approve itself does not get to be on by
+default. This reverses "make fingerprint the default", on evidence gathered
+after that decision. One env var turns it back on where the reader is trusted.
+
+### Not only AppLocker — check the system stack
+`pam_fprintd` also sits in `/etc/pam.d/common-auth` (Ubuntu's
+`pam-auth-update`), which `sudo`, `polkit-1` and the KDE lock screen include
+with `[success=2 default=ignore]`. A spurious driver success there *skips*
+`pam_unix` and authenticates. The same bogus match that opened a locked app can
+grant `sudo` or dismiss the lock screen. Nothing here can fix that: disable the
+fingerprint profile system-wide (`sudo pam-auth-update`, untick Fingerprint)
+until the driver is fixed.
+
+### How availability is probed (asked, so recorded)
+Re-checked on **every** auth run, never cached: `APPLOCKER_FP=1`, the PAM
+service file exists, and `timeout 3 fprintd-list $USER` exits 0 with at least
+one `- #<n>: <finger>` line. Therefore:
+- **reader unplugged** → `fprintd-list` fails → tier skipped: no button, no
+  wait. A hung fprintd is bounded by that `timeout 3`.
+- **plugged in later** → the next unlock sees it, no restart needed.
+- **connected but nothing enrolled** → still unavailable (no `- #` line).
+- plugging in mid-run only affects the dialog's button, not the pre-prompt tier
+  that has already run.
+
 ## 0.0.10 — you can finally see that face unlock worked
 
 ### Fixed

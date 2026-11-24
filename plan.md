@@ -84,6 +84,22 @@ and that looked like a bypass. NOT the watchdog (0.0.3), NOT the AppImage mount
 - [ ] THE REAL FIX for the original complaint: show a brief "Face recognised"
   confirmation on an allow, so a silent pass doesn't read as "no lock at all".
 
+### [!] 0i. FINGERPRINT BYPASS — REAL, OBSERVED, now opt-in (0.0.12)
+14:29:13-16: three locked Zen launches `allow (auth passed)` with NO finger, NO
+face (no `matching against` lines), NO dialog, NO password. fprintd logged three
+"Driver reported a match providing a scanned print that is not matching any in
+the gallery" at those same seconds. User confirmed no finger on the reader.
+=> THIS is the original "if authentication fails it opens anyway".
+- [x] Tier flipped to OPT-IN (`APPLOCKER_FP=1`). Reverses the user's
+  "fingerprint as default" instruction, on evidence gathered afterwards.
+- [ ] OUTSIDE APPLOCKER, tell the user: `pam_fprintd` is in
+  /etc/pam.d/common-auth with `[success=2 default=ignore]`, which sudo,
+  polkit-1 and the KDE lock screen all include — the same bogus match can grant
+  sudo or dismiss the lock screen. Fix: `sudo pam-auth-update`, untick
+  Fingerprint.
+- [ ] Reproduction is intermittent. `applockerd auth-test <name>` (positional,
+  NOT --app) retries it; with face ON it also opens a camera + dialog.
+
 ### [ ] 0f. FINGERPRINT READER IS BROKEN ON THIS MACHINE (driver, not us)
 fprintd/libfprint during a real attempt:
   `Read failed: device was disconnected, aborting`
