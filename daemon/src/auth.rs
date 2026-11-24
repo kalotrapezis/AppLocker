@@ -294,9 +294,18 @@ fn stamp_fingerprint() {
 /// polkit prompt that nobody will answer (~25s). We always run as root here, so
 /// that shouldn't happen, but a stalled probe would delay the unlock prompt.
 fn fingerprint_enrolled(user: &str) -> bool {
-    // Escape hatch: APPLOCKER_FP=0 turns the whole tier off (no silent wait at
-    // the reader before the PIN dialog, no Fingerprint button).
-    if std::env::var("APPLOCKER_FP").map(|v| v == "0").unwrap_or(false) {
+    // OPT-IN (`APPLOCKER_FP=1`), and deliberately not the default.
+    //
+    // On 2026-11-24 this tier produced a real bypass on the dev machine: three
+    // locked-app launches were allowed with no finger, no face and no dialog,
+    // while fprintd logged, at those same three seconds, "Driver reported a
+    // match providing a scanned print that is not matching any in the gallery"
+    // (Chipsailing CS9711). A flaky libfprint driver can hand PAM a success
+    // nobody asked for, and PAM success is all we can see from in here.
+    //
+    // A lock must fail safe: a factor that can approve itself does not get to be
+    // on by default. On hardware whose reader you trust, set APPLOCKER_FP=1.
+    if std::env::var("APPLOCKER_FP").map(|v| v != "1").unwrap_or(true) {
         return false;
     }
     if !std::path::Path::new("/etc/pam.d/applocker-fprintd").is_file() {
