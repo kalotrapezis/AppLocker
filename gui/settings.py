@@ -252,6 +252,76 @@ PAM_TIER_FILES = {
 }
 
 
+_TIER_KEYS = {"apps": "apps_methods", "lockscreen": "lockscreen_methods",
+              "files": "files_methods"}
+
+
+def read_tiers() -> dict:
+    """Per-tier method sets from the daemon's config, with the same inheritance
+    rule as policy.rs: a tier with no key follows the global switches (and the
+    lock screen never inherits the PIN)."""
+    cfg = read_config()
+    base = {"face": cfg["face"], "fingerprint": cfg.get("fingerprint", True),
+            "require_both": False, "pin": cfg["pin"], "password": cfg["sudo"]}
+    tiers = {t: dict(base) for t in _TIER_KEYS}
+    tiers["lockscreen"]["pin"] = False
+    path = cfg_path("APPLOCKER_CONFIG", "/etc/applocker/config")
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = (p.strip().lower() for p in line.split("=", 1))
+                for tier, key in _TIER_KEYS.items():
+                    if k != key:
+                        continue
+                    toks = [t.strip() for t in v.replace("+", ",").split(",")]
+                    tiers[tier] = {
+                        "face": "face" in toks,
+                        "fingerprint": any(t in toks for t in ("fingerprint", "finger", "fp")),
+                        "require_both": any(t in toks for t in ("both", "require-both")),
+                        "pin": "pin" in toks,
+                        "password": any(t in toks for t in ("password", "sudo")),
+                    }
+    except OSError:
+        pass
+    return tiers
+
+
+def tier_methods_str(t: dict) -> str:
+    """Back to the daemon's comma list, in the order `applockerd` prints it."""
+    out = []
+    if t.get("fingerprint"):
+        out.append("fingerprint")
+    if t.get("face"):
+        out.append("face")
+    if t.get("require_both"):
+        out.append("both")
+    if t.get("pin"):
+        out.append("pin")
+    if t.get("password"):
+        out.append("password")
+    return ", ".join(out) if out else "none"
+
+
+def tier_has(tier: str, method: str) -> bool:
+    return bool(read_tiers().get(tier, {}).get(method))
+
+
+def fp_pam_tier_enabled() -> bool:
+    """True if the greeter's own stack offers the reader (pam_fprintd in KDE's
+    PAM file, or system-wide via common-auth)."""
+    for path in ("/etc/pam.d/kde", "/etc/pam.d/common-auth"):
+        try:
+            with open(path) as f:
+                if "pam_fprintd" in f.read():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 def pam_tier_enabled(tier: str) -> bool:
     """True if face unlock is wired into this PAM stack right now."""
     try:
@@ -580,6 +650,8 @@ class SettingsWindow(Gtk.Window):
         # on-disk truth; `_loading` guards programmatic control updates so they
         # don't count as edits.
         self._persisted = read_config()
+        self._persisted_tiers = read_tiers()
+        self._persisted_fp_pam = fp_pam_tier_enabled()
         self._loading = False
         self._face_dialog = None  # set while the Face gear dialog is open
 
@@ -597,6 +669,7 @@ class SettingsWindow(Gtk.Window):
         body.pack_start(self.stack, True, True, 0)
 
         self._build_security_page()
+        self._build_fingerprint_page()
         self._build_apps_page()
         self._build_files_page()
         self._build_presence_page()
@@ -611,6 +684,7 @@ class SettingsWindow(Gtk.Window):
     # -- navigation sidebar + page/card scaffolding --------------------------
 
     NAV = [("security", "Security & unlock"),
+           ("fingerprint", "Fingerprint"),
            ("apps", "Locked apps"),
            ("files", "Private files"),
            ("presence", "Presence & display")]
@@ -951,6 +1025,15 @@ class SettingsWindow(Gtk.Window):
     # -- Fingerprint gear dialog (passes, test, remove) --------------------
 
     def _open_fp_dialog(self, _btn):
+        """The card's ⚙ now goes to the Fingerprint page, which has everything
+        the old dialog had plus the per-tier switches."""
+        self._select_page("fingerprint")
+        for row in self.nav.get_children():
+            if getattr(row, "page", None) == "fingerprint":
+                self.nav.select_row(row)
+                break
+
+    def _unused_fp_dialog(self, _btn):
         dlg = Gtk.Dialog(title="Fingerprint unlock", transient_for=self, modal=True)
         dlg.set_default_size(470, 460)
         dlg.add_button("Close", Gtk.ResponseType.CLOSE)
@@ -1091,7 +1174,7 @@ class SettingsWindow(Gtk.Window):
 
     def _on_fp_delete(self, _btn):
         ask = Gtk.MessageDialog(
-            transient_for=self._fp_dialog, modal=True,
+            transient_for=self, modal=True,
             message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.OK_CANCEL,
             text="Remove every enrolled pass?")
         ask.format_secondary_text(
@@ -1124,6 +1207,16 @@ class SettingsWindow(Gtk.Window):
             self.fp_switch.set_sensitive(present)
         if getattr(self, "fp_gear", None) is not None:
             self.fp_gear.set_sensitive(present)
+        if getattr(self, "fp_list", None) is not None:
+            try:
+                self._refresh_fp_list()
+            except Exception:
+                pass
+        if getattr(self, "fp_page_status", None) is not None:
+            self.fp_page_status.set_text(
+                "Reader detected." if present else
+                "No fingerprint reader detected. If it is plugged in, reseat it "
+                "and reopen Settings.")
         if getattr(self, "fp_summary", None) is None:
             return False
         if not present:
@@ -1232,6 +1325,64 @@ class SettingsWindow(Gtk.Window):
             return
         set_service(not service_active())
         self._refresh_service()
+
+    # -- Fingerprint page ----------------------------------------------------
+
+    def _build_fingerprint_page(self):
+        page = self._page(
+            "fingerprint", "Fingerprint",
+            "Enrol passes of your finger and choose where the reader may unlock.")
+
+        # Reader + enrolment.
+        card = self._card(page)
+        self._heading_row(card, "Reader")
+        self.fp_page_status = self._dim(card, "Looking for a reader…")
+        self.fp_list = Gtk.ListBox()
+        self.fp_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        card.pack_start(self.fp_list, False, False, 0)
+        self._dim(card, "A press reader only sees a small patch of skin, so one "
+                        "pass covers one angle. Add two or three passes of the "
+                        "SAME finger, held a little differently each time — any "
+                        "of them unlocks.")
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btns.set_halign(Gtk.Align.START)
+        self.fp_add_btn = Gtk.Button(label="Add a pass…")
+        self.fp_add_btn.connect("clicked", self._on_fp_add)
+        btns.pack_start(self.fp_add_btn, False, False, 0)
+        self.fp_test_btn = Gtk.Button(label="Test (5 presses)")
+        self.fp_test_btn.connect("clicked", self._on_fp_test)
+        btns.pack_start(self.fp_test_btn, False, False, 0)
+        self.fp_del_btn = Gtk.Button(label="Remove all")
+        self.fp_del_btn.connect("clicked", self._on_fp_delete)
+        btns.pack_start(self.fp_del_btn, False, False, 0)
+        card.pack_start(btns, False, False, 0)
+        self.fp_status = Gtk.Label(xalign=0, label="")
+        self.fp_status.set_line_wrap(True)
+        card.pack_start(self.fp_status, False, False, 0)
+
+        # Where the reader may unlock — one switch per tier.
+        where = self._card(page)
+        self._heading_row(where, "Unlock these with your finger")
+        self._dim(where, "Each place keeps its own setting. Turning them all off "
+                         "leaves face and your PIN or password.")
+        self.fp_tier_switches = {}
+        for tier, label in (("apps", "Locked apps"),
+                            ("files", "Private files"),
+                            ("lockscreen", "Lock screen (via the login stack)")):
+            initial = (fp_pam_tier_enabled() if tier == "lockscreen"
+                       else tier_has(tier, "fingerprint"))
+            row, sw = self._switch_row(label, initial)
+            sw.connect("notify::active", self._on_fp_tier_toggled, tier)
+            self.fp_tier_switches[tier] = sw
+            where.pack_start(row, False, False, 0)
+        self._dim(where, "The lock screen one adds pam_fprintd to KDE's login "
+                         "stack, so the greeter itself offers the reader. Your "
+                         "password always still works.")
+
+    def _on_fp_tier_toggled(self, switch, _param, tier):
+        if self._loading:
+            return
+        self._update_apply_state()
 
     # -- Locked apps page ----------------------------------------------------
 
@@ -1786,6 +1937,8 @@ class SettingsWindow(Gtk.Window):
 
     def _snapshot_ui(self) -> dict:
         return {
+            "fp_tiers": {t: sw.get_active()
+                         for t, sw in getattr(self, "fp_tier_switches", {}).items()},
             "face": self.face_switch.get_active(),
             "pin": self.pin_switch.get_active(),
             "fingerprint": self.fp_switch.get_active(),
@@ -1802,6 +1955,18 @@ class SettingsWindow(Gtk.Window):
         ops = []
         if ui["face"] != base["face"]:
             ops.append(["set-face", "on" if ui["face"] else "off"])
+        # Per-tier fingerprint. apps/files are policy; the lock screen is the
+        # greeter's own PAM stack, which only root may edit — hence the broker.
+        for tier, want in ui.get("fp_tiers", {}).items():
+            if tier == "lockscreen":
+                if want != self._persisted_fp_pam:
+                    ops.append(["pam", "fingerprint", "on" if want else "off"])
+                continue
+            current = self._persisted_tiers.get(tier, {})
+            if want != bool(current.get("fingerprint")):
+                merged = dict(current)
+                merged["fingerprint"] = want
+                ops.append(["set-methods", tier, tier_methods_str(merged)])
         if ui["fingerprint"] != base["fingerprint"]:
             ops.append(["set-fingerprint", "on" if ui["fingerprint"] else "off"])
         if ui["pin"] != base["pin"] or ui["sudo"] != base["sudo"]:
@@ -1857,6 +2022,8 @@ class SettingsWindow(Gtk.Window):
                    or (p["apps_enabled"] and not ui["apps_enabled"]))
         if run_privileged_batch(ops, force=weakens):
             self._persisted = read_config()
+            self._persisted_tiers = read_tiers()
+            self._persisted_fp_pam = fp_pam_tier_enabled()
             self._reset_controls()  # resync to what actually saved
             self._update_apply_state()
             self._toast("Changes applied.")

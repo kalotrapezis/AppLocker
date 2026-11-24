@@ -3,6 +3,26 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.26 — a Fingerprint page, with per-place switches
+
+- **New "Fingerprint" page** in the sidebar, between Security and Locked apps.
+  The reader's state, the passes you have enrolled, and **Add a pass… /
+  Test (5 presses) / Remove all** — the enrolment that used to be a CLI script,
+  in the app. The ⚙ on the Security card jumps here.
+- **"Unlock these with your finger"**: one switch each for **Locked apps**,
+  **Private files** and **Lock screen**. The first two write the per-tier policy
+  from 0.0.25; the lock-screen one adds `pam_fprintd` to KDE's own login stack
+  through the broker, which is what makes the **greeter** offer the reader —
+  the thing that was missing.
+- The lock-screen switch reads its true state from `/etc/pam.d/kde` and
+  `common-auth`, so it reflects what the system actually does rather than what
+  AppLocker wishes.
+
+### Still CLI-only
+Face, PIN and password per tier, and the `both` cross-check, are set with
+`applockerd set-methods <tier> <list>`; the page only exposes the fingerprint
+half of that matrix so far.
+
 ## 0.0.25 — apps, lock screen and files get their own methods
 
 ### Added
