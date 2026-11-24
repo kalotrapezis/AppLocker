@@ -3,6 +3,32 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.23 — `applocker-fp-enroll`: more passes of the same finger
+
+"I don't know why, now it's like it's a different finger." Because there is
+exactly **one** template: `fprintd-enroll` fills a single finger slot, and a
+press-type sensor only photographs a small patch of skin — press at a slightly
+different angle and it is, as far as the matcher is concerned, a different
+finger. Phones take a dozen-plus captures across the fingertip.
+
+New `applocker-fp-enroll` spends three slots on the **same** finger, held
+differently each round (flat, rolled left, rolled right). `pam_fprintd` matches
+against every enrolled slot, so any of the three opens a lock.
+
+```
+applocker-fp-enroll            # add passes
+applocker-fp-enroll --reset    # wipe first, then enrol
+applocker-fp-enroll --check    # 5 presses, reports how many matched
+```
+
+`--check` is the honest part: it tells you whether enrolment actually helped on
+this hardware, or whether the USB connection is the problem after all. Four
+matches out of five or better is healthy.
+
+Not reinventing libfprint, deliberately: the driver decides how many presses an
+enrolment takes, and a reader that fabricates matches does so below any
+template store we could write. More slots is the real lever available to us.
+
 ## 0.0.22 — the gate covers every filesystem, not just `/`
 
 The hole behind everything else: **`/tmp` is tmpfs, a different filesystem, and

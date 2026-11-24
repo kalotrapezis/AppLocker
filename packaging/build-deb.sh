@@ -10,7 +10,7 @@ set -euo pipefail
 # Version is a fixed base + a testing-round letter that bumps every build:
 # 0.0.1-a, 0.0.1-b, ...  Pass an explicit letter to rebuild a round:
 #   packaging/build-deb.sh c
-VERSION_BASE="0.0.22"
+VERSION_BASE="0.0.23"
 ROUND_FILE="$(dirname "$0")/.build-round"
 # APPLOCKER_VERSION overrides the whole version string (for a real release, e.g.
 # APPLOCKER_VERSION=0.0.1 APPLOCKER_RELEASE=1 packaging/build-deb.sh). Otherwise
@@ -78,6 +78,7 @@ ln -s ../lib/applocker/applockerd "$STAGE/usr/bin/applockerd"
 install -m 0755 "$REPO/packaging/bin/applocker-pam" "$STAGE/usr/bin/applocker-pam"
 install -m 0755 "$REPO/packaging/bin/applocker" "$STAGE/usr/bin/applocker"
 install -m 0755 "$REPO/packaging/bin/applocker-test-scope" "$STAGE/usr/bin/applocker-test-scope"
+install -m 0755 "$REPO/packaging/bin/applocker-fp-enroll" "$STAGE/usr/bin/applocker-fp-enroll"
 
 # DEV MODE marker: while this file exists the daemon refuses to gate all of / (so
 # the app-gate can't freeze the machine); the app-gate only runs when explicitly

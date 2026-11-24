@@ -768,6 +768,9 @@ class SettingsWindow(Gtk.Window):
         self._dim(fp, "Touch the reader when an app asks. Tried before face, "
                       "and skipped automatically when no reader or no enrolled "
                       "finger is found — so face and your PIN still work.")
+        self._dim(fp, "Reads badly? One template covers one angle. Run "
+                      "applocker-fp-enroll in a terminal to add passes of the "
+                      "same finger, or --check to measure how often it matches.")
         self._dim(fp, "With face unlock also on, the two are cross-checked: a "
                       "locked app opens only if both match, with no PIN or "
                       "password way round it. Turn one off to use a single "
