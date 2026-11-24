@@ -3,6 +3,26 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.27 — Settings can't freeze on Apply any more
+
+"The app crashed when I saved the fingerprint settings." It did not crash of its
+own accord: `_apply` called the broker **synchronously on the GTK main thread**,
+with a 300-second socket timeout. The broker was wedged at the time, so the
+window stopped repainting, and a frozen Wayland window gets killed — reported as
+a crash, with SIGABRT and no Python traceback, which is exactly what we saw.
+
+- Apply now runs in a worker thread; the UI stays alive, Apply/Revert disable
+  themselves and the status line says "Applying…" until the broker answers.
+- Nothing had been half-saved: no per-tier keys were written and
+  `/etc/pam.d/kde` was untouched, because the ops never reached the broker.
+
+### What wedged the broker
+Three Settings instances were open at once, two of them sitting at an auth
+prompt. The broker serves one request at a time, so those prompts held it and
+every later launch failed its startup auth and exited instantly — "the app does
+not open now". 0.0.25's 180-second prompt timeout is the permanent fix; it just
+was not installed yet.
+
 ## 0.0.26 — a Fingerprint page, with per-place switches
 
 - **New "Fingerprint" page** in the sidebar, between Security and Locked apps.

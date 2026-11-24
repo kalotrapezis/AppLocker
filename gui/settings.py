@@ -2020,7 +2020,23 @@ class SettingsWindow(Gtk.Window):
                    or (p["pin"] and not ui["pin"])
                    or (p["sudo"] and not ui["sudo"])
                    or (p["apps_enabled"] and not ui["apps_enabled"]))
-        if run_privileged_batch(ops, force=weakens):
+        # The broker is single-threaded and its auth can open a dialog, so this
+        # call can take minutes. Doing it on the UI thread froze the whole
+        # window — and a frozen window gets killed, which is what "the app
+        # crashed when I saved" actually was.
+        self.apply_btn.set_sensitive(False)
+        self.revert_btn.set_sensitive(False)
+        self.dirty_label.set_text("Applying…")
+
+        def work():
+            ok = run_privileged_batch(ops, force=weakens)
+            GLib.idle_add(self._apply_finished, ok, started_attention)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_finished(self, ok, started_attention):
+        """Back on the UI thread once the broker has answered."""
+        if ok:
             self._persisted = read_config()
             self._persisted_tiers = read_tiers()
             self._persisted_fp_pam = fp_pam_tier_enabled()
@@ -2034,6 +2050,10 @@ class SettingsWindow(Gtk.Window):
             # Cancelled or failed → the UI must not keep showing the change.
             self._revert()
             self._toast("Changes not applied.")
+        self.apply_btn.set_sensitive(True)
+        self.revert_btn.set_sensitive(True)
+        self._update_apply_state()
+        return False
 
     def _revert(self, _btn=None):
         self._reset_controls()
