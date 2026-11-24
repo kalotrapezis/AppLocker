@@ -10,7 +10,7 @@ set -euo pipefail
 # Version is a fixed base + a testing-round letter that bumps every build:
 # 0.0.1-a, 0.0.1-b, ...  Pass an explicit letter to rebuild a round:
 #   packaging/build-deb.sh c
-VERSION_BASE="0.0.8"
+VERSION_BASE="0.0.9"
 ROUND_FILE="$(dirname "$0")/.build-round"
 # APPLOCKER_VERSION overrides the whole version string (for a real release, e.g.
 # APPLOCKER_VERSION=0.0.1 APPLOCKER_RELEASE=1 packaging/build-deb.sh). Otherwise
@@ -147,6 +147,11 @@ if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
 	# On an UPGRADE the unit is already running the old binary; restart it so the
 	# freshly-installed daemon takes over (enable --now won't restart a running one).
 	systemctl try-restart applockerd-broker.service >/dev/null 2>&1 || true
+	# Same for the GATE, when the admin has it on: without this, an upgrade
+	# installs the new binary but the old one keeps enforcing until a reboot —
+	# so a fix looks like it did nothing. try-restart is a no-op when it's off,
+	# which is the common case, so this never turns enforcement on.
+	systemctl try-restart applockerd.service >/dev/null 2>&1 || true
 fi
 # Refresh the icon + desktop caches so the launcher icon appears immediately.
 gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
@@ -189,6 +194,11 @@ if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
 	# On an UPGRADE the unit is already running the old binary; restart it so the
 	# freshly-installed daemon takes over (enable --now won't restart a running one).
 	systemctl try-restart applockerd-broker.service >/dev/null 2>&1 || true
+	# Same for the GATE, when the admin has it on: without this, an upgrade
+	# installs the new binary but the old one keeps enforcing until a reboot —
+	# so a fix looks like it did nothing. try-restart is a no-op when it's off,
+	# which is the common case, so this never turns enforcement on.
+	systemctl try-restart applockerd.service >/dev/null 2>&1 || true
 fi
 # Refresh the icon + desktop caches so the launcher icon appears immediately.
 gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true

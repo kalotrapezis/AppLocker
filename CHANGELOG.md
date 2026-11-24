@@ -3,6 +3,15 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.9 — an upgrade now takes effect without a reboot
+
+### Fixed
+- **`postinst` restarted the broker but not the gate.** With enforcement on, an
+  upgrade installed the new binary while the *old* one kept running — so a fix
+  looked like it had done nothing until the next reboot. Both units are
+  `try-restart`ed now, which is a no-op when the gate is off (the common case),
+  so upgrading still never turns enforcement on by itself.
+
 ## 0.0.8 — a broken reader must not cost you a password attempt
 
 ### Fixed

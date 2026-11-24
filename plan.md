@@ -41,6 +41,14 @@ Version bumps land in `dist/applocker_0.0.1-<letter>_amd64.deb`.
 
 ## P0 — core correctness (do first, in order)
 
+### [x] 0g. 0.0.9 — upgrades apply without a reboot
+`postinst` try-restarted only the broker, so with the gate on an upgrade left
+the OLD binary enforcing until reboot (a fix would look like a no-op). Now both.
+No-op when the gate is off, so it never enables enforcement.
+State after the user disabled the gate and rebooted (2026-11-24): gate
+inactive+disabled, broker active, watcher AUTOSTARTED on its own (pid 3005) with
+the lock-screen face unlock live — no manual start needed any more.
+
 ### [x] 0e. GATE ON — Viber mystery SOLVED (my diagnosis was wrong, twice)
 Journal evidence (Nov 20-23, gate was running): 7 Viber launches, ALL
 `allow (auth passed)` in 1-3s. No DENY, no fail-open, no second instance.
