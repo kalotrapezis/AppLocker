@@ -3,6 +3,23 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.32 — the per-place switches stop lying (and stop being stuck)
+
+Reported with a screenshot: the Face page showed **Locked apps** and
+**Private files** switched **on**, greyed out so they could not be switched
+off, under a line saying face was off anyway.
+
+Three things were wrong at once, all mine:
+
+- They were **frozen** (`set_sensitive(False)`). A switch you cannot move is
+  worse than one that explains itself. They are live again.
+- They showed the **saved** value while the daemon was clamping it to off, so
+  "on" was a lie. Both readers now clamp to the master switch, the same way
+  `policy.rs` does — what you see is what the daemon does.
+- Applying while the master was off left the saved lists still naming the
+  factor. The master now **clamps on write** too, so the file can't drift from
+  the UI.
+
 ## 0.0.31 — the fingerprint veto was wrong, and is now off by default
 
 I built the veto (0.0.13) on a misreading, and it has been rejecting your real

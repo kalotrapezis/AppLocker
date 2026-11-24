@@ -286,6 +286,13 @@ def read_tiers() -> dict:
                     }
     except OSError:
         pass
+    # Clamp to the masters, exactly as policy.rs does, so the UI never shows a
+    # place as "on" that the daemon is quietly ignoring — and so the baseline
+    # matches what is displayed (otherwise Settings opens already dirty).
+    for t in tiers.values():
+        t["face"] = t["face"] and cfg["face"]
+        t["fingerprint"] = t["fingerprint"] and cfg.get("fingerprint", True)
+        t["require_both"] = t["require_both"] and t["face"] and t["fingerprint"]
     return tiers
 
 
@@ -1391,7 +1398,7 @@ class SettingsWindow(Gtk.Window):
                             ("sudo", "Terminal sudo (via the sudo stack)")):
             initial = (pam_tier_enabled("screenlock") if tier == "lockscreen"
                        else pam_tier_enabled("sudo") if tier == "sudo"
-                       else tier_has(tier, "face"))
+                       else tier_has(tier, "face"))   # already clamped
             srow, sw = self._switch_row(label, initial)
             sw.connect("notify::active", self._on_face_tier_toggled, tier)
             self.face_tier_switches[tier] = sw
@@ -1411,12 +1418,15 @@ class SettingsWindow(Gtk.Window):
         if getattr(self, "face_master_hint", None) is None:
             return
         on = self.face_switch.get_active() if hasattr(self, "face_switch") else False
-        for sw in getattr(self, "face_tier_switches", {}).values():
-            sw.set_sensitive(on)
+        # Deliberately NOT disabled: a switch you cannot move is worse than one
+        # that explains itself, and turning these off is a reasonable thing to
+        # want while the master is off. Applying with the master off also
+        # clears them from the saved lists (see _compute_ops), so what you see
+        # here is what the daemon will do.
         self.face_master_hint.set_text(
             "" if on else
-            "Face unlock is off in Security & unlock, so none of these apply "
-            "until you turn it back on.")
+            "Face unlock is off in Security & unlock, so these show off and "
+            "stay off. Turn it back on there, then pick the places you want.")
 
     # -- Fingerprint page ----------------------------------------------------
 
@@ -1464,7 +1474,7 @@ class SettingsWindow(Gtk.Window):
                             ("sudo", "Terminal sudo (via the sudo stack)")):
             initial = (fp_pam_tier_enabled() if tier == "lockscreen"
                        else fp_sudo_tier_enabled() if tier == "sudo"
-                       else tier_has(tier, "fingerprint"))
+                       else tier_has(tier, "fingerprint"))   # already clamped
             row, sw = self._switch_row(label, initial)
             sw.connect("notify::active", self._on_fp_tier_toggled, tier)
             self.fp_tier_switches[tier] = sw
@@ -2063,6 +2073,7 @@ class SettingsWindow(Gtk.Window):
                 if want != self._persisted_fp_sudo:
                     ops.append(["pam", "sudo-fingerprint", "on" if want else "off"])
                 continue
+            want = want and ui["fingerprint"]
             current = self._persisted_tiers.get(tier, {})
             if want != bool(current.get("fingerprint")):
                 merged = dict(current)
@@ -2074,6 +2085,9 @@ class SettingsWindow(Gtk.Window):
                 if want != self._persisted_face_tiers.get(tier):
                     ops.append(["pam", pam_tier, "on" if want else "off"])
                 continue
+            # The master wins, exactly as the daemon clamps it — and we write
+            # that through, so the saved list never disagrees with Settings.
+            want = want and ui["face"]
             current = self._persisted_tiers.get(tier, {})
             if want != bool(current.get("face")):
                 merged = dict(current)
