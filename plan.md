@@ -136,6 +136,20 @@ the gallery" at those same seconds. User confirmed no finger on the reader.
 - [ ] Reproduction is intermittent. `applockerd auth-test <name>` (positional,
   NOT --app) retries it; with face ON it also opens a camera + dialog.
 
+### [x] 0l. READER ROOT CAUSE = THE USB PORT (measured 2026-11-24)
+38 disconnects / 45 reconnects in ONE DAY on usb 3-1 (device number up to 46).
+Not a weak sensor, not thin enrolment, not a libfprint matcher bug:
+- With the link up, `applocker-fp-enroll --check` scores 5/5.
+- During a disconnect window `fprintd-list` returns an EMPTY gallery — which is
+  why it felt like "something happened to the signature". The template is fine;
+  three reads a second later all show `- #0: right-index-finger`.
+- "Driver reported a match ... not matching any in the gallery" = host/device
+  DESYNC after a reconnect (the chip matches against its own store), not the
+  driver inventing a print. PAM still returns success, so the veto stays right.
+- FIX IS PHYSICAL: reseat / change port / short extension. No software change
+  helps; AppLocker already degrades well (veto, 60s cooldown, fall back to
+  face/PIN).
+
 ### [ ] 0f. FINGERPRINT READER IS BROKEN ON THIS MACHINE (driver, not us)
 fprintd/libfprint during a real attempt:
   `Read failed: device was disconnected, aborting`
