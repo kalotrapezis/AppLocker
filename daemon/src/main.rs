@@ -57,10 +57,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
-use applockerd::auth::{self, Outcome, SystemFallback};
+use applockerd::auth::{self, Fallback, Outcome, SystemFallback};
 use applockerd::desktop::{self, AppKind};
 use applockerd::face;
-use applockerd::feedback::{ClosingPrompter, FaceWithFeedback, Feedback};
+use applockerd::feedback::{ClosingPrompter, FaceWithFeedback, Feedback, FallbackWithFeedback};
 use applockerd::folderlist::{self, FolderList, LockedFolder};
 use applockerd::gate::{CachePolicy, Decision, GuiPrompter, UnlockCache};
 use applockerd::locklist::{self, LockList, LockedApp};
@@ -764,19 +764,22 @@ fn cmd_auth_test(app: Option<String>) {
     let app = app.unwrap_or_else(|| "auth-test".to_string());
     let (face, attempts, face_live) = face::build();
     let cfg = face::config_for(attempts);
-    let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+    let system = SystemFallback::system();
+    let user = system.user.clone();
+    let show = face_live || system.fingerprint_available();
+    let fb = std::rc::Rc::new(std::cell::RefCell::new(if show {
         Feedback::spawn(&app)
     } else {
         Feedback::none()
     }));
     let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
-    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app, face_live), fb);
-    let fallback = SystemFallback::system();
+    let mut prompter = ClosingPrompter::new(GuiPrompter::new(&app, face_live), fb.clone());
+    let fallback = FallbackWithFeedback::new(system, fb);
     let pol = policy::load_default();
 
     println!(
         "applockerd: auth-test for {app:?} (user={}) — policy: {}",
-        fallback.user,
+        user,
         pol.summary(),
     );
 
@@ -1168,17 +1171,24 @@ fn handle_event(
                 thread::spawn(move || {
                     let (face, attempts, face_live) = face::build();
                     let cfg = face::config_for(attempts);
-                    let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+                    let system = SystemFallback::system();
+                    // The window is for the reader too: its wait is silent and
+                    // several seconds long, so without it nobody knows to touch.
+                    let show = face_live || system.fingerprint_available();
+                    let fb = std::rc::Rc::new(std::cell::RefCell::new(if show {
                         Feedback::spawn(&app_inner)
                     } else {
                         Feedback::none()
                     }));
                     let mut face = FaceWithFeedback::new(face, fb.clone(), attempts);
                     let mut prompter = Announcing::new(
-                        ClosingPrompter::new(GuiPrompter::new(&app_inner, face_live), fb),
+                        ClosingPrompter::new(
+                            GuiPrompter::new(&app_inner, face_live),
+                            fb.clone(),
+                        ),
                         tx_prompt,
                     );
-                    let fallback = SystemFallback::system();
+                    let fallback = FallbackWithFeedback::new(system, fb);
                     let outcome = auth::run(&cfg, &mut face, &mut prompter, &fallback);
                     // If the outer thread already timed out, the receiver is gone
                     // and this send is a harmless no-op.

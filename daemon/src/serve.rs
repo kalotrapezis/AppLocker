@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use crate::auth::{self, Available, FaceVerifier, Fallback, Method, Outcome, PromptResult,
                   Prompter, SystemFallback};
 use crate::face;
-use crate::feedback::{ClosingPrompter, FaceWithFeedback, Feedback};
+use crate::feedback::{ClosingPrompter, FaceWithFeedback, Feedback, FallbackWithFeedback};
 use crate::gate::GuiPrompter;
 use crate::pin;
 use crate::session;
@@ -295,14 +295,16 @@ fn authenticate(reason: &str) -> bool {
         fb0.pin_available(), fb0.sudo_available(),
     );
     let cfg = face::config_for(attempts);
-    let fb = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
+    let system = SystemFallback::system();
+    let show = face_live || system.fingerprint_available();
+    let fb = std::rc::Rc::new(std::cell::RefCell::new(if show {
         Feedback::spawn(reason)
     } else {
         Feedback::none()
     }));
     let mut face = FaceWithFeedback::new(face_v, fb.clone(), attempts);
-    let mut prompter = ClosingPrompter::new(GuiPrompter::new(reason, face_live), fb);
-    let fallback = SystemFallback::system();
+    let mut prompter = ClosingPrompter::new(GuiPrompter::new(reason, face_live), fb.clone());
+    let fallback = FallbackWithFeedback::new(system, fb);
     matches!(
         auth::run(&cfg, &mut face, &mut prompter, &fallback),
         Outcome::Allowed
@@ -433,6 +435,17 @@ fn get_sudo(reason: &str) -> String {
     // Frictionless paths, fastest first: the fingerprint reader (no camera, no
     // typing) and then face. Both are identity proofs, so either releases it.
     let fb0 = SystemFallback::system();
+    // Same feedback window as authenticate(): without it a face match — or the
+    // reader's several-second silent wait — reads as "nothing happened".
+    let (face_v, attempts, face_live) = face::build();
+    let win = std::rc::Rc::new(std::cell::RefCell::new(
+        if face_live || fb0.fingerprint_available() {
+            Feedback::spawn(reason)
+        } else {
+            Feedback::none()
+        },
+    ));
+    let fb0 = FallbackWithFeedback::new(fb0, win.clone());
     if fb0.fingerprint_available() && fb0.verify_fingerprint().unwrap_or(false) {
         store.record_success();
         return match store.load() {
@@ -440,14 +453,6 @@ fn get_sudo(reason: &str) -> String {
             None => "notset".to_string(),
         };
     }
-    // Same feedback window as authenticate(): without it a face match here is
-    // completely silent, which reads as "nothing happened".
-    let (face_v, attempts, face_live) = face::build();
-    let win = std::rc::Rc::new(std::cell::RefCell::new(if face_live {
-        Feedback::spawn(reason)
-    } else {
-        Feedback::none()
-    }));
     let mut face_v = FaceWithFeedback::new(face_v, win.clone(), attempts);
     for _ in 0..attempts {
         if face_v.try_match() {

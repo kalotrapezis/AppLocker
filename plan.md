@@ -56,10 +56,13 @@ just opened, which is exactly what "the lock did nothing" looks like.
   FaceWithFeedback + ClosingPrompter pair. CORRECTION to my earlier note: the
   broker's main `authenticate()` always had the window — only get_sudo lacked
   it. Needed `FaceVerifier` in scope in serve.rs for the trait method.
-- [ ] STILL SILENT: the fingerprint tier, which runs before any window exists
-  (auth::run tier 0), so a touch-to-unlock is instant and unconfirmed. Fixing it
-  means handing the feedback handle to the Fallback trait — a wider change than
-  the others, so it waits for a reason beyond tidiness.
+- [x] DONE (0.0.14): the fingerprint tier shows ☝ "Touch the fingerprint
+  reader" for the whole PAM wait, then the green ✓. `FallbackWithFeedback`
+  decorator + a `finger` state in the window; the window is spawned when face OR
+  the reader is available (it used to be face-only, which is why the reader was
+  always silent). Wired into gate, auth-test, broker authenticate() and
+  get_sudo(). User's words: "we tested the fingerprint its super fast we never
+  finished the implementation".
 
 ### [x] 0g. 0.0.9 — upgrades apply without a reboot
 `postinst` try-restarted only the broker, so with the gate on an upgrade left

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 
-use crate::auth::{Available, FaceVerifier, Prompter, PromptResult};
+use crate::auth::{Available, FaceVerifier, Prompter, PromptResult, Fallback};
 
 /// A handle on one feedback-window process. Dropping it closes the window
 /// (stdin EOF), so it can never outlive the auth attempt.
@@ -67,6 +67,11 @@ impl Feedback {
 
     pub fn scanning(&mut self) {
         self.send("scanning");
+    }
+
+    /// "Touch the fingerprint reader" — the reader is waiting, silently.
+    pub fn finger(&mut self) {
+        self.send("finger");
     }
 
     pub fn fail(&mut self, attempt: u32, total: u32) {
@@ -148,6 +153,50 @@ impl FaceVerifier for FaceWithFeedback {
 
 /// Wraps a [`Prompter`]: the first time the PIN/sudo dialog is about to show,
 /// close the feedback window (after a beat, so the last shake/✕ is visible).
+/// Wraps the real [`Fallback`] so the reader's silent wait is visible: the
+/// window says "Touch the fingerprint reader" while PAM blocks, and shows the ✓
+/// if the touch is accepted. Everything else passes straight through.
+///
+/// Without this the fingerprint tier is a few seconds of nothing at all — which
+/// is how a working reader ends up looking broken.
+pub struct FallbackWithFeedback<F: Fallback> {
+    inner: F,
+    fb: SharedFeedback,
+}
+
+impl<F: Fallback> FallbackWithFeedback<F> {
+    pub fn new(inner: F, fb: SharedFeedback) -> Self {
+        FallbackWithFeedback { inner, fb }
+    }
+}
+
+impl<F: Fallback> Fallback for FallbackWithFeedback<F> {
+    fn pin_available(&self) -> bool {
+        self.inner.pin_available()
+    }
+    fn sudo_available(&self) -> bool {
+        self.inner.sudo_available()
+    }
+    fn verify_pin(&self, secret: &str) -> bool {
+        self.inner.verify_pin(secret)
+    }
+    fn verify_password(&self, secret: &str) -> Result<bool, String> {
+        self.inner.verify_password(secret)
+    }
+    fn fingerprint_available(&self) -> bool {
+        self.inner.fingerprint_available()
+    }
+
+    fn verify_fingerprint(&self) -> Result<bool, String> {
+        self.fb.borrow_mut().finger();
+        let out = self.inner.verify_fingerprint();
+        if matches!(out, Ok(true)) {
+            self.fb.borrow_mut().ok();
+        }
+        out
+    }
+}
+
 pub struct ClosingPrompter<P: Prompter> {
     inner: P,
     fb: SharedFeedback,
@@ -208,6 +257,37 @@ mod tests {
         fn prompt(&mut self, _a: Available) -> PromptResult {
             PromptResult::Entered { method: Method::Pin, secret: "x".into() }
         }
+    }
+
+    /// The window wrapper must never change a verdict — it only narrates.
+    #[test]
+    fn fallback_wrapper_passes_verdicts_through() {
+        struct Fake {
+            fp: Result<bool, String>,
+        }
+        impl Fallback for Fake {
+            fn pin_available(&self) -> bool { true }
+            fn sudo_available(&self) -> bool { false }
+            fn verify_pin(&self, s: &str) -> bool { s == "1234" }
+            fn verify_password(&self, _s: &str) -> Result<bool, String> { Ok(false) }
+            fn fingerprint_available(&self) -> bool { true }
+            fn verify_fingerprint(&self) -> Result<bool, String> { self.fp.clone() }
+        }
+        let none = || std::rc::Rc::new(std::cell::RefCell::new(Feedback::none()));
+
+        let ok = FallbackWithFeedback::new(Fake { fp: Ok(true) }, none());
+        assert_eq!(ok.verify_fingerprint(), Ok(true));
+        assert!(ok.verify_pin("1234") && !ok.verify_pin("0000"));
+        assert!(ok.pin_available() && !ok.sudo_available());
+
+        let bad = FallbackWithFeedback::new(Fake { fp: Ok(false) }, none());
+        assert_eq!(bad.verify_fingerprint(), Ok(false));
+
+        let broken = FallbackWithFeedback::new(
+            Fake { fp: Err("no reader".into()) },
+            none(),
+        );
+        assert!(broken.verify_fingerprint().is_err(), "errors stay errors");
     }
 
     #[test]

@@ -8,6 +8,7 @@ makes no decision (mirrors the philosophy of auth_prompt.py).
 
 Protocol — one command per line on **stdin** (the daemon holds the pipe):
 
+    finger              # the fingerprint reader is waiting for a touch
     scanning            # show the "looking for you" state
     fail <n> <total>    # attempt n of total failed: shake, show ✕
     ok                  # matched: show green ✓, then self-close (~1.2s; an
@@ -66,6 +67,12 @@ class FeedbackWindow(Gtk.Window):
         self.quitting = False   # True once the ✓ owns the shutdown
 
     # ── states ────────────────────────────────────────────────────────────
+    def show_finger(self):
+        # The reader waits in silence for several seconds; without this nobody
+        # knows it is live, so they wait for the password box instead.
+        self.icon.set_markup("<span size='400%'>☝</span>")
+        self.status.set_text("Touch the fingerprint reader")
+
     def show_scanning(self):
         self.icon.set_markup("<span size='400%'>👤</span>")
         self.status.set_text("Looking for you…")
@@ -119,7 +126,9 @@ def main():
         if not parts:
             return True
         cmd = parts[0]
-        if cmd == "scanning":
+        if cmd == "finger":
+            win.show_finger()
+        elif cmd == "scanning":
             win.show_scanning()
         elif cmd == "fail":
             n = int(parts[1]) if len(parts) > 1 else 1

@@ -3,6 +3,25 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.14 — the reader now says it is waiting
+
+The fingerprint tier was finished except for the part that makes it usable: it
+blocked at the reader for several seconds **with nothing on screen**, and the
+dialog's Fingerprint button closed the window before PAM even started waiting.
+A fast factor that gives no sign it is listening just looks broken.
+
+- The feedback window learns a `finger` state: ☝ **"Touch the fingerprint
+  reader"**, shown for the whole PAM wait, followed by the same green ✓ as a
+  face match when the touch is accepted.
+- New `FallbackWithFeedback` decorator (same shape as `FaceWithFeedback` and
+  `ClosingPrompter`) drives it. It only narrates — a unit test pins that it
+  never alters a verdict, errors included.
+- The window is now spawned when **either** face or the reader is available; it
+  used to appear only for face, which is why the reader tier was always silent.
+- Wired into all four auth paths: the gate's worker, `auth-test`, the broker's
+  `authenticate()` and the sudo-password release. In the release the reader is
+  now tried *after* the window exists, not before.
+
 ## 0.0.13 — fingerprint is back on, with a veto instead of a ban
 
 0.0.12 disabled the tier outright. That was the safe reflex, but the wrong
