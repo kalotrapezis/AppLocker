@@ -92,11 +92,19 @@ the gallery" at those same seconds. User confirmed no finger on the reader.
 => THIS is the original "if authentication fails it opens anyway".
 - [x] Tier flipped to OPT-IN (`APPLOCKER_FP=1`). Reverses the user's
   "fingerprint as default" instruction, on evidence gathered afterwards.
-- [ ] OUTSIDE APPLOCKER, tell the user: `pam_fprintd` is in
-  /etc/pam.d/common-auth with `[success=2 default=ignore]`, which sudo,
-  polkit-1 and the KDE lock screen all include — the same bogus match can grant
-  sudo or dismiss the lock screen. Fix: `sudo pam-auth-update`, untick
-  Fingerprint.
+- [x] OUTSIDE APPLOCKER (done 2026-11-24 ~14:45): `pam-auth-update --remove
+  fprintd` took pam_fprintd out of /etc/pam.d/common-auth (it was
+  `[success=2 default=ignore]`, so a bogus success SKIPPED pam_unix and
+  authenticated). sudo now prompts for the password with no reader step;
+  pam_unix still present, so no lock-out.
+- [!] PLASMA 6 HAS ITS OWN FINGERPRINT SERVICE: `/etc/pam.d/kde-fingerprint`
+  (`auth required pam_fprintd.so debug max-tries=5`). Removing fprintd from
+  common-auth does NOT disable fingerprint at the KDE lock screen — this file
+  must be neutered separately (`pam_fprintd` → `pam_deny`, backup kept at
+  `kde-fingerprint.applocker.bak`). It is a plasma conffile, so an upgrade will
+  ask about the local change. Re-enable by restoring the .bak.
+  NOTE: `/etc/pam.d/applocker-password` matches a grep for pam_fprintd only in a
+  COMMENT — it is pam_unix only, as intended.
 - [ ] Reproduction is intermittent. `applockerd auth-test <name>` (positional,
   NOT --app) retries it; with face ON it also opens a camera + dialog.
 
