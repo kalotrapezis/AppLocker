@@ -121,6 +121,18 @@ pub fn run(
     prompter: &mut dyn Prompter,
     fallback: &dyn Fallback,
 ) -> Outcome {
+    // Tier 0: the fingerprint reader, when a finger is enrolled. It goes first
+    // because it's the fastest factor and needs no camera — touch the reader
+    // and you're in, with no button to press first. Ignore it and it falls
+    // through to face, then the prompt (where it's offered again as a button).
+    if fallback.fingerprint_available() {
+        match fallback.verify_fingerprint() {
+            Ok(true) => return Outcome::Allowed,
+            Ok(false) => {}
+            Err(e) => eprintln!("applockerd: fingerprint unusable: {e}"),
+        }
+    }
+
     // Tier 1: recognition, up to N attempts.
     for attempt in 0..cfg.face_attempts {
         if face.try_match() {
@@ -245,6 +257,11 @@ pub const FPRINTD_SERVICE: &str = "applocker-fprintd";
 /// polkit prompt that nobody will answer (~25s). We always run as root here, so
 /// that shouldn't happen, but a stalled probe would delay the unlock prompt.
 fn fingerprint_enrolled(user: &str) -> bool {
+    // Escape hatch: APPLOCKER_FP=0 turns the whole tier off (no silent wait at
+    // the reader before the PIN dialog, no Fingerprint button).
+    if std::env::var("APPLOCKER_FP").map(|v| v == "0").unwrap_or(false) {
+        return false;
+    }
     if !std::path::Path::new("/etc/pam.d/applocker-fprintd").is_file() {
         return false;
     }
@@ -346,6 +363,31 @@ mod tests {
         good_pin: &'static str,
         good_pw: &'static str,
     }
+
+    /// Fallback with a reader attached; `touched` decides what it reports.
+    struct FpFallback {
+        touched: bool,
+    }
+    impl Fallback for FpFallback {
+        fn pin_available(&self) -> bool {
+            true
+        }
+        fn sudo_available(&self) -> bool {
+            false
+        }
+        fn verify_pin(&self, secret: &str) -> bool {
+            secret == "1234"
+        }
+        fn verify_password(&self, _secret: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn fingerprint_available(&self) -> bool {
+            true
+        }
+        fn verify_fingerprint(&self) -> Result<bool, String> {
+            Ok(self.touched)
+        }
+    }
     impl Fallback for FakeFallback {
         fn pin_available(&self) -> bool {
             self.pin
@@ -374,6 +416,37 @@ mod tests {
             method,
             secret: s.to_string(),
         }
+    }
+
+    /// Touching the reader gets you in with no dialog and no camera — that's
+    /// the "no button" path.
+    #[test]
+    fn fingerprint_allows_before_face_or_prompt() {
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: vec![], idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&fast_cfg(), &mut face, &mut prompt, &FpFallback { touched: true }),
+            Outcome::Allowed
+        );
+        assert_eq!(face.idx, 0, "face must not run once the reader accepted");
+        assert!(prompt.seen_available.is_empty());
+    }
+
+    /// Ignoring the reader must not deny — it falls through to face, then the
+    /// prompt, which still offers the reader as a button.
+    #[test]
+    fn unused_fingerprint_falls_through_to_the_prompt() {
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt {
+            answers: vec![entered(Method::Pin, "1234")],
+            idx: 0,
+            seen_available: vec![],
+        };
+        assert_eq!(
+            run(&fast_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Allowed
+        );
+        assert_eq!(prompt.seen_available[0].fingerprint, true);
     }
 
     #[test]

@@ -6,8 +6,8 @@
 # Every edit backs the file up to <file>.applocker.bak first, and `disable`
 # removes only our line — so a mistake is always reversible.
 #
-#   sudo applocker-pam enable  sudo|screenlock|screensaver|lightdm|all
-#   sudo applocker-pam disable sudo|screenlock|screensaver|lightdm|all
+#   sudo applocker-pam enable  sudo|screenlock|fingerprint|screensaver|lightdm|all
+#   sudo applocker-pam disable sudo|screenlock|fingerprint|screensaver|lightdm|all
 #   sudo applocker-pam status
 #
 # Tiers: `sudo` (/etc/pam.d/sudo) and `screenlock` (KDE Plasma screen locker,
@@ -22,10 +22,23 @@ set -eu
 
 MODULE="pam_applocker.so"
 
+# Which module a tier manages. All tiers but `fingerprint` are our own face
+# module; `fingerprint` inserts pam_fprintd into the SAME KDE stack so the lock
+# screen offers "touch the sensor" with no button press (Plasma >= 6 starts that
+# conversation as soon as the greeter appears). Per-tier so disabling one tier
+# never strips the other one's line out of /etc/pam.d/kde.
+module_for() {
+	case "$1" in
+	fingerprint) echo "pam_fprintd.so" ;;
+	*)           echo "$MODULE" ;;
+	esac
+}
+
 file_for() {
 	case "$1" in
 	sudo)        echo /etc/pam.d/sudo ;;           # terminal sudo
 	screenlock)  echo /etc/pam.d/kde ;;            # KDE kscreenlocker PAM service
+	fingerprint) echo /etc/pam.d/kde ;;            # same stack, pam_fprintd
 	screensaver) echo /etc/pam.d/cinnamon-screensaver ;;
 	lightdm)     echo /etc/pam.d/lightdm ;;
 	*)           echo "" ;;
@@ -40,7 +53,8 @@ file_for() {
 # copy it into /etc/pam.d before editing, so the rest of the stack is preserved.
 vendor_for() {
 	case "$1" in
-	screenlock) echo /usr/lib/pam.d/kde ;;
+	screenlock)  echo /usr/lib/pam.d/kde ;;
+	fingerprint) echo /usr/lib/pam.d/kde ;;
 	*)          echo "" ;;
 	esac
 }
@@ -49,8 +63,11 @@ vendor_for() {
 # camera priority (recognize.py reads it) so it preempts the desktop helpers.
 line_for() {
 	case "$1" in
-	screenlock) printf 'auth\tsufficient\t%s\tpriority=lockscreen' "$MODULE" ;;
-	*)          printf 'auth\tsufficient\t%s' "$MODULE" ;;
+	screenlock)  printf 'auth\tsufficient\t%s\tpriority=lockscreen' "$MODULE" ;;
+	# sufficient + a short timeout: if the reader is ignored or broken, the
+	# stack falls straight through to the password field.
+	fingerprint) printf 'auth\tsufficient\tpam_fprintd.so\ttimeout=10' ;;
+	*)           printf 'auth\tsufficient\t%s' "$MODULE" ;;
 	esac
 }
 
@@ -78,7 +95,12 @@ enable_one() {
 		fi
 	fi
 	line="$(line_for "$tier")"
-	if grep -q "$MODULE" "$f"; then
+	mod="$(module_for "$tier")"
+	if [ "$tier" = "fingerprint" ] && ! ls /lib/*/security/pam_fprintd.so >/dev/null 2>&1; then
+		echo "skip fingerprint: pam_fprintd.so not installed (apt install libpam-fprintd)" >&2
+		return 0
+	fi
+	if grep -q "$mod" "$f"; then
 		echo "$tier: already enabled ($f)"; return 0
 	fi
 	cp -n "$f" "$f.applocker.bak" 2>/dev/null || true
@@ -102,11 +124,12 @@ disable_one() {
 	f="$(file_for "$tier")"
 	if [ -z "$f" ]; then echo "unknown tier: $tier" >&2; return 1; fi
 	if [ ! -f "$f" ]; then echo "skip $tier: $f not found" >&2; return 0; fi
-	if ! grep -q "$MODULE" "$f"; then
+	mod="$(module_for "$tier")"
+	if ! grep -q "$mod" "$f"; then
 		echo "$tier: not enabled"; return 0
 	fi
 	cp -n "$f" "$f.applocker.bak" 2>/dev/null || true
-	grep -v "$MODULE" "$f" > "$f.applocker.tmp"
+	grep -v "$mod" "$f" > "$f.applocker.tmp"
 	cat "$f.applocker.tmp" > "$f"
 	rm -f "$f.applocker.tmp"
 	# If we'd materialised /etc/pam.d/<svc> from the vendor default and it's now
@@ -121,11 +144,12 @@ disable_one() {
 }
 
 status() {
-	for tier in sudo screenlock screensaver lightdm; do
+	for tier in sudo screenlock fingerprint screensaver lightdm; do
 		f="$(file_for "$tier")"
+		mod="$(module_for "$tier")"
 		if [ ! -f "$f" ]; then
 			printf '%-12s %s\n' "$tier" "(no $f)"
-		elif grep -q "$MODULE" "$f"; then
+		elif grep -q "$mod" "$f"; then
 			printf '%-12s %s\n' "$tier" "ENABLED"
 		else
 			printf '%-12s %s\n' "$tier" "off"
@@ -137,7 +161,7 @@ expand() { # "all" → the KDE-relevant live tiers
 	if [ "$1" = "all" ]; then echo "sudo screenlock"; else echo "$1"; fi
 }
 
-USAGE="usage: applocker-pam enable|disable sudo|screenlock|screensaver|lightdm|all
+USAGE="usage: applocker-pam enable|disable sudo|screenlock|fingerprint|screensaver|lightdm|all
        applocker-pam status"
 
 cmd="${1:-}"

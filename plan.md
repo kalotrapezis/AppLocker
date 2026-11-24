@@ -41,6 +41,29 @@ Version bumps land in `dist/applocker_0.0.1-<letter>_amd64.deb`.
 
 ## P0 — core correctness (do first, in order)
 
+### [x] 0b. 0.0.4 — "skip the confirmation on login": no button anywhere
+The greeter's Unlock button cannot be removed by a PAM module (plan 2f's open
+question, "why a button, can't it just enter"). Answered by not using PAM for
+this path at all: while locked, `watch_presence.py` runs the identity check and
+calls `loginctl unlock-session` on a match; kscreenlocker dismisses itself on
+logind's Unlock. VERIFIED LIVE on Plasma 6.6/Wayland (lock → face + turn → in).
+- No root, no PAM, no lock-out risk: a failure leaves the normal greeter.
+- On via the existing lock-screen face toggle OR `touch
+  ~/.config/applocker/lockscreen-unlock` (no root). Liveness kept.
+- 5s cadence for 180s after the lock, then 30s; skipped when the session isn't
+  active, and on battery when "pause on battery" is set.
+- Fingerprint now runs BEFORE the prompt (no button to click), and
+  `applocker-pam fingerprint` can put pam_fprintd in KDE's stack so the greeter
+  itself says "touch the sensor" — sandbox-tested, NOT enabled (login PAM edit;
+  run it yourself with a root shell open).
+- [ ] VERIFY after installing 0.0.3/0.0.4: the autostart only starts the watcher
+  at LOGIN, so after `dpkg -i` either log out/in or run
+  `python3 /usr/lib/applocker/watch_presence.py &` once.
+- [ ] Open: no on-greeter feedback for the turn challenge (same gap as 2f). With
+  the camera path this matters more — you get no hint that it wants a head-turn.
+  Options: notify via PAM is unavailable here (we're outside PAM), so either
+  drop liveness for this tier (user call) or draw nothing and rely on habit.
+
 ### [x] 0. 0.0.3 — fail-open hole, bystanders, fingerprint, clean uninstall
 Four user reports, all root-caused and fixed (see CHANGELOG 0.0.3):
 - Gate fail-open watchdog covered the whole auth routine → a locked app opened

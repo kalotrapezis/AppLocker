@@ -213,12 +213,16 @@ impl<P: auth::Prompter> auth::Prompter for Announcing<P> {
 /// Fail-open watchdog: if an auth run doesn't finish within this long, the gate
 /// answers ALLOW and logs it, so a hung recognizer (busy camera, no display)
 /// can't leave an exec blocked forever. `$APPLOCKER_GATE_TIMEOUT` seconds;
-/// default 30; `0` disables (strict deny-until-answered, the old behaviour).
+/// default 60; `0` disables (strict deny-until-answered, the old behaviour).
+///
+/// 60 rather than 30 because the bounded pre-prompt tiers can legitimately add
+/// up to ~35s (fingerprint reader ~10s + three face runs ~25s). The watchdog is
+/// for work that has *hung*; once a dialog is up, `PROMPT_GRACE` takes over.
 fn fail_open_timeout() -> Option<Duration> {
     let secs = std::env::var("APPLOCKER_GATE_TIMEOUT")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(30);
+        .unwrap_or(60);
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
@@ -1324,8 +1328,8 @@ mod tests {
 
     #[test]
     fn fail_open_timeout_parsing() {
-        // Default (unset) is a 30s watchdog; "0" disables it. We can't safely
+        // Default (unset) is a 60s watchdog; "0" disables it. We can't safely
         // mutate process env in parallel tests, so just assert the default arm.
-        assert_eq!(fail_open_timeout().map(|d| d.as_secs()), Some(30));
+        assert_eq!(fail_open_timeout().map(|d| d.as_secs()), Some(60));
     }
 }

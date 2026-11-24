@@ -126,13 +126,118 @@ def on_ac_power():
     return None
 
 
+def _session_id() -> str:
+    """Our login session id for loginctl. `$XDG_SESSION_ID` in a real desktop
+    session; otherwise the newest session owned by us. Empty string means "let
+    loginctl resolve the caller's session", which is what the old call did."""
+    sid = os.environ.get("XDG_SESSION_ID", "").strip()
+    if sid:
+        return sid
+    try:
+        out = subprocess.run(["loginctl", "list-sessions", "--no-legend"],
+                             capture_output=True, text=True, timeout=5).stdout
+        me = os.environ.get("USER", "")
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == me:
+                return parts[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+SESSION_ID = _session_id()
+
+
 def session_locked() -> bool:
     try:
         out = subprocess.run(
-            ["loginctl", "show-session", "", "-p", "LockedHint", "--value"],
+            ["loginctl", "show-session", SESSION_ID, "-p", "LockedHint", "--value"],
             capture_output=True, text=True, timeout=5,
         ).stdout.strip()
         return out == "yes"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def session_active() -> bool:
+    """Is our session the one on the screen? False after a user/VT switch —
+    unlocking then would expose this desktop behind someone else's session."""
+    try:
+        out = subprocess.run(
+            ["loginctl", "show-session", SESSION_ID, "-p", "Active", "--value"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return out == "yes"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ── no-button unlock of the lock screen ──────────────────────────────────────
+# The PAM tier (pam_applocker in /etc/pam.d/kde) only runs when the KDE greeter
+# starts a conversation — i.e. after you click Unlock or type something. That is
+# the "confirmation" nobody wants. So while the screen is locked we run the same
+# face check ourselves and, on a match, tell logind to unlock the session; the
+# Plasma locker dismisses itself on that signal. No PAM involved, so a failure
+# here can never lock anyone out: the greeter stays exactly as it is.
+
+LOCKSCREEN_PAM = "/etc/pam.d/kde"
+
+# recognize.py sits next to us both in the repo and in the flat install layout.
+RECOGNIZE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recognize.py")
+
+# Dense attempts right after the lock (you stepped away for a coffee), then a
+# slow trickle so an hour later still works without the camera running flat out.
+UNLOCK_BURST = 180.0
+UNLOCK_SLOW_GAP = 30.0
+
+
+# Enabling this needs no root and no PAM edit: just the marker file. The PAM
+# tier also counts, so the existing Settings toggle ("Unlock these with your
+# face" → Lock screen) switches both the click-path and this one at once.
+UNLOCK_MARKER = os.path.expanduser("~/.config/applocker/lockscreen-unlock")
+
+
+def lockscreen_face_enabled() -> bool:
+    """On when the marker file exists, or when the user's existing lock-screen
+    face toggle has put pam_applocker into KDE's PAM stack. Two ways in, one
+    intent — no second switch to forget about."""
+    if os.path.exists(UNLOCK_MARKER):
+        return True
+    try:
+        with open(LOCKSCREEN_PAM) as f:
+            return "pam_applocker.so" in f.read()
+    except OSError:
+        return False
+
+
+def owner_at_screen(cam_index, timeout: float, liveness: bool) -> bool:
+    """One identity check at LOCKSCREEN camera priority. True only on a match;
+    every failure (busy camera, no face, not you) is False, so we stay locked.
+
+    Liveness is KEPT by default: this is the login tier, and a photo must not
+    open the machine. `--unlock-no-liveness` trades that for a glance.
+    """
+    cmd = [sys.executable, RECOGNIZE, "--camera", str(cam_index),
+           "--timeout", str(timeout)]
+    if not liveness:
+        cmd.append("--no-liveness")
+    try:
+        env = {**os.environ, "APPLOCKER_CAMERA_PRIORITY": "lockscreen"}
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout + 15, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["match"]
+
+
+def unlock_session() -> bool:
+    """logind unlock of our own session — allowed for the session's owner, no
+    polkit prompt, no root. Verified to dismiss kscreenlocker on Plasma 6."""
+    try:
+        r = subprocess.run(["loginctl", "unlock-session", SESSION_ID],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -548,6 +653,15 @@ def main() -> int:
                     help="how often to sample idle time (cheap, no camera)")
     ap.add_argument("--force", action="store_true",
                     help="run even if the config has attention off")
+    ap.add_argument("--no-unlock-face", action="store_true",
+                    help="don't try to unlock the lock screen with your face "
+                         "(the lock-screen face toggle still works on a click)")
+    ap.add_argument("--unlock-no-liveness", action="store_true",
+                    help="unlock the screen on a plain face match, no turn "
+                         "challenge — faster, but a photo could do it")
+    ap.add_argument("--unlock-interval", type=float, default=5.0,
+                    help="seconds between unlock attempts in the first "
+                         f"{int(UNLOCK_BURST)}s after a lock")
     ap.add_argument("--no-lock", action="store_true",
                     help="testing: log 'would lock' instead of locking the session")
     ap.add_argument("--brightness-once", action="store_true",
@@ -561,9 +675,13 @@ def main() -> int:
         return brightness_once(args.camera)
 
     conf = read_config()
-    if not args.force and not conf["enabled"]:
-        print("attention is off in the config (enable it in AppLocker settings, "
-              "or run with --force)", file=sys.stderr)
+    # Presence off is no longer a reason to quit: with the lock-screen face
+    # unlock on, this process still has a job (no-button unlock while locked).
+    if not args.force and not conf["enabled"] and (
+            args.no_unlock_face or not lockscreen_face_enabled()):
+        print("attention is off in the config and the lock-screen face unlock "
+              "is off (enable either in AppLocker settings, or run with "
+              "--force)", file=sys.stderr)
         return 2
 
     # --interval (seconds) overrides the config's attention_interval (minutes).
@@ -598,14 +716,19 @@ def main() -> int:
 
     def loop():
         next_snapshot_at = None  # monotonic deadline; None = not scheduled yet
+        locked_since = None      # when the current lock started (unlock cadence)
         next_brightness_at = time.monotonic()  # fire an initial adjust on startup
         while True:
             # Re-read config each tick so the settings GUI takes effect live:
             # interval, AC-only, and the on/off switch (turning it off exits).
             conf = read_config()
-            if not args.force and not conf["enabled"]:
-                print("attention turned off in the config — watcher exiting",
-                      file=sys.stderr)
+            attention_on = args.force or conf["enabled"]
+            # With presence off we still stay alive if the lock-screen face
+            # toggle is on: the no-button unlock is this process's other job.
+            unlock_on = (not args.no_unlock_face) and lockscreen_face_enabled()
+            if not attention_on and not unlock_on:
+                print("attention off and no lock-screen face unlock — "
+                      "watcher exiting", file=sys.stderr)
                 GLib.idle_add(Gtk.main_quit)
                 return
             if args.interval is None:
@@ -617,6 +740,32 @@ def main() -> int:
                     go_present()
                 next_snapshot_at = None
                 time.sleep(max(args.poll, 5.0))
+                continue
+
+            # Locked screen: try to let the owner straight back in, no button.
+            # Any lock counts (manual Meta+L, lid, or our own walk-away lock).
+            # Disabled → falls through to the old sit-idle behaviour below.
+            if unlock_on and session_locked():
+                if locked_since is None:
+                    locked_since = time.monotonic()
+                if session_active():
+                    matched = owner_at_screen(
+                        args.camera, 5.0, not args.unlock_no_liveness)
+                    if matched and unlock_session():
+                        print("presence: face matched at the lock screen — "
+                              "session unlocked", file=sys.stderr)
+                        go_present()
+                        next_snapshot_at = None
+                        locked_since = None
+                        continue
+                dense = time.monotonic() - locked_since < UNLOCK_BURST
+                time.sleep(args.unlock_interval if dense else UNLOCK_SLOW_GAP)
+                continue
+            locked_since = None
+
+            # Presence itself is off — we're here only for the unlock job.
+            if not attention_on:
+                time.sleep(max(args.poll, 2.0))
                 continue
 
             # After a lock, sit idle until the session unlocks, then resume.
@@ -693,6 +842,14 @@ def main() -> int:
     ac = " [AC-only]" if conf["ac_only"] else ""
     print(f"presence watcher: time-based, snapshot every {cfg.interval:.0f}s, "
           f"lock after {args.misses} empty snapshots{ac}", file=sys.stderr)
+    if args.no_unlock_face:
+        print("lock-screen face unlock: off (--no-unlock-face)", file=sys.stderr)
+    else:
+        live = "without" if args.unlock_no_liveness else "with"
+        print(f"lock-screen face unlock: follows the Settings toggle "
+              f"({LOCKSCREEN_PAM}), {live} liveness, every "
+              f"{args.unlock_interval:.0f}s for {int(UNLOCK_BURST)}s then "
+              f"every {int(UNLOCK_SLOW_GAP)}s", file=sys.stderr)
     Gtk.main()
     return 0
 

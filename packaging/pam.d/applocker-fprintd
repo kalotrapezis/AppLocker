@@ -4,5 +4,5 @@
 #
 # Needs libpam-fprintd + an enrolled finger (`fprintd-enroll`). The daemon only
 # offers the fingerprint button when `fprintd-list $USER` shows one.
-auth       required   pam_fprintd.so   timeout=20
+auth       required   pam_fprintd.so   timeout=10
 account    required   pam_permit.so

@@ -3,6 +3,47 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.4 — no button: the lock screen lets you straight in
+
+### Added
+- **Face unlock with no confirmation click.** The PAM tier could only ever run
+  *after* the KDE greeter started a conversation — i.e. after you clicked Unlock
+  or typed something. That click was the "confirmation" nobody wanted, and it is
+  not something a PAM module can remove (the greeter owns it). So the presence
+  watcher now does the work itself: while the session is locked it runs the same
+  identity check and, on a match, asks **logind** to unlock the session, which
+  the Plasma locker obeys. No PAM involved on this path, so it cannot lock
+  anyone out — if it fails, the ordinary greeter is still sitting there.
+  Verified live on Plasma 6.6/Wayland: locked → face + head-turn → in.
+  - Enabled by the existing Settings toggle (Unlock these with your face → Lock
+    screen), **or** by `touch ~/.config/applocker/lockscreen-unlock`, which
+    needs no root and no PAM edit at all.
+  - Liveness is kept (your earlier call: a photo must not open the machine), so
+    it is a glance *plus* a head-turn. `--unlock-no-liveness` trades that away.
+  - Cadence: every 5s for the first 3 minutes after the lock, then every 30s, so
+    coming back an hour later still works without the camera running flat out.
+    Skipped entirely while the session is not the active one (VT/user switch),
+    and while on battery if "pause on battery" is on.
+  - The watcher no longer exits when presence/attention is off — with the
+    unlock job enabled it stays resident for that alone.
+- **The fingerprint reader is tried before the prompt**, so there is no
+  Fingerprint button to click either: launch a locked app, touch the reader,
+  you're in. Ignore it and it falls through to face, then the dialog (where the
+  button still exists as the retry). `APPLOCKER_FP=0` turns the tier off.
+- **`applocker-pam fingerprint`** — an opt-in tier that puts `pam_fprintd` into
+  KDE's own PAM stack, so the *greeter itself* offers "touch the sensor" with no
+  click (Plasma ≥ 6 starts that conversation as soon as the lock screen
+  appears). Sandbox-tested alongside the face tier: both can live in
+  `/etc/pam.d/kde` and each disables independently. **Not enabled by anything** —
+  it edits a login PAM stack, so you run it yourself with a root shell open:
+  `sudo applocker-pam enable fingerprint`.
+
+### Changed
+- The gate's fail-open watchdog default went 30s → 60s. The bounded pre-prompt
+  tiers can legitimately take ~35s now (reader ~10s + three face runs ~25s), and
+  the watchdog must only fire for work that has actually hung; once a dialog is
+  up, the 5-minute prompt grace from 0.0.3 takes over.
+
 ## 0.0.3 — the fail-open hole, bystanders, fingerprint unlock, and a clean uninstall
 
 ### Security
