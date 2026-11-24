@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::auth::{Available, Method, Prompter, PromptResult};
 
@@ -19,16 +20,28 @@ use crate::auth::{Available, Method, Prompter, PromptResult};
 /// For this step the cache lives only in memory, so it's implicitly wiped on
 /// daemon restart. Step 5 wires it to logind Lock/Unlock and the attention
 /// watcher for the real "wipe on lock/reboot" behaviour.
-#[derive(Default)]
 pub struct UnlockCache {
     inner: Mutex<Inner>,
+    grace: Duration,
 }
 
 #[derive(Default)]
 struct Inner {
     unlocked: HashSet<String>,
     pending: HashSet<String>,
+    /// When each target last authenticated, for the one-launch grace below.
+    last_ok: std::collections::HashMap<String, std::time::Instant>,
 }
+
+/// One user action can be several execs: a flatpak launch produces two or more
+/// `bwrap` calls, and under "re-auth every launch" each one asked separately —
+/// so opening Zen meant typing the password twice. Within this window after a
+/// success, further execs of the SAME target ride on it.
+///
+/// shortcut: a fixed 10s window, not tied to the launching process tree —
+/// upgrade to matching on the session leader if a second app ever needs to be
+/// told apart from a relaunch.
+const RELAUNCH_GRACE: Duration = Duration::from_secs(10);
 
 /// How long an unlock lasts for a given app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,9 +64,20 @@ pub enum Decision {
     NeedsAuth,
 }
 
+impl Default for UnlockCache {
+    fn default() -> Self {
+        UnlockCache::new()
+    }
+}
+
 impl UnlockCache {
     pub fn new() -> UnlockCache {
-        UnlockCache::default()
+        UnlockCache { inner: Mutex::new(Inner::default()), grace: RELAUNCH_GRACE }
+    }
+
+    /// Same, with a chosen relaunch grace — for tests.
+    pub fn with_grace(grace: Duration) -> UnlockCache {
+        UnlockCache { inner: Mutex::new(Inner::default()), grace }
     }
 
     /// Decide what to do with a fresh locked exec of `target`, reserving a
@@ -62,7 +86,14 @@ impl UnlockCache {
     /// so two simultaneous launches don't stack two prompts.
     pub fn begin(&self, target: &str, policy: CachePolicy) -> Decision {
         let mut inner = self.inner.lock().unwrap();
+        let just_authed = inner
+            .last_ok
+            .get(target)
+            .is_some_and(|t| t.elapsed() < self.grace);
         if policy == CachePolicy::OncePerSession && inner.unlocked.contains(target) {
+            Decision::AlreadyUnlocked
+        } else if just_authed {
+            // Same launch, second exec: don't ask again.
             Decision::AlreadyUnlocked
         } else if inner.pending.contains(target) {
             Decision::PromptInFlight
@@ -77,8 +108,11 @@ impl UnlockCache {
     pub fn finish(&self, target: &str, allowed: bool, policy: CachePolicy) {
         let mut inner = self.inner.lock().unwrap();
         inner.pending.remove(target);
-        if allowed && policy == CachePolicy::OncePerSession {
-            inner.unlocked.insert(target.to_string());
+        if allowed {
+            inner.last_ok.insert(target.to_string(), std::time::Instant::now());
+            if policy == CachePolicy::OncePerSession {
+                inner.unlocked.insert(target.to_string());
+            }
         }
     }
 
@@ -87,6 +121,7 @@ impl UnlockCache {
     pub fn wipe(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.unlocked.clear();
+        inner.last_ok.clear(); // a lock ends the grace too
     }
 }
 
@@ -272,13 +307,46 @@ mod tests {
     #[test]
     fn cache_every_time_never_caches() {
         let p = CachePolicy::EveryTime;
-        let cache = UnlockCache::new();
+        // No grace: the strict "every launch" contract.
+        let cache = UnlockCache::with_grace(Duration::from_millis(0));
         assert!(matches!(cache.begin("bank", p), Decision::NeedsAuth));
         // Simultaneous second launch still won't stack a prompt.
         assert!(matches!(cache.begin("bank", p), Decision::PromptInFlight));
         // Even after a successful auth, the next launch re-authenticates.
         cache.finish("bank", true, p);
         assert!(matches!(cache.begin("bank", p), Decision::NeedsAuth));
+    }
+
+    /// One user action can be several execs — a flatpak launch is two or more
+    /// `bwrap` calls — and asking twice for one launch is what "the password
+    /// fails the second time" actually was.
+    #[test]
+    fn one_launch_asks_once_even_under_every_time() {
+        let p = CachePolicy::EveryTime;
+        let cache = UnlockCache::with_grace(Duration::from_millis(80));
+        assert!(matches!(cache.begin("zen", p), Decision::NeedsAuth));
+        cache.finish("zen", true, p);
+        // The launch's second exec rides on the auth just given.
+        assert!(matches!(cache.begin("zen", p), Decision::AlreadyUnlocked));
+        // Once the grace passes, a fresh launch authenticates again.
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(matches!(cache.begin("zen", p), Decision::NeedsAuth));
+        // A failed auth grants no grace at all.
+        let cache = UnlockCache::with_grace(Duration::from_secs(10));
+        assert!(matches!(cache.begin("vault", p), Decision::NeedsAuth));
+        cache.finish("vault", false, p);
+        assert!(matches!(cache.begin("vault", p), Decision::NeedsAuth));
+    }
+
+    /// A session lock ends the grace, so walking away really does re-lock.
+    #[test]
+    fn locking_the_session_ends_the_grace() {
+        let p = CachePolicy::EveryTime;
+        let cache = UnlockCache::with_grace(Duration::from_secs(10));
+        cache.begin("zen", p);
+        cache.finish("zen", true, p);
+        cache.wipe();
+        assert!(matches!(cache.begin("zen", p), Decision::NeedsAuth));
     }
 
     #[test]

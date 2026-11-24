@@ -3,6 +3,24 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.33 — one launch asks once
+
+"Password fails the second time" — it wasn't failing. You were being asked
+**twice for one launch**:
+
+```
+20:13:02  auth  pid=133595  Zen Browser (prompting)  → allow
+20:13:09  auth  pid=133589  Zen Browser (prompting)  → allow    ← same launch
+```
+
+A flatpak start is two or more `bwrap` execs, and with *re-auth: every launch*
+nothing joined them, so each one asked. After a successful auth, further execs
+of the **same** target now ride on it for 10 seconds.
+
+- A **failed** auth grants no grace at all.
+- A **session lock** ends it immediately, so walking away still re-locks.
+- Strict "every launch" is still available with a zero grace.
+
 ## 0.0.32 — the per-place switches stop lying (and stop being stuck)
 
 Reported with a screenshot: the Face page showed **Locked apps** and
