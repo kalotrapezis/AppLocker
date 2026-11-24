@@ -3,6 +3,19 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.15 — a Fingerprint switch in Settings, above Face unlock
+
+- **Fingerprint unlock** is now a card in Security & unlock, sitting above Face
+  unlock because that is the order the factors are tried in: reader, then face,
+  then PIN/password. Backed by a real policy key (`fingerprint = on|off` in
+  `/etc/applocker/config`) and `applockerd set-fingerprint on|off`, so the CLI,
+  the GUI and the daemon all read the same switch.
+- No "enrol first" guard like face has: availability is re-checked at every
+  unlock, so leaving it on with no reader attached costs nothing.
+- The Settings window stamped its own version by hand and had drifted to
+  **v0.0.2** while 0.0.14 was installed. `build-deb.sh` now writes the real
+  version into the installed copy at package time.
+
 ## 0.0.14 — the reader now says it is waiting
 
 The fingerprint tier was finished except for the part that makes it usable: it

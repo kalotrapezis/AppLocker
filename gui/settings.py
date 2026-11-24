@@ -36,7 +36,7 @@ import threading
 
 # Shown in the sidebar footer. Kept in step with the packaged version base
 # (packaging/build-deb.sh VERSION_BASE); the round-letter suffix isn't surfaced.
-APP_VERSION = "0.0.2"
+APP_VERSION = "0.0.15-dev"   # stamped with the real version by build-deb.sh
 
 # A user-writable log (the GUI has no terminal), so add/remove/broker issues are
 # diagnosable after the fact:  tail -f ~/.cache/applocker/settings.log
@@ -116,7 +116,8 @@ def cfg_path(env: str, default: str) -> str:
 
 def read_config() -> dict:
     """Parse /etc/applocker/config into {face, allow_pin, allow_sudo, reauth}."""
-    out = {"face": False, "pin": True, "sudo": True, "reauth_every": False,
+    out = {"face": False, "fingerprint": True, "pin": True, "sudo": True,
+           "reauth_every": False,
            "attention": False, "attention_interval": 2, "attention_ac_only": False,
            "apps_enabled": True}
     path = cfg_path("APPLOCKER_CONFIG", "/etc/applocker/config")
@@ -127,7 +128,9 @@ def read_config() -> dict:
                 if "=" not in line:
                     continue
                 k, v = (p.strip().lower() for p in line.split("=", 1))
-                if k == "face":
+                if k == "fingerprint":
+                    out["fingerprint"] = v in ("on", "true", "1", "yes")
+                elif k == "face":
                     out["face"] = v in ("on", "true", "1", "yes")
                 elif k == "fallback":
                     toks = [t.strip() for t in v.replace("+", ",").split(",")]
@@ -754,6 +757,17 @@ class SettingsWindow(Gtk.Window):
         self.boot_switch.connect("notify::active", self._on_boot_toggled)
         boot.pack_start(self.boot_switch, False, False, 0)
         svc.pack_start(boot, False, False, 0)
+
+        # Fingerprint card — above face, because the reader is tried first:
+        # it is the fastest factor and needs no camera.
+        fp = self._card(page)
+        self.fp_switch = Gtk.Switch(active=cfg["fingerprint"])
+        self.fp_switch.set_valign(Gtk.Align.CENTER)
+        self.fp_switch.connect("notify::active", self._on_fp_toggled)
+        self._heading_row(fp, "Fingerprint unlock", switch=self.fp_switch)
+        self._dim(fp, "Touch the reader when an app asks. Tried before face, "
+                      "and skipped automatically when no reader or no enrolled "
+                      "finger is found — so face and your PIN still work.")
 
         # Face unlock card.
         face = self._card(page)
@@ -1522,6 +1536,7 @@ class SettingsWindow(Gtk.Window):
         return {
             "face": self.face_switch.get_active(),
             "pin": self.pin_switch.get_active(),
+            "fingerprint": self.fp_switch.get_active(),
             "sudo": self.sudo_switch.get_active(),
             "reauth_every": self.reauth.get_active_id() == "always",
             "attention": self.attention_switch.get_active(),
@@ -1535,6 +1550,8 @@ class SettingsWindow(Gtk.Window):
         ops = []
         if ui["face"] != base["face"]:
             ops.append(["set-face", "on" if ui["face"] else "off"])
+        if ui["fingerprint"] != base["fingerprint"]:
+            ops.append(["set-fingerprint", "on" if ui["fingerprint"] else "off"])
         if ui["pin"] != base["pin"] or ui["sudo"] != base["sudo"]:
             val = ("both" if ui["pin"] and ui["sudo"]
                    else ("pin" if ui["pin"] else "sudo"))
@@ -1618,6 +1635,13 @@ class SettingsWindow(Gtk.Window):
         if switch.get_active() and not has_enrolled_faces():
             self._reject_toggle(switch, "Add a face first (“Add a new face…”) "
                                         "before turning on face unlock.")
+            return
+        self._update_apply_state()
+
+    def _on_fp_toggled(self, _switch, _param):
+        # No guard like face's "enrol first": availability is re-checked at
+        # every unlock, so turning this on with no reader attached is harmless.
+        if self._loading:
             return
         self._update_apply_state()
 

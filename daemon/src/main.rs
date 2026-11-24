@@ -12,6 +12,7 @@
 //!   applockerd set-pin          set/replace the PIN fallback (writes the hash)
 //!   applockerd config           show the current auth policy
 //!   applockerd set-face on|off  enable/disable face (off = PIN/sudo only)
+//!   applockerd set-fingerprint on|off   enable/disable the fingerprint reader
 //!   applockerd set-fallback pin|sudo|both   choose which fallbacks are offered
 //!   applockerd set-reauth session|always    cache unlock until lock, or re-ask
 //!   applockerd list-installed   list installed apps (from .desktop files)
@@ -262,6 +263,7 @@ fn main() {
         Some("set-pin") => cmd_set_pin(),
         Some("config") => cmd_config_show(),
         Some("set-face") => cmd_set_face(std::env::args().nth(2)),
+        Some("set-fingerprint") => cmd_set_fingerprint(std::env::args().nth(2)),
         Some("session-probe") => cmd_session_probe(),
         Some("set-attention") => cmd_set_attention(std::env::args().nth(2)),
         Some("set-attention-interval") => cmd_set_attention_interval(std::env::args().nth(2)),
@@ -299,6 +301,7 @@ fn cmd_config_show() {
     );
     println!("\nChange with:");
     println!("  applockerd set-face on|off");
+    println!("  applockerd set-fingerprint on|off");
     println!("  applockerd set-attention on|off");
     println!("  applockerd set-attention-interval 2|5|10|15|30   (minutes between checks)");
     println!("  applockerd set-attention-ac-only on|off          (pause on battery)");
@@ -323,6 +326,32 @@ fn cmd_set_face(arg: Option<String>) {
     println!("face {} — {}", if on { "enabled" } else { "disabled" }, pol.summary());
     if on && !pin::is_set(&auth::default_pin_path()) {
         eprintln!("note: face still needs enrollment (face/enroll.py) to actually run.");
+    }
+}
+
+fn cmd_set_fingerprint(arg: Option<String>) {
+    let on = match arg.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!("usage: applockerd set-fingerprint on|off");
+            process::exit(2);
+        }
+    };
+    let path = policy::default_path();
+    let mut pol = policy::Policy::load(&path);
+    pol.allow_fingerprint = on;
+    save_policy_or_exit(&pol, &path);
+    println!(
+        "fingerprint {} — {}",
+        if on { "enabled" } else { "disabled" },
+        pol.summary()
+    );
+    if on {
+        eprintln!(
+            "note: the reader is only used when `fprintd-list $USER` shows an \
+             enrolled finger; with no reader attached this changes nothing."
+        );
     }
 }
 

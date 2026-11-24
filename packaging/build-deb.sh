@@ -10,7 +10,7 @@ set -euo pipefail
 # Version is a fixed base + a testing-round letter that bumps every build:
 # 0.0.1-a, 0.0.1-b, ...  Pass an explicit letter to rebuild a round:
 #   packaging/build-deb.sh c
-VERSION_BASE="0.0.14"
+VERSION_BASE="0.0.15"
 ROUND_FILE="$(dirname "$0")/.build-round"
 # APPLOCKER_VERSION overrides the whole version string (for a real release, e.g.
 # APPLOCKER_VERSION=0.0.1 APPLOCKER_RELEASE=1 packaging/build-deb.sh). Otherwise
@@ -59,6 +59,10 @@ install -m 0755 "$REPO/daemon/target/release/applockerd" "$LIB/applockerd"
 for py in "$REPO"/face/*.py "$REPO"/gui/*.py "$REPO"/vault/*.py "$REPO"/hide/*.py; do
 	install -m 0644 "$py" "$LIB/"
 done
+
+# The Settings window prints its version in the corner; stamp the real package
+# version in so it can't drift (it showed 0.0.2 while 0.0.14 was installed).
+sed -i "s/^APP_VERSION = .*/APP_VERSION = \"$VERSION\"/" "$LIB/settings.py"
 
 # PAM module into the multiarch security dir.
 install -m 0644 "$REPO/pam/target/release/libpam_applocker.so" \

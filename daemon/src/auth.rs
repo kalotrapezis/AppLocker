@@ -250,6 +250,8 @@ pub struct SystemFallback {
     pub allow_pin: bool,
     /// Policy switch: offer the sudo-password fallback at all.
     pub allow_sudo: bool,
+    /// Policy switch: try the fingerprint reader at all.
+    pub allow_fingerprint: bool,
 }
 
 /// PAM service that runs `pam_fprintd` alone (shipped as /etc/pam.d/ by the
@@ -363,6 +365,7 @@ impl SystemFallback {
             user: desktop_user(),
             allow_pin: policy.allow_pin,
             allow_sudo: policy.allow_sudo,
+            allow_fingerprint: policy.allow_fingerprint,
         }
     }
 }
@@ -388,7 +391,7 @@ impl Fallback for SystemFallback {
     }
 
     fn fingerprint_available(&self) -> bool {
-        fingerprint_enrolled(&self.user)
+        self.allow_fingerprint && fingerprint_enrolled(&self.user)
     }
 
     /// pam_fprintd asks nothing of the conversation (it only sends info

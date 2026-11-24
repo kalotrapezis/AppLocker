@@ -34,6 +34,9 @@ pub struct Policy {
     pub allow_pin: bool,
     /// Offer the sudo-password fallback.
     pub allow_sudo: bool,
+    /// Try the fingerprint reader before face. Off = never touch fprintd, so a
+    /// reader you don't trust (or don't want waited on) is out of the picture.
+    pub allow_fingerprint: bool,
     /// Re-auth on *every* launch of a locked app, instead of caching the unlock
     /// until the next session lock. The global default; a future per-app list
     /// can override it. Maps to [`gate::CachePolicy`](crate::gate::CachePolicy).
@@ -66,6 +69,9 @@ impl Default for Policy {
         // session (re-ask only after a lock) so it isn't nagging.
         Policy {
             face_enabled: false,
+            // On when a finger is actually enrolled — the check is live, so
+            // this costs nothing on a machine with no reader.
+            allow_fingerprint: true,
             allow_pin: true,
             allow_sudo: true,
             reauth_every_time: false,
@@ -102,6 +108,9 @@ impl Policy {
             let val = val.trim();
             match key {
                 "face" => p.face_enabled = parse_bool(val).unwrap_or(p.face_enabled),
+                "fingerprint" => {
+                    p.allow_fingerprint = parse_bool(val).unwrap_or(p.allow_fingerprint)
+                }
                 "fallback" => {
                     let (pin, sudo) = parse_fallback(val);
                     p.allow_pin = pin;
@@ -156,6 +165,7 @@ impl Policy {
         let body = format!(
             "# AppLocker auth policy — edit with `applockerd set-face` / `set-fallback`\n\
              face = {}\n\
+             fingerprint = {}\n\
              fallback = {}\n\
              reauth = {}\n\
              attention = {}\n\
@@ -163,6 +173,7 @@ impl Policy {
              attention_ac_only = {}\n\
              apps_enabled = {}\n",
             if self.face_enabled { "on" } else { "off" },
+            if self.allow_fingerprint { "on" } else { "off" },
             fallback.join(", "),
             if self.reauth_every_time { "always" } else { "session" },
             if self.attention_enabled { "on" } else { "off" },
@@ -200,8 +211,9 @@ impl Policy {
             "off".to_string()
         };
         format!(
-            "face {}, fallback: {}, re-auth: {}, attention {}, apps {}",
+            "face {}, fingerprint {}, fallback: {}, re-auth: {}, attention {}, apps {}",
             if self.face_enabled { "ON" } else { "off" },
+            if self.allow_fingerprint { "on" } else { "off" },
             fb.join(" + "),
             if self.reauth_every_time { "every launch" } else { "once per session" },
             att,
