@@ -3,6 +3,43 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.31 — the fingerprint veto was wrong, and is now off by default
+
+I built the veto (0.0.13) on a misreading, and it has been rejecting your real
+fingerprints ever since. The proof arrived by accident, from a `sudo` that
+installed 0.0.30:
+
+```
+20:11:32  fprintd starting
+20:11:33  Driver reported a match ... not matching any in the gallery
+20:11:33  sudo: session opened for user root by teo      ← the finger worked
+```
+
+A genuine touch authenticated `sudo` **in the same second** libfprint logged
+the "disowned match" line. That line does not mean a fabricated match. On this
+class of reader the comparison happens **on the chip**, and libfprint simply
+cannot map the chip's answer back to its own gallery entry — so it says so,
+about ordinary, correct authentications. `sudo` succeeded only because our veto
+is not in that path.
+
+So the veto was rejecting nearly every honest touch inside AppLocker. It is now
+**off by default** (`APPLOCKER_FP_VETO=1` re-enables it for hardware where the
+line really does indicate a fabricated match).
+
+### Retractions, in full
+- "52 fabricated matches today" — wrong. They are 52 *unverifiable* matches,
+  most of them almost certainly genuine.
+- "Three locked apps opened with nothing on the sensor" — unsupported. That
+  rested on reading "the fingerprint is not there" as "I did not touch it";
+  the user says they likely touched it from habit.
+- "A false match there grants root" — overstated for this device. The user's
+  own control test (a *different* finger was refused) shows the chip
+  discriminates. Not touching the reader has still never been shown to
+  authenticate.
+
+What stands: the reader drops off USB constantly (38 disconnects in a day), and
+during those windows it genuinely fails and the gallery reads empty.
+
 ## 0.0.30 — a Face page to match, and sudo on both
 
 - **New "Face" page**, the same shape as Fingerprint: enrolled looks with

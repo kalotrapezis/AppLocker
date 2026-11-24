@@ -554,7 +554,19 @@ impl Fallback for SystemFallback {
         // reported a match providing a scanned print that is not matching any in
         // the gallery" at the same seconds. libfprint knows the match was
         // rubbish; PAM just doesn't pass that on. So we ask the log.
-        if ok && fprintd_disowned_match_since(started) {
+        // OFF by default, and here is why. On this class of reader the match
+        // happens ON THE CHIP, and libfprint logs "a scanned print that is not
+        // matching any in the gallery" because it cannot map the chip's answer
+        // back to its own record. That line accompanies ORDINARY, CORRECT
+        // authentications: proved on 2026-11-24 at 20:11:33, when a real finger
+        // opened `sudo` (no veto in that path) in the same second the line was
+        // logged. Vetoing on it therefore rejected almost every genuine touch,
+        // which is exactly what "it does not open with my finger" was.
+        //
+        // Keep it available for hardware where the line really does mean a
+        // fabricated match: APPLOCKER_FP_VETO=1.
+        let veto_on = std::env::var("APPLOCKER_FP_VETO").map(|v| v == "1").unwrap_or(false);
+        if ok && veto_on && fprintd_disowned_match_since(started) {
             // Err, not Ok(false): the reader is not *rejecting* anyone, it is
             // malfunctioning. The difference matters when both factors are
             // required — a broken reader must step aside, not lock you out.
@@ -806,8 +818,9 @@ mod tests {
         );
     }
 
-    /// The veto that makes a flaky reader survivable: libfprint saying the
-    /// driver's match wasn't in the gallery turns a PAM success into a failure.
+    /// The veto's *pattern matching* still works; it is simply off by default
+    /// now, because on match-on-chip readers that log line accompanies honest
+    /// successes (see verify_fingerprint).
     #[test]
     fn a_disowned_match_is_not_a_match() {
         let bogus = "fprintd[123]: Driver reported a match providing a scanned \

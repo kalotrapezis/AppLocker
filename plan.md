@@ -112,6 +112,23 @@ Changes what matters: patience beats cleverness, so nothing may open by waiting.
 - [ ] Consider: a child can also just wait for a parent-unlocked session. The
   `reauth = every launch` setting (already on here) is what limits that.
 
+### [x] 0m. THE "BYPASS" WAS MY MISREADING — veto off by default (0.0.31)
+Proof, 2026-11-24 20:11:33: a real finger opened `sudo` (no veto in that path)
+in the SAME SECOND libfprint logged "a scanned print that is not matching any
+in the gallery". That line accompanies ORDINARY CORRECT authentications on a
+match-on-chip reader: the chip decides, libfprint cannot map the answer to its
+gallery entry, so it complains. It is not evidence of a fabricated match.
+- Veto now opt-in (`APPLOCKER_FP_VETO=1`). It had been rejecting almost every
+  genuine touch — the user's "AppLocker does not open with finger".
+- RETRACTED: "52 fabricated matches" (they are unverifiable, mostly genuine);
+  "three apps opened with no finger" (rested on my reading of one message —
+  the user says they probably touched it); "root at risk" (overstated; the
+  user's wrong-finger control test was REFUSED, so the chip discriminates).
+- STILL TRUE: 38 USB disconnects/day; during those the device fails and the
+  gallery reads empty.
+- [ ] Open question nobody has tested cleanly: does an untouched sensor ever
+  return verify-match? /tmp/fp-truth-test.sh case 3 answers it.
+
 ### [!] 0i. FINGERPRINT BYPASS — REAL, OBSERVED, now opt-in (0.0.12)
 14:29:13-16: three locked Zen launches `allow (auth passed)` with NO finger, NO
 face (no `matching against` lines), NO dialog, NO password. fprintd logged three
