@@ -792,10 +792,12 @@ fn signal_daemon_reload() {
 fn cmd_auth_test(app: Option<String>) {
     let app = app.unwrap_or_else(|| "auth-test".to_string());
     let (face, attempts, face_live) = face::build();
-    let cfg = face::config_for(attempts);
     let system = SystemFallback::system();
     let user = system.user.clone();
-    let show = face_live || system.fingerprint_available();
+    let finger_live = system.fingerprint_available();
+    let mut cfg = face::config_for(attempts);
+    cfg.cross_reference = face_live && finger_live;
+    let show = face_live || finger_live;
     let fb = std::rc::Rc::new(std::cell::RefCell::new(if show {
         Feedback::spawn(&app)
     } else {
@@ -1199,11 +1201,14 @@ fn handle_event(
                 let tx_prompt = tx.clone();
                 thread::spawn(move || {
                     let (face, attempts, face_live) = face::build();
-                    let cfg = face::config_for(attempts);
                     let system = SystemFallback::system();
+                    let finger_live = system.fingerprint_available();
+                    let mut cfg = face::config_for(attempts);
+                    // Both biometrics on and usable → make them agree.
+                    cfg.cross_reference = face_live && finger_live;
                     // The window is for the reader too: its wait is silent and
                     // several seconds long, so without it nobody knows to touch.
-                    let show = face_live || system.fingerprint_available();
+                    let show = face_live || finger_live;
                     let fb = std::rc::Rc::new(std::cell::RefCell::new(if show {
                         Feedback::spawn(&app_inner)
                     } else {

@@ -768,6 +768,8 @@ class SettingsWindow(Gtk.Window):
         self._dim(fp, "Touch the reader when an app asks. Tried before face, "
                       "and skipped automatically when no reader or no enrolled "
                       "finger is found — so face and your PIN still work.")
+        self._dim(fp, "With face unlock also on, the two are cross-checked: both "
+                      "must match, or you are asked for your PIN or password.")
 
         # Face unlock card.
         face = self._card(page)

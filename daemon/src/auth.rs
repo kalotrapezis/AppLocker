@@ -97,6 +97,13 @@ pub struct Config {
     /// How many wrong PIN/password entries before we give up (Cancel always
     /// gives up immediately).
     pub fallback_attempts: u32,
+    /// Both biometrics are on AND usable, so make them agree: the reader and
+    /// the camera must *both* accept before the frictionless path opens
+    /// anything. Either one failing drops to the PIN/password prompt — which
+    /// still works alone, because a lock-out-proof fallback has to exist.
+    ///
+    /// The caller decides this, since only it knows whether face is live.
+    pub cross_reference: bool,
 }
 
 impl Default for Config {
@@ -105,8 +112,22 @@ impl Default for Config {
             face_attempts: 3,
             face_gap: Duration::from_millis(500),
             fallback_attempts: 3,
+            cross_reference: false,
         }
     }
+}
+
+/// Face recognition, up to `cfg.face_attempts` tries with a gap between them.
+fn face_matches(cfg: &Config, face: &mut dyn FaceVerifier) -> bool {
+    for attempt in 0..cfg.face_attempts {
+        if face.try_match() {
+            return true;
+        }
+        if attempt + 1 < cfg.face_attempts {
+            thread::sleep(cfg.face_gap);
+        }
+    }
+    false
 }
 
 /// Run the full routine. Returns [`Outcome::Allowed`] the moment any factor
@@ -121,25 +142,38 @@ pub fn run(
     prompter: &mut dyn Prompter,
     fallback: &dyn Fallback,
 ) -> Outcome {
-    // Tier 0: the fingerprint reader, when a finger is enrolled. It goes first
-    // because it's the fastest factor and needs no camera — touch the reader
-    // and you're in, with no button to press first. Ignore it and it falls
-    // through to face, then the prompt (where it's offered again as a button).
-    if fallback.fingerprint_available() {
-        match fallback.verify_fingerprint() {
-            Ok(true) => return Outcome::Allowed,
-            Ok(false) => {}
-            Err(e) => eprintln!("applockerd: fingerprint unusable: {e}"),
-        }
-    }
-
-    // Tier 1: recognition, up to N attempts.
-    for attempt in 0..cfg.face_attempts {
-        if face.try_match() {
+    // Cross-reference: both biometrics on and usable, so neither opens the lock
+    // alone — the reader and the camera have to agree. A photo without the
+    // finger, or a lifted print without the face, gets nothing; both land on
+    // the PIN/password prompt instead.
+    if cfg.cross_reference {
+        let finger = match fallback.verify_fingerprint() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("applockerd: fingerprint unusable: {e}");
+                false
+            }
+        };
+        if finger && face_matches(cfg, face) {
             return Outcome::Allowed;
         }
-        if attempt + 1 < cfg.face_attempts {
-            thread::sleep(cfg.face_gap);
+        // One of the two said no. Don't let the other stand in for it.
+    } else {
+        // Tier 0: the fingerprint reader, when a finger is enrolled. It goes
+        // first because it's the fastest factor and needs no camera — touch it
+        // and you're in. Ignore it and it falls through to face, then the
+        // prompt (where it's offered again as a button).
+        if fallback.fingerprint_available() {
+            match fallback.verify_fingerprint() {
+                Ok(true) => return Outcome::Allowed,
+                Ok(false) => {}
+                Err(e) => eprintln!("applockerd: fingerprint unusable: {e}"),
+            }
+        }
+
+        // Tier 1: recognition, up to N attempts.
+        if face_matches(cfg, face) {
+            return Outcome::Allowed;
         }
     }
 
@@ -500,11 +534,16 @@ mod tests {
         }
     }
 
+    fn cross_cfg() -> Config {
+        Config { cross_reference: true, ..fast_cfg() }
+    }
+
     fn fast_cfg() -> Config {
         Config {
             face_attempts: 3,
             face_gap: Duration::from_millis(0),
             fallback_attempts: 3,
+            cross_reference: false,
         }
     }
 
@@ -527,6 +566,41 @@ mod tests {
         );
         assert_eq!(face.idx, 0, "face must not run once the reader accepted");
         assert!(prompt.seen_available.is_empty());
+    }
+
+    /// With both biometrics on, neither opens the lock by itself.
+    #[test]
+    fn cross_reference_needs_both() {
+        let answers = || vec![entered(Method::Pin, "1234")];
+
+        // finger ✓ + face ✓ → straight in, no prompt.
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: vec![], idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: true }),
+            Outcome::Allowed
+        );
+        assert!(prompt.seen_available.is_empty(), "no prompt when both agree");
+
+        // finger ✓ + face ✗ → must NOT open on the finger alone.
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: answers(), idx: 0, seen_available: vec![] };
+        run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: true });
+        assert_eq!(prompt.seen_available.len(), 1, "face failed → prompt");
+
+        // finger ✗ + face ✓ → must NOT open on the face alone.
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: answers(), idx: 0, seen_available: vec![] };
+        run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: false });
+        assert_eq!(prompt.seen_available.len(), 1, "finger failed → prompt");
+
+        // The PIN still gets you in: the fallback must never be two-factor.
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: answers(), idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
+            Outcome::Allowed
+        );
     }
 
     /// The veto that makes a flaky reader survivable: libfprint saying the

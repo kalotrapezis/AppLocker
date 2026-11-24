@@ -294,9 +294,11 @@ fn authenticate(reason: &str) -> bool {
          pin_available={} sudo_available={} — trying face first, then fallback prompt",
         fb0.pin_available(), fb0.sudo_available(),
     );
-    let cfg = face::config_for(attempts);
     let system = SystemFallback::system();
-    let show = face_live || system.fingerprint_available();
+    let finger_live = system.fingerprint_available();
+    let mut cfg = face::config_for(attempts);
+    cfg.cross_reference = face_live && finger_live;
+    let show = face_live || finger_live;
     let fb = std::rc::Rc::new(std::cell::RefCell::new(if show {
         Feedback::spawn(reason)
     } else {
@@ -446,21 +448,33 @@ fn get_sudo(reason: &str) -> String {
         },
     ));
     let fb0 = FallbackWithFeedback::new(fb0, win.clone());
-    if fb0.fingerprint_available() && fb0.verify_fingerprint().unwrap_or(false) {
+    let finger_live = fb0.fingerprint_available();
+    let mut face_v = FaceWithFeedback::new(face_v, win.clone(), attempts);
+    let release = |store: &sudopass::Store| -> String {
         store.record_success();
-        return match store.load() {
+        match store.load() {
             Some(pw) => format!("ok\n{pw}"),
             None => "notset".to_string(),
-        };
-    }
-    let mut face_v = FaceWithFeedback::new(face_v, win.clone(), attempts);
-    for _ in 0..attempts {
-        if face_v.try_match() {
-            store.record_success();
-            return match store.load() {
-                Some(pw) => format!("ok\n{pw}"),
-                None => "notset".to_string(),
-            };
+        }
+    };
+    if face_live && finger_live {
+        // Cross-reference, same rule as the app gate: the reader and the camera
+        // must agree, or this falls through to the PIN/password prompt.
+        if fb0.verify_fingerprint().unwrap_or(false) {
+            for _ in 0..attempts {
+                if face_v.try_match() {
+                    return release(&store);
+                }
+            }
+        }
+    } else {
+        if finger_live && fb0.verify_fingerprint().unwrap_or(false) {
+            return release(&store);
+        }
+        for _ in 0..attempts {
+            if face_v.try_match() {
+                return release(&store);
+            }
         }
     }
 

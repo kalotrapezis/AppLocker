@@ -3,6 +3,28 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.16 — with both biometrics on, they are cross-checked
+
+Asked for directly: "if fingerprint and face is on, cross reference". So when
+**both** are enabled *and* usable, neither opens a lock on its own — the reader
+and the camera must agree. A photo without the finger, or a lifted print
+without the face, now gets the PIN/password prompt instead of the app.
+
+- Applies to the app gate, `auth-test`, the broker's `authenticate()` and the
+  sudo-password release — every path that runs the routine.
+- **Degrades, never blocks**: the rule only switches on when both factors are
+  live. No reader attached, no finger enrolled, or face off → the remaining
+  factor works alone exactly as before.
+- The PIN/password prompt is still single-factor on purpose. A lock-out-proof
+  fallback has to exist, so cross-checking raises the bar on the *biometric*
+  path rather than pretending to be true 2FA.
+- Settings says so under Fingerprint unlock, so the stricter behaviour isn't a
+  surprise.
+
+Worth knowing on this machine: with a reader that drops off mid-read, "both must
+agree" means more trips to the password box. Turning Fingerprint off in Settings
+returns you to face alone.
+
 ## 0.0.15 — a Fingerprint switch in Settings, above Face unlock
 
 - **Fingerprint unlock** is now a card in Security & unlock, sitting above Face
