@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AppLocker presence watcher
+Comment=Locks the session when you walk away (only acts if enabled in AppLocker settings)
+Exec=python3 /usr/lib/applocker/watch_presence.py
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel

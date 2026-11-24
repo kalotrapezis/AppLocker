@@ -1,0 +1,97 @@
+#!/bin/sh
+# applocker-fp-enroll — enrol ONE finger several times, into several slots.
+#
+# Why: a press-type reader photographs a small patch of skin. fprintd stores one
+# template per "finger" slot, and the stock `fprintd-enroll` fills exactly one —
+# so the first time you press at a slightly different angle it reads as somebody
+# else. Phones avoid this by taking a dozen captures across the fingertip; we do
+# the same by spending three slots on the SAME finger, held differently each
+# time. pam_fprintd matches against every enrolled slot, so any of them opens.
+#
+#   applocker-fp-enroll            # add passes for your finger
+#   applocker-fp-enroll --reset    # delete what's there first, then enrol
+#   applocker-fp-enroll --check    # just measure how reliably it matches
+#
+# Runs as you, not root: fprintd lets a session owner manage their own prints.
+set -eu
+
+SLOTS="right-index-finger right-middle-finger right-ring-finger"
+HINTS="flat, centred on the sensor
+rolled slightly to the LEFT
+rolled slightly to the RIGHT"
+
+USER_NAME="${USER:-$(id -un)}"
+RESET=no
+CHECK_ONLY=no
+for arg in "$@"; do
+	case "$arg" in
+	--reset) RESET=yes ;;
+	--check) CHECK_ONLY=yes ;;
+	-h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	*) echo "unknown option: $arg" >&2; exit 2 ;;
+	esac
+done
+
+command -v fprintd-enroll >/dev/null 2>&1 || {
+	echo "fprintd is not installed (apt install fprintd libpam-fprintd)" >&2
+	exit 1
+}
+
+check() {
+	hits=0
+	i=1
+	while [ "$i" -le 5 ]; do
+		printf '  press %d of 5… ' "$i"
+		if LC_ALL=C fprintd-verify "$USER_NAME" 2>/dev/null | grep -q "verify-match"; then
+			echo "match"
+			hits=$((hits + 1))
+		else
+			echo "NO match"
+		fi
+		i=$((i + 1))
+	done
+	echo
+	echo "matched $hits of 5."
+	[ "$hits" -ge 4 ] && echo "That is healthy." || \
+		echo "That is poor — add passes (run without --check), or reseat the reader."
+}
+
+if [ "$CHECK_ONLY" = yes ]; then
+	echo "Testing the reader. Press the SAME finger each time."
+	check
+	exit 0
+fi
+
+echo "Currently enrolled:"
+LC_ALL=C fprintd-list "$USER_NAME" 2>/dev/null | grep -E '^ - #' || echo "  (nothing)"
+echo
+
+if [ "$RESET" = yes ]; then
+	echo "Deleting existing prints for $USER_NAME…"
+	fprintd-delete "$USER_NAME" >/dev/null 2>&1 || true
+fi
+
+echo "Use ONE finger for all three rounds — the same one, held differently."
+echo "Each round asks for several presses; that is the driver's doing, not ours."
+echo
+n=1
+done_any=no
+for slot in $SLOTS; do
+	hint=$(echo "$HINTS" | sed -n "${n}p")
+	echo "── round $n of 3 — hold it $hint"
+	if LC_ALL=C fprintd-enroll -f "$slot" "$USER_NAME"; then
+		done_any=yes
+	else
+		echo "   round $n failed (flaky reader?) — carrying on" >&2
+	fi
+	echo
+	n=$((n + 1))
+done
+
+[ "$done_any" = yes ] || { echo "Nothing was enrolled." >&2; exit 1; }
+
+echo "Now enrolled:"
+LC_ALL=C fprintd-list "$USER_NAME" 2>/dev/null | grep -E '^ - #' || true
+echo
+echo "Checking how reliably it reads back:"
+check

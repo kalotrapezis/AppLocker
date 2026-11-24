@@ -1,0 +1,12 @@
+# AppLocker fingerprint tier. Its own PAM service so a finger touch is checked
+# by pam_fprintd alone — never answered by a password, and a missing/broken
+# fprintd can only fail this stack, never weaken `sudo`.
+#
+# timeout=6, not longer: a broken reader (libfprint driver errors — seen on a
+# Chipsailing CS9711) must not stall the unlock. APPLOCKER_FP=0 turns the whole
+# tier off; see README.
+#
+# Needs libpam-fprintd + an enrolled finger (`fprintd-enroll`). The daemon only
+# offers the fingerprint button when `fprintd-list $USER` shows one.
+auth       required   pam_fprintd.so   timeout=6
+account    required   pam_permit.so

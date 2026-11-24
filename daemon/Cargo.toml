@@ -1,0 +1,20 @@
+[package]
+name = "applockerd"
+version = "0.0.1"
+edition = "2021"
+description = "AppLocker privileged daemon — exec/file gate via fanotify"
+license = "AGPL-3.0"
+
+[lib]
+name = "applockerd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "applockerd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
