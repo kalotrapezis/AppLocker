@@ -3,6 +3,62 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.8 — a broken reader must not cost you a password attempt
+
+### Fixed
+- **A failed fingerprint consumed one of the three password attempts.** Attempts
+  are a brute-force budget and a finger is not a guessable secret — and on flaky
+  reader hardware it fails for reasons that have nothing to do with the person.
+  Only typed answers (PIN, password) spend a try now. Found on the first real
+  unlock with the gate on: the reader errored and the dialog came back with
+  "Incorrect — try again" having already eaten a try.
+- Reader PAM timeout 10s → 6s, so a broken reader cannot stall an unlock.
+  `APPLOCKER_FP=0` still turns the tier off entirely.
+
+### Corrected — the Viber diagnosis was wrong, twice
+The journal settled it. Every Viber launch under the gate (7 of them, Nov 20–23)
+ended in `allow (auth passed)` within 1–3 seconds. No `DENY`, no
+`ALLOW (fail-open)`, no second instance anywhere in the log. So:
+- it was **not** the 30s fail-open watchdog (0.0.3) — that never fired here;
+- it was **not** an AppImage second instance (0.0.5) — the gate matched
+  `viber.appimage` correctly on every launch.
+What actually happened: **face recognition kept passing**, silently, in about
+two seconds, so Viber opened with no dialog — which reads as "it opened even
+though auth failed". Both earlier fixes close real holes and both stay, but
+neither was the cause of this symptom. With the gate on, a cancelled prompt now
+gives `DENY (auth failed)`, no Viber process and no FUSE mount (verified
+07:20:07).
+
+Also worth knowing, since it shapes what to trust: liveness passed in ~2s on
+every one of those launches — ordinary head movement satisfies the turn
+challenge. It is a spoof speed bump, not a real liveness test.
+
+### Known hardware problem (not fixable here)
+This machine's reader (Chipsailing CS9711) fails inside libfprint:
+`device was disconnected`, `expected 8 bytes but got 8000`, and once
+`Driver reported a match providing a scanned print that is not matching any in
+the gallery` — libfprint rejecting a match the *driver* claimed. That is also
+why `sudo` times out at the reader. Nothing in AppLocker can fix it.
+
+## 0.0.7 — a PAM service of our own for typed passwords
+
+### Fixed
+- **Checking a typed password went through the distro `sudo` stack**, which on
+  Ubuntu begins with `pam_fprintd` (`timeout=15`): every password check sat at
+  the reader for ~15s before looking at what was typed, and a finger touch could
+  satisfy a call whose whole question was "is this password correct?". New
+  `/etc/pam.d/applocker-password` (pam_unix only) is used when present, with the
+  old behaviour as the fallback if you delete it.
+
+## 0.0.6 — refuse a redundant fingerprint tier
+
+### Fixed
+- `applocker-pam enable fingerprint` now refuses when `pam_fprintd` is already
+  in `/etc/pam.d/common-auth` (Ubuntu's `pam-auth-update` puts it there, and
+  `/etc/pam.d/kde` includes it). Enabling it anyway would have stacked a second
+  reader wait in front of the greeter's existing one.
+- The installer's text still advertised the old 30s fail-open timeout.
+
 ## 0.0.5 — fingerprint first, a trust window, and the camera stops idling
 
 ### Security

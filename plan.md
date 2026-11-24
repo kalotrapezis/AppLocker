@@ -41,6 +41,38 @@ Version bumps land in `dist/applocker_0.0.1-<letter>_amd64.deb`.
 
 ## P0 — core correctness (do first, in order)
 
+### [x] 0e. GATE ON — Viber mystery SOLVED (my diagnosis was wrong, twice)
+Journal evidence (Nov 20-23, gate was running): 7 Viber launches, ALL
+`allow (auth passed)` in 1-3s. No DENY, no fail-open, no second instance.
+=> The cause was **face passing silently in ~2s**: the app opened with no dialog
+and that looked like a bypass. NOT the watchdog (0.0.3), NOT the AppImage mount
+(0.0.5) — both were real code holes, neither was this symptom.
+- Verified 07:20:07 with the gate on: cancelled prompt → `DENY (auth failed)`,
+  no viber process, no /tmp/.mount_viber* → the lock holds.
+- Confirmed live that the real binary runs as
+  `/tmp/.mount_viber.nBOMAE/usr/bin/Viber` — the path the pre-0.0.5 gate could
+  never match. The hole was real even though it wasn't the complaint.
+- Liveness passes in ~2s from ordinary movement. Treat it as a speed bump.
+- [ ] THE REAL FIX for the original complaint: show a brief "Face recognised"
+  confirmation on an allow, so a silent pass doesn't read as "no lock at all".
+
+### [ ] 0f. FINGERPRINT READER IS BROKEN ON THIS MACHINE (driver, not us)
+fprintd/libfprint during a real attempt:
+  `Read failed: device was disconnected, aborting`
+  `Error; expected 8 bytes but got 8000, failing`
+  `Device reported an error during verify: Init: expected 8 bytes but got 8000`
+  `Driver reported a match providing a scanned print that is not matching any
+   in the gallery`   ← libfprint rejecting a match the DRIVER claimed
+Chipsailing CS9711 (press). Also why `sudo` times out at the reader.
+- [x] A failed finger no longer spends a password attempt (0.0.8).
+- [x] Reader PAM timeout 10s → 6s.
+- [ ] DECIDE: keep fingerprint as the first factor on THIS box? With this driver
+  it mostly buys 6s of silence before the dialog. Off switch:
+  `Environment=APPLOCKER_FP=0` in a drop-in for applockerd.service.
+- [ ] Face is OFF in policy and no PIN is set, so the only reliable factor right
+  now is the account password. `applockerd set-face on` / `set-pin` restore the
+  fast paths (face was matching 7/7 in ~2s).
+
 ### [x] 0d. INSTALLED + VERIFIED ON METAL (0.0.5, 2026-11-24 07:09)
 - `dpkg -i` said "previously unselected package" → AppLocker was genuinely NOT
   installed any more. The "never lets go" symptom was leftover STATE (PAM lines,
