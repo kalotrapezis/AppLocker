@@ -276,6 +276,35 @@ fn password_service() -> String {
 /// payload — it says "a finger was verified at <time>", nothing about whose.
 pub const FP_STAMP: &str = "/run/applocker/last-fingerprint";
 
+/// libfprint's own words when a driver claims a match it cannot justify. When
+/// this is in fprintd's log for the attempt we just made, the PAM success is
+/// not evidence of anything and must not open a lock.
+const BOGUS_MATCH_MARKERS: [&str; 2] = [
+    "not matching any in the gallery",
+    "fp_print_equal", // "should not be reached" — same event, different line
+];
+
+/// Pure half of the veto, so it can be tested without a reader.
+fn log_disowns_the_match(log: &str) -> bool {
+    BOGUS_MATCH_MARKERS.iter().any(|m| log.contains(m))
+}
+
+/// Did fprintd disown a match in the last minute? Root-only read, bounded.
+fn fprintd_disowned_recent_match() -> bool {
+    match std::process::Command::new("journalctl")
+        .args(["-u", "fprintd", "--no-pager", "-S", "-1min"])
+        .output()
+    {
+        Ok(o) => log_disowns_the_match(&String::from_utf8_lossy(&o.stdout)),
+        // Can't read the log → can't veto. Say so rather than silently trusting.
+        Err(e) => {
+            eprintln!("applockerd: cannot check fprintd's log ({e}); \
+                       accepting the reader's word for this attempt");
+            false
+        }
+    }
+}
+
 fn stamp_fingerprint() {
     let dir = std::path::Path::new(FP_STAMP).parent();
     if let Some(d) = dir {
@@ -294,18 +323,20 @@ fn stamp_fingerprint() {
 /// polkit prompt that nobody will answer (~25s). We always run as root here, so
 /// that shouldn't happen, but a stalled probe would delay the unlock prompt.
 fn fingerprint_enrolled(user: &str) -> bool {
-    // OPT-IN (`APPLOCKER_FP=1`), and deliberately not the default.
+    // On by default again (`APPLOCKER_FP=0` disables), because the bypass this
+    // tier produced on 2026-11-24 now has a specific guard rather than a blanket
+    // ban: `verify_fingerprint` throws away any PAM success that fprintd's own
+    // log disowns ("not matching any in the gallery"). That was exactly the
+    // failure — three allows with no finger on the reader.
     //
-    // On 2026-11-24 this tier produced a real bypass on the dev machine: three
-    // locked-app launches were allowed with no finger, no face and no dialog,
-    // while fprintd logged, at those same three seconds, "Driver reported a
-    // match providing a scanned print that is not matching any in the gallery"
-    // (Chipsailing CS9711). A flaky libfprint driver can hand PAM a success
-    // nobody asked for, and PAM success is all we can see from in here.
+    // The three behaviours this gives, which is what was asked for:
+    //   reader absent / unenrolled  → tier skipped, straight to face or PIN
+    //   reader back                 → used again at the next unlock, no restart
+    //   reader lying                → success vetoed, falls back to face / PIN
     //
-    // A lock must fail safe: a factor that can approve itself does not get to be
-    // on by default. On hardware whose reader you trust, set APPLOCKER_FP=1.
-    if std::env::var("APPLOCKER_FP").map(|v| v != "1").unwrap_or(true) {
+    // Note what it does NOT cover: the system's own fingerprint PAM (sudo, the
+    // KDE greeter) has no such veto and cannot get one from here.
+    if std::env::var("APPLOCKER_FP").map(|v| v == "0").unwrap_or(false) {
         return false;
     }
     if !std::path::Path::new("/etc/pam.d/applocker-fprintd").is_file() {
@@ -366,6 +397,19 @@ impl Fallback for SystemFallback {
     /// module times out.
     fn verify_fingerprint(&self) -> Result<bool, String> {
         let ok = pam::verify_password(FPRINTD_SERVICE, &self.user, "")?;
+        // A PAM success is not the end of it. On 2026-11-24 this reader produced
+        // three successes with no finger on it, while libfprint logged "Driver
+        // reported a match providing a scanned print that is not matching any in
+        // the gallery" at the same seconds. libfprint knows the match was
+        // rubbish; PAM just doesn't pass that on. So we ask the log.
+        if ok && fprintd_disowned_recent_match() {
+            eprintln!(
+                "applockerd: REJECTING a fingerprint success — fprintd reports the \
+                 driver's match was not in the gallery (flaky reader). Falling \
+                 back to face / PIN."
+            );
+            return Ok(false);
+        }
         if ok {
             stamp_fingerprint();
         }
@@ -480,6 +524,22 @@ mod tests {
         );
         assert_eq!(face.idx, 0, "face must not run once the reader accepted");
         assert!(prompt.seen_available.is_empty());
+    }
+
+    /// The veto that makes a flaky reader survivable: libfprint saying the
+    /// driver's match wasn't in the gallery turns a PAM success into a failure.
+    #[test]
+    fn a_disowned_match_is_not_a_match() {
+        let bogus = "fprintd[123]: Driver reported a match providing a scanned \
+                     print that is not matching any in the gallery.";
+        assert!(log_disowns_the_match(bogus));
+        assert!(log_disowns_the_match(
+            "file ../libfprint/fp-print.c: line 636 (fp_print_equal): should not be reached"
+        ));
+        // Ordinary noise, including a plain disconnect, must NOT veto a success.
+        assert!(!log_disowns_the_match("Read failed: device was disconnected, aborting"));
+        assert!(!log_disowns_the_match("Started fprintd.service"));
+        assert!(!log_disowns_the_match(""));
     }
 
     /// A failing reader must not burn the password-attempt budget: the user

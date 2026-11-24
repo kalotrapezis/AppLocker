@@ -3,6 +3,38 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.13 — fingerprint is back on, with a veto instead of a ban
+
+0.0.12 disabled the tier outright. That was the safe reflex, but the wrong
+shape: what failed was not "the reader is missing" — the fallback to face/PIN
+already handled that — it was the reader **lying**. And libfprint *knows* when
+it lies; PAM just doesn't pass it on:
+
+```
+Driver reported a match providing a scanned print that is not matching any in the gallery.
+```
+
+So `verify_fingerprint` now asks fprintd's log after every PAM success, and
+throws the success away if that line (or its `fp_print_equal` twin) appeared in
+the last minute. A plain `device was disconnected` does **not** veto anything —
+only a disowned match does. Unit-tested on both.
+
+With that guard, the tier is on by default again (`APPLOCKER_FP=0` disables),
+which restores the three behaviours asked for:
+- reader absent or nothing enrolled → tier skipped, straight to face or PIN;
+- reader plugged back in → used again at the next unlock, no restart;
+- reader lying → success vetoed, falls back to face or PIN.
+
+**Limit, stated plainly:** this only protects AppLocker's own prompts. The
+system's fingerprint PAM — `sudo`, polkit, the KDE greeter — cannot be given
+this veto from here. If the reader is trusted enough for those, it is trusted
+with `pam-auth-update --enable fprintd`; if it is not, leave them off.
+
+Not implemented, deliberately: binding to a specific reader ("same device").
+The bypass came from the *same* device, present and enrolled, so identity
+wouldn't have caught it — and it would add a lock-out mode of its own after any
+legitimate hardware change. Say the word if you want it anyway.
+
 ## 0.0.12 — the fingerprint tier is OFF by default (it produced a real bypass)
 
 ### Security — this is the actual "it opens even when auth fails"
