@@ -386,6 +386,33 @@ fn fprintd_disowned_recent_match() -> bool {
     }
 }
 
+/// Set when the reader proves unusable, so the next unlock doesn't wait at it
+/// again. tmpfs, like the trust stamp: a reboot forgets.
+pub const FP_UNUSABLE_STAMP: &str = "/run/applocker/fingerprint-unusable";
+
+/// How long to leave a dead reader alone before trying it again.
+const FP_COOLDOWN_SECS: u64 = 60;
+
+fn stamp_unusable() {
+    if let Some(d) = std::path::Path::new(FP_UNUSABLE_STAMP).parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(FP_UNUSABLE_STAMP, b"");
+}
+
+/// Did the reader fail us within the cooldown? Then it is "disconnected" as far
+/// as this unlock is concerned: with no face either, go straight to the prompt
+/// instead of making the user watch the reader do nothing for six seconds.
+fn fingerprint_recently_unusable() -> bool {
+    let Ok(meta) = std::fs::metadata(FP_UNUSABLE_STAMP) else {
+        return false;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < FP_COOLDOWN_SECS)
+}
+
 fn stamp_fingerprint() {
     let dir = std::path::Path::new(FP_STAMP).parent();
     if let Some(d) = dir {
@@ -404,6 +431,10 @@ fn stamp_fingerprint() {
 /// polkit prompt that nobody will answer (~25s). We always run as root here, so
 /// that shouldn't happen, but a stalled probe would delay the unlock prompt.
 fn fingerprint_enrolled(user: &str) -> bool {
+    // A reader that just failed is treated as absent until the cooldown is up.
+    if fingerprint_recently_unusable() {
+        return false;
+    }
     // On by default again (`APPLOCKER_FP=0` disables), because the bypass this
     // tier produced on 2026-11-24 now has a specific guard rather than a blanket
     // ban: `verify_fingerprint` throws away any PAM success that fprintd's own
@@ -478,7 +509,13 @@ impl Fallback for SystemFallback {
     /// with an empty secret. Blocks until the user touches the reader or the
     /// module times out.
     fn verify_fingerprint(&self) -> Result<bool, String> {
-        let ok = pam::verify_password(FPRINTD_SERVICE, &self.user, "")?;
+        let ok = match pam::verify_password(FPRINTD_SERVICE, &self.user, "") {
+            Ok(v) => v,
+            Err(e) => {
+                stamp_unusable(); // PAM itself couldn't run it — don't retry for a minute
+                return Err(e);
+            }
+        };
         // A PAM success is not the end of it. On 2026-11-24 this reader produced
         // three successes with no finger on it, while libfprint logged "Driver
         // reported a match providing a scanned print that is not matching any in
@@ -488,6 +525,7 @@ impl Fallback for SystemFallback {
             // Err, not Ok(false): the reader is not *rejecting* anyone, it is
             // malfunctioning. The difference matters when both factors are
             // required — a broken reader must step aside, not lock you out.
+            stamp_unusable();
             return Err("fprintd disowned the driver's match (flaky reader)".to_string());
         }
         if ok {
@@ -663,6 +701,16 @@ mod tests {
             run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
             Outcome::Allowed
         );
+    }
+
+    /// The cooldown predicate: no stamp → the reader is fair game.
+    #[test]
+    fn no_unusable_stamp_means_the_reader_is_tried() {
+        // The real path writes to /run; with no stamp present this must be
+        // false so a working reader is never skipped.
+        if !std::path::Path::new(FP_UNUSABLE_STAMP).exists() {
+            assert!(!fingerprint_recently_unusable());
+        }
     }
 
     /// A reader that is broken (not rejecting) must step aside rather than

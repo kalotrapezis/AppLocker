@@ -3,6 +3,21 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.21 — a dead reader stops costing you six seconds per launch
+
+"If face is off and fingerprint is disconnected go to sudo." It already did —
+but only after waiting at the reader first, every single launch. With face off
+that meant six seconds of nothing before the password box appeared.
+
+A reader that proves unusable (PAM can't run it, or libfprint disowns its
+match) is now stamped at `/run/applocker/fingerprint-unusable` and treated as
+**absent for 60 seconds**. So the first failure costs the wait; the next
+launches go straight to the prompt. tmpfs, so a reboot forgets, and a reader
+that starts behaving is picked up again a minute later with no restart.
+
+With face off and the reader in that state, an unlock is now just the password
+box, immediately — which is the behaviour asked for.
+
 ## 0.0.20 — with face off, stop pretending to look for a face
 
 Reported: "I have face off and it still checks face and finger." The camera was
