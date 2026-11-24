@@ -41,6 +41,23 @@ Version bumps land in `dist/applocker_0.0.1-<letter>_amd64.deb`.
 
 ## P0 — core correctness (do first, in order)
 
+### [x] 0h. 0.0.10 — ROOT CAUSE of "it opens even when auth fails" FIXED
+The confirmation existed and was never rendered. `Feedback::ok()` sent `ok` then
+`reap()`d, and reap drops the child's stdin — that EOF quit the window instantly,
+racing its own 700ms timer. So every successful face unlock was silent: the app
+just opened, which is exactly what "the lock did nothing" looks like.
+- Daemon waits (OK_LINGER 1400ms) instead of reaping; window also ignores an EOF
+  once the ✓ owns the shutdown. Either side alone fixes it; both are in.
+- Tick visible 700ms → 1200ms (a flash after a 2s scan was missable).
+- MEASURED: window lifetime 0.18s before (GTK startup only, nothing drawn) →
+  1.38s after. Control: EOF with no tick still exits in 0.18s, so nothing
+  lingers.
+- [ ] STILL SILENT: the fingerprint tier (runs before any window exists) and the
+  BROKER's face path — serve.rs calls face::build() directly and never wraps it
+  in FaceWithFeedback, so Settings/sudo-release face unlocks show nothing. Same
+  class of bug, different path. Wiring the broker to the feedback window is the
+  next real UX win.
+
 ### [x] 0g. 0.0.9 — upgrades apply without a reboot
 `postinst` try-restarted only the broker, so with the gate on an upgrade left
 the OLD binary enforcing until reboot (a fix would look like a no-op). Now both.

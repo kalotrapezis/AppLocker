@@ -10,7 +10,8 @@ Protocol — one command per line on **stdin** (the daemon holds the pipe):
 
     scanning            # show the "looking for you" state
     fail <n> <total>    # attempt n of total failed: shake, show ✕
-    ok                  # matched: show green ✓, then self-close
+    ok                  # matched: show green ✓, then self-close (~1.2s; an
+                        # EOF after this does NOT cut it short)
     close               # go away now (e.g. falling back to the PIN prompt)
 
 EOF on stdin also closes the window, so a crashed daemon can't leave it stuck
@@ -24,6 +25,12 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk  # noqa: E402
+
+
+# How long the ✓ stays up. Long enough to actually register — the original
+# 700ms, after a 1-2s scan, was easy to miss entirely, which is what made a
+# working face unlock feel like no lock at all.
+OK_VISIBLE_MS = 1200
 
 
 class FeedbackWindow(Gtk.Window):
@@ -56,6 +63,7 @@ class FeedbackWindow(Gtk.Window):
         box.pack_start(self.subtitle, False, False, 0)
 
         self.set_default_size(220, -1)
+        self.quitting = False   # True once the ✓ owns the shutdown
 
     # ── states ────────────────────────────────────────────────────────────
     def show_scanning(self):
@@ -70,7 +78,11 @@ class FeedbackWindow(Gtk.Window):
     def show_ok(self):
         self.icon.set_markup("<span size='400%' foreground='#27ae60'>✓</span>")
         self.status.set_text("Welcome back")
-        GLib.timeout_add(700, Gtk.main_quit)
+        # Own the shutdown from here: a stdin EOF arriving right behind the "ok"
+        # must not cut the tick short (that bug made every successful face
+        # unlock look silent).
+        self.quitting = True
+        GLib.timeout_add(OK_VISIBLE_MS, Gtk.main_quit)
 
     def _shake(self):
         # Nudge the window left/right for ~300ms — the classic "wrong" gesture.
@@ -99,6 +111,8 @@ def main():
     def on_stdin(fd, condition):
         line = sys.stdin.readline()
         if not line:  # EOF: daemon went away — never linger on screen
+            if win.quitting:
+                return False   # ✓ is up; its own timer closes us
             Gtk.main_quit()
             return False
         parts = line.strip().split()

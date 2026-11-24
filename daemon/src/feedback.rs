@@ -13,6 +13,7 @@
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::time::Duration;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -72,9 +73,20 @@ impl Feedback {
         self.send(&format!("fail {attempt} {total}"));
     }
 
-    /// Show the green check; the window closes itself shortly after.
+    /// Show the green check, and let it be *seen*: the window displays the ✓ for
+    /// ~700ms and quits by itself, so we wait instead of reaping.
+    ///
+    /// This used to `send("ok")` then `reap()` straight away — and reap drops
+    /// the child's stdin, whose EOF makes the window quit at once. The tick was
+    /// therefore never on screen for more than a flash, which is exactly why a
+    /// successful face unlock looked like nothing had happened and the lock
+    /// looked broken. Costs ~0.9s on a successful unlock; that is the feature.
     pub fn ok(&mut self) {
+        if !self.is_live() {
+            return;
+        }
         self.send("ok");
+        std::thread::sleep(OK_LINGER);
         self.reap();
     }
 
@@ -90,6 +102,10 @@ impl Feedback {
         }
     }
 }
+
+/// How long to leave the ✓ on screen. Must outlast the window's own
+/// `OK_VISIBLE_MS` self-close timer (see gui/unlock_feedback.py), with slack.
+const OK_LINGER: Duration = Duration::from_millis(1400);
 
 impl Drop for Feedback {
     fn drop(&mut self) {

@@ -3,6 +3,29 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.10 — you can finally see that face unlock worked
+
+### Fixed
+- **The "Welcome back" ✓ was never actually shown.** This is the real cause of
+  the complaint that started this whole run — "Viber opens even when
+  authentication fails". `Feedback::ok()` wrote `ok` to the feedback window and
+  then immediately called `reap()`, which drops the child's stdin; that EOF made
+  the window quit at once, racing its own 700ms timer. So a successful face
+  unlock showed nothing at all, the app just opened, and that is
+  indistinguishable from "the lock did nothing".
+  The daemon now waits for the window to close itself, and the window ignores an
+  EOF that arrives behind an `ok` (belt and braces: either side alone fixes it).
+  Measured: the window lived 0.18s before — pure GTK startup, nothing drawn —
+  and 1.38s after.
+- The ✓ now stays up **1.2s** instead of 700ms. A 700ms flash at the end of a
+  1–2s scan was easy to miss, which was half the problem. A successful face
+  unlock therefore costs ~1.4s more; that delay *is* the feature.
+
+### Still silent (follow-ups, noted in plan.md)
+- The fingerprint tier shows nothing at all — it runs before any window exists.
+- The broker's own face path (Settings, sudo-password release) never spawns the
+  feedback window; only the gate and `auth-test` do.
+
 ## 0.0.9 — an upgrade now takes effect without a reboot
 
 ### Fixed
