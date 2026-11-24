@@ -3,6 +3,20 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.30 — a Face page to match, and sudo on both
+
+- **New "Face" page**, the same shape as Fingerprint: enrolled looks with
+  "Add a new face…", and **"Unlock these with your face"** for Locked apps,
+  Private files, Lock screen and Terminal sudo. The ⚙ on the Security card
+  goes here; the old modal dialog is retired.
+- **Terminal sudo** added to the fingerprint card too, so both factors offer
+  the same four places.
+- The per-place face switches **grey out when the master switch is off**, with
+  a line saying so — the daemon clamps them anyway (0.0.29), and a switch that
+  cannot take effect should not look live.
+- Apps and files write the per-tier policy; lock screen and sudo write
+  `auth sufficient` PAM rules, so a password always still works.
+
 ## 0.0.29 — master switches master, and the veto stops poisoning honest touches
 
 ### Fixed

@@ -309,6 +309,19 @@ def tier_has(tier: str, method: str) -> bool:
     return bool(read_tiers().get(tier, {}).get(method))
 
 
+def fp_sudo_tier_enabled() -> bool:
+    """Does terminal sudo offer the reader (pam_fprintd in its own stack or in
+    common-auth, which it includes)?"""
+    for path in ("/etc/pam.d/sudo", "/etc/pam.d/common-auth"):
+        try:
+            with open(path) as f:
+                if "pam_fprintd" in f.read():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 def fp_pam_tier_enabled() -> bool:
     """True if the greeter's own stack offers the reader (pam_fprintd in KDE's
     PAM file, or system-wide via common-auth)."""
@@ -652,6 +665,9 @@ class SettingsWindow(Gtk.Window):
         self._persisted = read_config()
         self._persisted_tiers = read_tiers()
         self._persisted_fp_pam = fp_pam_tier_enabled()
+        self._persisted_fp_sudo = fp_sudo_tier_enabled()
+        self._persisted_face_tiers = {"lockscreen": pam_tier_enabled("screenlock"),
+                                      "sudo": pam_tier_enabled("sudo")}
         self._loading = False
         self._face_dialog = None  # set while the Face gear dialog is open
 
@@ -669,6 +685,7 @@ class SettingsWindow(Gtk.Window):
         body.pack_start(self.stack, True, True, 0)
 
         self._build_security_page()
+        self._build_face_page()
         self._build_fingerprint_page()
         self._build_apps_page()
         self._build_files_page()
@@ -684,6 +701,7 @@ class SettingsWindow(Gtk.Window):
     # -- navigation sidebar + page/card scaffolding --------------------------
 
     NAV = [("security", "Security & unlock"),
+           ("face", "Face"),
            ("fingerprint", "Fingerprint"),
            ("apps", "Locked apps"),
            ("files", "Private files"),
@@ -975,6 +993,15 @@ class SettingsWindow(Gtk.Window):
     # -- Face unlock gear dialog (enrolled faces + where face unlocks) -------
 
     def _open_face_dialog(self, _btn):
+        """The ⚙ now goes to the Face page, which holds everything the old
+        dialog did plus the per-place switches."""
+        self._select_page("face")
+        for row in self.nav.get_children():
+            if getattr(row, "page", None) == "face":
+                self.nav.select_row(row)
+                break
+
+    def _unused_face_dialog(self, _btn):
         dlg = Gtk.Dialog(title="Face unlock", transient_for=self, modal=True)
         dlg.set_default_size(470, 540)
         dlg.add_button("Close", Gtk.ResponseType.CLOSE)
@@ -1249,11 +1276,11 @@ class SettingsWindow(Gtk.Window):
         """After an async enroll finishes: always refresh the summary, and the
         list too if the Face dialog is still open."""
         self._refresh_faces_summary()
-        if self._face_dialog is not None:
-            try:
-                self._refresh_faces()
-            except Exception:
-                pass
+        # The list lives on the Face page now, so always refresh it.
+        try:
+            self._refresh_faces()
+        except Exception:
+            pass
 
     def _on_boot_toggled(self, switch, _param):
         if self._loading:
@@ -1326,6 +1353,71 @@ class SettingsWindow(Gtk.Window):
         set_service(not service_active())
         self._refresh_service()
 
+    # -- Face page -----------------------------------------------------------
+
+    def _build_face_page(self):
+        page = self._page(
+            "face", "Face",
+            "Enrol the looks you want recognised, and choose where your face "
+            "may unlock.")
+
+        card = self._card(page)
+        self._heading_row(card, "Enrolled faces")
+        self.face_page_status = self._dim(card, "")
+        self.faces_list = Gtk.ListBox()
+        self.faces_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        card.pack_start(self.faces_list, False, False, 0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.set_halign(Gtk.Align.START)
+        self.add_face_btn = Gtk.Button(label="Add a new face…")
+        self.add_face_btn.connect("clicked", self._on_add_face)
+        row.pack_start(self.add_face_btn, False, False, 0)
+        card.pack_start(row, False, False, 0)
+        self._dim(card, "Add a few looks (glasses, a new haircut, lamp off) — "
+                        "any of them unlocks.")
+        if not has_camera():
+            self.add_face_btn.set_sensitive(False)
+            self._dim(card, "No camera detected — face unlock is unavailable.")
+
+        where = self._card(page)
+        self._heading_row(where, "Unlock these with your face")
+        self._dim(where, "Each place keeps its own setting. The last two are "
+                         "'sufficient' PAM rules, so your password always still "
+                         "works and this can never lock you out.")
+        self.face_tier_switches = {}
+        for tier, label in (("apps", "Locked apps"),
+                            ("files", "Private files"),
+                            ("lockscreen", "Lock screen (via the login stack)"),
+                            ("sudo", "Terminal sudo (via the sudo stack)")):
+            initial = (pam_tier_enabled("screenlock") if tier == "lockscreen"
+                       else pam_tier_enabled("sudo") if tier == "sudo"
+                       else tier_has(tier, "face"))
+            srow, sw = self._switch_row(label, initial)
+            sw.connect("notify::active", self._on_face_tier_toggled, tier)
+            self.face_tier_switches[tier] = sw
+            where.pack_start(srow, False, False, 0)
+        self.face_master_hint = self._dim(where, "")
+        self._refresh_face_master_hint()
+        self._refresh_faces()
+
+    def _on_face_tier_toggled(self, _switch, _param, _tier):
+        if self._loading:
+            return
+        self._update_apply_state()
+
+    def _refresh_face_master_hint(self):
+        """The daemon clamps every place to the master switch, so say so rather
+        than letting someone flip a switch that cannot take effect."""
+        if getattr(self, "face_master_hint", None) is None:
+            return
+        on = self.face_switch.get_active() if hasattr(self, "face_switch") else False
+        for sw in getattr(self, "face_tier_switches", {}).values():
+            sw.set_sensitive(on)
+        self.face_master_hint.set_text(
+            "" if on else
+            "Face unlock is off in Security & unlock, so none of these apply "
+            "until you turn it back on.")
+
     # -- Fingerprint page ----------------------------------------------------
 
     def _build_fingerprint_page(self):
@@ -1368,15 +1460,18 @@ class SettingsWindow(Gtk.Window):
         self.fp_tier_switches = {}
         for tier, label in (("apps", "Locked apps"),
                             ("files", "Private files"),
-                            ("lockscreen", "Lock screen (via the login stack)")):
+                            ("lockscreen", "Lock screen (via the login stack)"),
+                            ("sudo", "Terminal sudo (via the sudo stack)")):
             initial = (fp_pam_tier_enabled() if tier == "lockscreen"
+                       else fp_sudo_tier_enabled() if tier == "sudo"
                        else tier_has(tier, "fingerprint"))
             row, sw = self._switch_row(label, initial)
             sw.connect("notify::active", self._on_fp_tier_toggled, tier)
             self.fp_tier_switches[tier] = sw
             where.pack_start(row, False, False, 0)
-        self._dim(where, "The lock screen one adds pam_fprintd to KDE's login "
-                         "stack, so the greeter itself offers the reader. Your "
+        self._dim(where, "The last two add pam_fprintd to KDE's login stack and "
+                         "to sudo's, so the greeter and the terminal offer the "
+                         "reader themselves. Both are 'sufficient', so your "
                          "password always still works.")
 
     def _on_fp_tier_toggled(self, switch, _param, tier):
@@ -1939,6 +2034,8 @@ class SettingsWindow(Gtk.Window):
         return {
             "fp_tiers": {t: sw.get_active()
                          for t, sw in getattr(self, "fp_tier_switches", {}).items()},
+            "face_tiers": {t: sw.get_active()
+                           for t, sw in getattr(self, "face_tier_switches", {}).items()},
             "face": self.face_switch.get_active(),
             "pin": self.pin_switch.get_active(),
             "fingerprint": self.fp_switch.get_active(),
@@ -1962,10 +2059,25 @@ class SettingsWindow(Gtk.Window):
                 if want != self._persisted_fp_pam:
                     ops.append(["pam", "fingerprint", "on" if want else "off"])
                 continue
+            if tier == "sudo":
+                if want != self._persisted_fp_sudo:
+                    ops.append(["pam", "sudo-fingerprint", "on" if want else "off"])
+                continue
             current = self._persisted_tiers.get(tier, {})
             if want != bool(current.get("fingerprint")):
                 merged = dict(current)
                 merged["fingerprint"] = want
+                ops.append(["set-methods", tier, tier_methods_str(merged)])
+        for tier, want in ui.get("face_tiers", {}).items():
+            if tier in ("lockscreen", "sudo"):
+                pam_tier = "screenlock" if tier == "lockscreen" else "sudo"
+                if want != self._persisted_face_tiers.get(tier):
+                    ops.append(["pam", pam_tier, "on" if want else "off"])
+                continue
+            current = self._persisted_tiers.get(tier, {})
+            if want != bool(current.get("face")):
+                merged = dict(current)
+                merged["face"] = want
                 ops.append(["set-methods", tier, tier_methods_str(merged)])
         if ui["fingerprint"] != base["fingerprint"]:
             ops.append(["set-fingerprint", "on" if ui["fingerprint"] else "off"])
@@ -2040,6 +2152,9 @@ class SettingsWindow(Gtk.Window):
             self._persisted = read_config()
             self._persisted_tiers = read_tiers()
             self._persisted_fp_pam = fp_pam_tier_enabled()
+            self._persisted_fp_sudo = fp_sudo_tier_enabled()
+            self._persisted_face_tiers = {"lockscreen": pam_tier_enabled("screenlock"),
+                                          "sudo": pam_tier_enabled("sudo")}
             self._reset_controls()  # resync to what actually saved
             self._update_apply_state()
             self._toast("Changes applied.")
@@ -2075,6 +2190,7 @@ class SettingsWindow(Gtk.Window):
             self._reject_toggle(switch, "Add a face first (“Add a new face…”) "
                                         "before turning on face unlock.")
             return
+        self._refresh_face_master_hint()
         self._update_apply_state()
 
     def _on_fp_toggled(self, _switch, _param):
