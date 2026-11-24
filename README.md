@@ -95,6 +95,72 @@ First run walks you through models + face enrollment (or "Skip face" for PIN
 only). The Private folder, hidden files, and presence features all work without
 turning on the system-wide app gate.
 
+## Fingerprint
+
+AppLocker does not talk to the sensor itself. It asks **PAM**, which asks
+**fprintd**, which uses **libfprint** — so prints live in `/var/lib/fprint`,
+never in AppLocker, and enrolment is the system's.
+
+In the app: **Settings → Fingerprint** shows the reader's state, the passes you
+have enrolled, and **Add a pass… / Test (5 presses) / Remove all**. One pass
+covers one angle of one patch of skin, so adding two or three passes of the
+*same* finger (flat, rolled left, rolled right) is what makes a press-type
+reader feel reliable. The same thing from a terminal:
+
+```bash
+applocker-fp-enroll            # add passes
+applocker-fp-enroll --check    # 5 presses, reports how many matched
+```
+
+**Unlock these with your finger** has a switch per place — Locked apps, Private
+files, Lock screen, Terminal sudo. The first two set AppLocker's own policy;
+the last two add `auth sufficient pam_fprintd.so` to KDE's and sudo's PAM
+stacks (`applocker-pam enable fingerprint` / `enable sudo-fingerprint`). Being
+`sufficient`, your password always still works, so neither can lock you out.
+
+### If your reader needs an out-of-distro driver
+
+Many cheap USB readers are supported by libfprint **upstream** before the
+distro ships that version. This machine is one: a *Chipsailing CS9711*
+(`2541:0236`), handled by libfprint's `cs9711` driver, which Ubuntu's
+`libfprint-2-2` 1.95.1 does not contain. The fix is to build libfprint from
+source; it installs into `/usr/local`, which the dynamic linker searches before
+`/usr/lib`, so `fprintd` picks it up with nothing else to configure:
+
+```bash
+sudo apt install build-essential meson ninja-build pkg-config libglib2.0-dev \
+     libgusb-dev libnss3-dev libgudev-1.0-dev libcairo2-dev libsystemd-dev
+git clone https://gitlab.freedesktop.org/libfprint/libfprint.git
+cd libfprint && meson setup build --prefix=/usr/local -Ddrivers=all
+sudo ninja -C build install && sudo ldconfig
+sudo systemctl restart fprintd
+```
+
+Check which library is actually in use, and that your device is claimed:
+
+```bash
+ldd $(command -v fprintd 2>/dev/null || echo /usr/libexec/fprintd) | grep fprint
+fprintd-list "$USER"
+```
+
+Worth knowing before you rely on it:
+
+- The `/usr/local` build **shadows** the packaged one. `apt upgrade` will not
+  touch it, and it will not pick up distro security fixes — rebuild it
+  yourself. Deleting `/usr/local/lib/*/libfprint-2.so*` and running `ldconfig`
+  hands control back to the distro library.
+- Readers that match **on the chip** make libfprint log *"Driver reported a
+  match providing a scanned print that is not matching any in the gallery"*
+  during **ordinary, correct** authentications: the sensor decides, and
+  libfprint cannot map that answer onto its own record. It is noisy, not
+  sinister. AppLocker used to reject those and so refused real fingerprints;
+  it now accepts what PAM reports. Set `APPLOCKER_FP_VETO=1` to refuse them
+  again on hardware where that line really does mean trouble.
+- A loose USB connection is the usual cause of "it behaves like a different
+  finger": during a dropout `fprintd-list` reports **no enrolled prints at
+  all**. Check with `journalctl -k | grep "usb .*disconnect"` before blaming
+  the software.
+
 ## How it's put together
 
 | Piece | Language | Job |
