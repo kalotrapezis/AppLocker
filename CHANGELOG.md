@@ -3,6 +3,18 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.28 — the files tier is wired, and the watcher survives a stopped service
+
+- **Hide-and-reveal follows the `files` tier.** The silent camera check now
+  asks the policy first: face must be allowed there at all; liveness stays on
+  unless the tier pairs face with the reader; and with `both` a recent
+  fingerprint is required as the second factor, since a silent reveal cannot
+  ask anyone to touch a sensor. Any failure still leaves items hidden.
+- **The watcher stays resident while the feature is configured**, and only
+  stands down from the camera while the service is stopped. 0.0.25 conflated
+  the two, so stopping the gate made the watcher exit outright — and it would
+  not have come back until the next login, even after restarting the service.
+
 ## 0.0.27 — Settings can't freeze on Apply any more
 
 "The app crashed when I saved the fingerprint settings." It did not crash of its

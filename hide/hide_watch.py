@@ -160,17 +160,68 @@ def session_locked() -> bool:
         return False
 
 
+# A fingerprint accepted by the daemon stamps this (tmpfs). It is how a silent
+# reveal can honour "fingerprint + face" without being able to ask for a finger.
+FP_STAMP = "/run/applocker/last-fingerprint"
+FP_TRUST_WINDOW = 20 * 60
+
+
+def read_files_tier() -> dict:
+    """The `files_methods` line from the daemon's config, with the same
+    inheritance as policy.rs: no key → follow the global `face` switch."""
+    tier = {"face": False, "fingerprint": False, "require_both": False}
+    path = os.environ.get("APPLOCKER_CONFIG", "/etc/applocker/config")
+    explicit = False
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = (p.strip().lower() for p in line.split("=", 1))
+                if k == "face" and not explicit:
+                    tier["face"] = v in ("on", "true", "1", "yes", "enabled")
+                elif k == "files_methods":
+                    explicit = True
+                    toks = [t.strip() for t in v.replace("+", ",").split(",")]
+                    tier["face"] = "face" in toks
+                    tier["fingerprint"] = any(t in toks for t in ("fingerprint", "finger", "fp"))
+                    tier["require_both"] = any(t in toks for t in ("both", "require-both"))
+    except OSError:
+        pass
+    return tier
+
+
+def recent_fingerprint(window: float = FP_TRUST_WINDOW) -> bool:
+    try:
+        return (time.time() - os.path.getmtime(FP_STAMP)) < window
+    except OSError:
+        return False
+
+
 def owner_present(camera: int, timeout: float) -> bool:
-    """Silent camera check: True only if an enrolled face matches. No dialog,
-    no liveness challenge (frictionless, like the app-gate). Any failure — no
-    camera, no face, not you — is False, so items stay hidden."""
+    """Silent camera check: True only if an enrolled face matches. No dialog.
+
+    Follows the **files** tier: face must be allowed there at all; liveness is
+    on unless the tier pairs face with the reader; and with "both" a recent
+    fingerprint is required as the second factor, since a silent reveal cannot
+    ask anyone to touch the sensor. Any failure — no camera, no face, not you —
+    is False, so items stay hidden.
+    """
+    tier = read_files_tier()
+    if not tier["face"]:
+        return False
+    if tier["require_both"] and tier["fingerprint"] and not recent_fingerprint():
+        return False
+    cmd = [sys.executable, RECOGNIZE, "--camera", str(camera),
+           "--timeout", str(timeout)]
+    # Two factors stand in for the head turn; one factor keeps it.
+    if not (tier["require_both"] and tier["fingerprint"]):
+        cmd.append("--no-liveness")
     try:
         env = {**os.environ, "APPLOCKER_CAMERA_PRIORITY": "file"}  # below app/lock
-        r = subprocess.run(
-            [sys.executable, RECOGNIZE, "--no-liveness",
-             "--camera", str(camera), "--timeout", str(timeout)],
-            capture_output=True, text=True, timeout=timeout + 12, env=env,
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout + 12, env=env)
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["match"]

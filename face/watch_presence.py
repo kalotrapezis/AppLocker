@@ -311,15 +311,16 @@ def read_lockscreen_policy() -> dict:
     return pol
 
 
-def lockscreen_face_enabled() -> bool:
-    """On when the marker file exists, or when the user's existing lock-screen
-    face toggle has put pam_applocker into KDE's PAM stack. Two ways in, one
-    intent — no second switch to forget about."""
-    if not applocker_enforcing():
-        return False   # service stopped → AppLocker does nothing, including this
+def lockscreen_configured() -> bool:
+    """Is lock-screen face unlock *configured* (marker or PAM tier + policy)?
+
+    Deliberately ignores whether the service is running: that flips while we
+    live, and exiting on it would mean the watcher never comes back when the
+    user restarts enforcement from Settings.
+    """
     pol = read_lockscreen_policy()
     if not pol["face"]:
-        return False   # this tier doesn't accept face at all
+        return False
     if os.path.exists(UNLOCK_MARKER):
         return True
     try:
@@ -327,6 +328,16 @@ def lockscreen_face_enabled() -> bool:
             return "pam_applocker.so" in f.read()
     except OSError:
         return False
+
+
+def lockscreen_face_enabled() -> bool:
+    """On when the marker file exists, or when the user's existing lock-screen
+    face toggle has put pam_applocker into KDE's PAM stack. Two ways in, one
+    intent — no second switch to forget about."""
+    # Configured AND currently enforcing. Stopping the service in Settings is
+    # read as "AppLocker off", so the camera stands down with it — but we stay
+    # resident (see lockscreen_configured) so restarting it just works.
+    return lockscreen_configured() and applocker_enforcing()
 
 
 def owner_at_screen(cam_index, timeout: float, liveness: bool = True) -> bool:
@@ -796,7 +807,7 @@ def main() -> int:
     # Presence off is no longer a reason to quit: with the lock-screen face
     # unlock on, this process still has a job (no-button unlock while locked).
     if not args.force and not conf["enabled"] and (
-            args.no_unlock_face or not lockscreen_face_enabled()):
+            args.no_unlock_face or not lockscreen_configured()):
         print("attention is off in the config and the lock-screen face unlock "
               "is off (enable either in AppLocker settings, or run with "
               "--force)", file=sys.stderr)
@@ -844,8 +855,11 @@ def main() -> int:
             attention_on = args.force or conf["enabled"]
             # With presence off we still stay alive if the lock-screen face
             # toggle is on: the no-button unlock is this process's other job.
-            unlock_on = (not args.no_unlock_face) and lockscreen_face_enabled()
-            if not attention_on and not unlock_on:
+            # Stay resident while it is configured; `unlock_on` also requires
+            # the service to be running, and that can flip at any moment.
+            configured = (not args.no_unlock_face) and lockscreen_configured()
+            unlock_on = configured and applocker_enforcing()
+            if not attention_on and not configured:
                 print("attention off and no lock-screen face unlock — "
                       "watcher exiting", file=sys.stderr)
                 GLib.idle_add(Gtk.main_quit)
