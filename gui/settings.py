@@ -114,6 +114,45 @@ def cfg_path(env: str, default: str) -> str:
     return os.environ.get(env, default)
 
 
+# Fingerprint slots we spend on ONE finger, in the order we fill them. fprintd
+# keeps one template per slot and matches against all of them, so three passes
+# of the same finger held differently is what makes a press sensor reliable.
+FP_SLOTS = [
+    ("right-index-finger", "Pass 1 — flat, centred"),
+    ("right-middle-finger", "Pass 2 — rolled slightly left"),
+    ("right-ring-finger", "Pass 3 — rolled slightly right"),
+    ("left-index-finger", "Pass 4 — tip, higher up"),
+    ("left-middle-finger", "Pass 5 — lower, more of the pad"),
+]
+FP_SLOT_LABEL = dict(FP_SLOTS)
+
+
+def _fprintd(args, timeout=8):
+    """Run an fprintd CLI tool in C locale; ('', False) if it can't."""
+    try:
+        r = subprocess.run(["env", "LC_ALL=C"] + args, capture_output=True,
+                           text=True, timeout=timeout)
+        return r.stdout, r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return "", False
+
+
+def fp_reader_present() -> bool:
+    out, ok = _fprintd(["fprintd-list", os.environ.get("USER", "")], timeout=5)
+    return ok or "Fingerprints for" in out
+
+
+def fp_enrolled_slots() -> list:
+    """Slot names already enrolled, e.g. ['right-index-finger']."""
+    out, _ = _fprintd(["fprintd-list", os.environ.get("USER", "")], timeout=5)
+    found = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("- #") and ":" in line:
+            found.append(line.split(":", 1)[1].strip())
+    return found
+
+
 def read_config() -> dict:
     """Parse /etc/applocker/config into {face, allow_pin, allow_sudo, reauth}."""
     out = {"face": False, "fingerprint": True, "pin": True, "sudo": True,
@@ -707,6 +746,7 @@ class SettingsWindow(Gtk.Window):
             gear.set_valign(Gtk.Align.CENTER)
             gear.connect("clicked", gear_cb)
             row.pack_start(gear, False, False, 0)
+            self._last_gear = gear
         if switch is not None:
             switch.set_valign(Gtk.Align.CENTER)
             row.pack_start(switch, False, False, 0)
@@ -764,13 +804,19 @@ class SettingsWindow(Gtk.Window):
         self.fp_switch = Gtk.Switch(active=cfg["fingerprint"])
         self.fp_switch.set_valign(Gtk.Align.CENTER)
         self.fp_switch.connect("notify::active", self._on_fp_toggled)
-        self._heading_row(fp, "Fingerprint unlock", switch=self.fp_switch)
+        self._last_gear = None
+        self._heading_row(fp, "Fingerprint unlock", gear_cb=self._open_fp_dialog,
+                          switch=self.fp_switch)
+        self.fp_gear = self._last_gear
         self._dim(fp, "Touch the reader when an app asks. Tried before face, "
                       "and skipped automatically when no reader or no enrolled "
                       "finger is found — so face and your PIN still work.")
-        self._dim(fp, "Reads badly? One template covers one angle. Run "
-                      "applocker-fp-enroll in a terminal to add passes of the "
-                      "same finger, or --check to measure how often it matches.")
+        self.fp_summary = self._dim(fp, "Looking for a reader…")
+        # fprintd can take seconds to answer on a flaky reader, so never ask it
+        # on the UI thread — start the card disabled and switch it on if a
+        # reader turns up.
+        self.fp_switch.set_sensitive(False)
+        self._probe_fp_reader()
         self._dim(fp, "With face unlock also on, the two are cross-checked: a "
                       "locked app opens only if both match, with no PIN or "
                       "password way round it. Turn one off to use a single "
@@ -780,8 +826,15 @@ class SettingsWindow(Gtk.Window):
         face = self._card(page)
         self.face_switch = Gtk.Switch(active=cfg["face"])
         self.face_switch.connect("notify::active", self._on_face_toggled)
+        self._last_gear = None
         self._heading_row(face, "Face unlock", gear_cb=self._open_face_dialog,
                           switch=self.face_switch)
+        self.face_gear = self._last_gear
+        if not has_camera():
+            # Nothing to enrol with and nothing to match against: don't offer a
+            # switch that could only ever fail.
+            self.face_switch.set_sensitive(False)
+            self._dim(face, "No camera detected — face unlock is unavailable.")
         self._dim(face, "Unlock the lock screen and terminal sudo prompts with "
                         "your face.")
         self.faces_summary = self._dim(face, "")
@@ -894,6 +947,198 @@ class SettingsWindow(Gtk.Window):
         dlg.destroy()
         self._face_dialog = None
         self._refresh_faces_summary()
+
+    # -- Fingerprint gear dialog (passes, test, remove) --------------------
+
+    def _open_fp_dialog(self, _btn):
+        dlg = Gtk.Dialog(title="Fingerprint unlock", transient_for=self, modal=True)
+        dlg.set_default_size(470, 460)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_border_width(14)
+
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup("<b>Enrolled passes</b>")
+        area.add(lbl)
+        self.fp_list = Gtk.ListBox()
+        self.fp_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        area.add(self.fp_list)
+
+        area.add(self._dim_label(
+            "A press reader only sees a small patch of skin, so one pass covers "
+            "one angle. Add two or three passes of the SAME finger, held a "
+            "little differently each time — any of them will unlock."))
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btns.set_halign(Gtk.Align.START)
+        self.fp_add_btn = Gtk.Button(label="Add a pass…")
+        self.fp_add_btn.connect("clicked", self._on_fp_add)
+        btns.pack_start(self.fp_add_btn, False, False, 0)
+        self.fp_test_btn = Gtk.Button(label="Test (5 presses)")
+        self.fp_test_btn.connect("clicked", self._on_fp_test)
+        btns.pack_start(self.fp_test_btn, False, False, 0)
+        self.fp_del_btn = Gtk.Button(label="Remove all")
+        self.fp_del_btn.connect("clicked", self._on_fp_delete)
+        btns.pack_start(self.fp_del_btn, False, False, 0)
+        area.add(btns)
+
+        self.fp_status = Gtk.Label(xalign=0, label="")
+        self.fp_status.set_line_wrap(True)
+        area.add(self.fp_status)
+
+        self._fp_dialog = dlg
+        self._refresh_fp_list()
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+        self._fp_dialog = None
+        self._probe_fp_reader()   # refresh the card's summary
+
+    def _refresh_fp_list(self):
+        for child in self.fp_list.get_children():
+            self.fp_list.remove(child)
+        slots = fp_enrolled_slots()
+        self._fp_slots = slots
+        if not slots:
+            row = Gtk.ListBoxRow()
+            row.add(self._dim_label("  Nothing enrolled yet."))
+            self.fp_list.add(row)
+        for slot in slots:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            box.set_border_width(6)
+            box.pack_start(Gtk.Label(label=FP_SLOT_LABEL.get(slot, slot), xalign=0),
+                           True, True, 0)
+            box.pack_start(self._dim_label("enrolled", wrap=False), False, False, 0)
+            row.add(box)
+            self.fp_list.add(row)
+        # Out of slots? Then "add" has nowhere to go.
+        free = [s for s, _ in FP_SLOTS if s not in slots]
+        self.fp_add_btn.set_sensitive(bool(free))
+        self.fp_list.show_all()
+
+    def _fp_busy(self, busy, status=""):
+        for b in (self.fp_add_btn, self.fp_test_btn, self.fp_del_btn):
+            b.set_sensitive(not busy)
+        if not busy:
+            self._refresh_fp_list()
+        if status:
+            self.fp_status.set_text(status)
+
+    def _on_fp_add(self, _btn):
+        known = getattr(self, "_fp_slots", [])
+        free = [(s, lab) for s, lab in FP_SLOTS if s not in known]
+        if not free:
+            self.fp_status.set_text("All five passes are used — remove them to redo.")
+            return
+        slot, label = free[0]
+        self._fp_busy(True, f"{label}: press the reader, and keep pressing when "
+                            "it asks — the reader decides how many times.")
+        try:
+            proc = subprocess.Popen(
+                ["env", "LC_ALL=C", "fprintd-enroll", "-f", slot],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except OSError as e:
+            self._fp_busy(False, f"Could not start enrolment: {e}")
+            return
+
+        stages = [0]
+
+        def on_line(src, _cond):
+            line = src.readline()
+            if not line:                      # EOF: enrolment finished
+                proc.wait()
+                ok = proc.returncode == 0
+                self._fp_busy(False, f"{label}: added." if ok else
+                              f"{label}: did not complete — try again, and if it "
+                              "keeps failing check the reader's USB connection.")
+                return False
+            line = line.strip()
+            if "enroll-stage-passed" in line:
+                stages[0] += 1
+                self.fp_status.set_text(f"{label}: {stages[0]} press(es) accepted — "
+                                        "keep going.")
+            elif "enroll-completed" in line:
+                self.fp_status.set_text(f"{label}: done.")
+            elif "enroll-duplicate" in line:
+                self.fp_status.set_text(f"{label}: that finger is already enrolled "
+                                        "in another pass — use a slightly "
+                                        "different angle.")
+            elif "retry" in line or "remove" in line.lower():
+                self.fp_status.set_text(f"{label}: didn't read — lift and press again.")
+            return True
+
+        GLib.io_add_watch(proc.stdout, GLib.IO_IN | GLib.IO_HUP, on_line)
+
+    def _on_fp_test(self, _btn):
+        self._fp_busy(True, "Press the same finger five times…")
+        user = os.environ.get("USER", "")
+
+        def work():
+            hits = 0
+            for i in range(1, 6):
+                GLib.idle_add(self.fp_status.set_text, f"Press {i} of 5…")
+                out, _ = _fprintd(["fprintd-verify", user], timeout=20)
+                if "verify-match" in out:
+                    hits += 1
+            verdict = ("That is healthy." if hits >= 4 else
+                       "That is poor — add another pass, and check the USB "
+                       "connection; a reader that keeps disconnecting reads "
+                       "like a different finger.")
+            GLib.idle_add(self._fp_busy, False, f"Matched {hits} of 5. {verdict}")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_fp_delete(self, _btn):
+        ask = Gtk.MessageDialog(
+            transient_for=self._fp_dialog, modal=True,
+            message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Remove every enrolled pass?")
+        ask.format_secondary_text(
+            "You will need to enrol again before fingerprint unlock works. Face "
+            "and your PIN or password are unaffected.")
+        resp = ask.run()
+        ask.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+        self._fp_busy(True, "Removing…")
+
+        def work():
+            _fprintd(["fprintd-delete", os.environ.get("USER", "")], timeout=15)
+            GLib.idle_add(self._fp_busy, False, "Removed.")
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- fingerprint availability + summary --------------------------------
+
+    def _probe_fp_reader(self):
+        def work():
+            present = fp_reader_present()
+            slots = fp_enrolled_slots() if present else []
+            GLib.idle_add(self._apply_fp_state, present, slots)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_fp_state(self, present, slots):
+        self._fp_present = present
+        self._fp_slots = slots
+        if getattr(self, "fp_switch", None) is not None:
+            self.fp_switch.set_sensitive(present)
+        if getattr(self, "fp_gear", None) is not None:
+            self.fp_gear.set_sensitive(present)
+        if getattr(self, "fp_summary", None) is None:
+            return False
+        if not present:
+            self.fp_summary.set_text(
+                "No fingerprint reader detected — unavailable. If it is plugged "
+                "in, reseat it and reopen Settings.")
+        elif slots:
+            self.fp_summary.set_text(
+                f"{len(slots)} pass{'es' if len(slots) != 1 else ''} enrolled — "
+                "add more with the ⚙ button above if it misreads.")
+        else:
+            self.fp_summary.set_text(
+                "Reader found, nothing enrolled yet — add a pass with the ⚙ "
+                "button above.")
+        return False  # one-shot idle
 
     def _refresh_faces_summary(self):
         try:

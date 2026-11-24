@@ -3,6 +3,27 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.24 — fingerprint enrolment inside Settings, and cards that grey out
+
+### Added
+- **A ⚙ dialog on the Fingerprint card**, mirroring the face one: the passes
+  you have enrolled, **Add a pass…** with live progress ("3 presses accepted —
+  keep going"), **Test (5 presses)** which reports how many matched, and
+  **Remove all** behind a confirmation. Each pass goes into its own fprintd
+  slot, labelled by how to hold the finger — flat, rolled left, rolled right —
+  because a press sensor only sees one patch of skin per template.
+- The card summarises itself: "2 passes enrolled — add more with ⚙ if it
+  misreads."
+
+### Changed
+- **Hardware that isn't there is greyed out.** No fingerprint reader → the
+  switch and ⚙ are disabled with "No fingerprint reader detected". No camera →
+  Face unlock is disabled with "No camera detected". Previously both offered
+  switches that could only ever fail.
+- The reader probe runs **off the UI thread** (fprintd can take seconds to
+  answer on a flaky device), so Settings opens instantly and the card enables
+  itself a moment later rather than freezing.
+
 ## 0.0.23 — `applocker-fp-enroll`: more passes of the same finger
 
 "I don't know why, now it's like it's a different finger." Because there is
