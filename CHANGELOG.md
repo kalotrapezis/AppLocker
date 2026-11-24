@@ -3,6 +3,27 @@
 Newest first. `0.0.1-<letter>` entries were testing rounds leading up to the first
 real release, **0.0.1**.
 
+## 0.0.19 — a broken reader steps aside instead of locking you out
+
+Reported straight after 0.0.16 went in: "cross check does not work for apps, it
+says no match". It wasn't timing — it was my logic. In cross-check mode face
+only ran **if the finger passed**, and this reader either fabricates matches
+(vetoed) or fails outright, so face never ran at all and every locked app
+refused.
+
+A factor that has *dropped out* is not a factor that said *no*. The fingerprint
+check now reports three outcomes instead of two:
+
+| reader says | meaning | result |
+|---|---|---|
+| accepted | working, it's you | face must agree too |
+| rejected | working, wrong finger | both required → refused |
+| **unusable** | PAM error, disconnect, or a match libfprint disowns | **not counted**: face alone decides, and the PIN prompt still appears if face fails too |
+
+So "if only one is enabled then we keep the one" now also covers a factor that
+has effectively dropped out — however it dropped out. The strict refusal is
+kept for a reader that is genuinely working and genuinely says no.
+
 ## 0.0.18 — renaming an AppImage no longer unlocks it
 
 `cp viber.appimage game.appimage` used to run unlocked: AppImages were matched

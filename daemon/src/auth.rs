@@ -156,15 +156,32 @@ pub fn run(
     // finger, or a lifted print without the face, gets nothing; both land on
     // the PIN/password prompt instead.
     if cfg.cross_reference {
-        let finger = match fallback.verify_fingerprint() {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("applockerd: fingerprint unusable: {e}");
-                false
+        match fallback.verify_fingerprint() {
+            // Reader works and accepted: face must agree too.
+            Ok(true) => {
+                if face_matches(cfg, face) {
+                    return Outcome::Allowed;
+                }
             }
-        };
-        if finger && face_matches(cfg, face) {
-            return Outcome::Allowed;
+            // Reader works and said no. Both are required, so that settles it.
+            Ok(false) => {}
+            // Reader is BROKEN, not rejecting: errors, disconnects, matches
+            // libfprint disowns. Treating that as "no" would lock the owner out
+            // of their own apps whenever the hardware plays up — "if only one
+            // is enabled we keep the one" applies to a factor that has dropped
+            // out, however it dropped out. Face alone decides this round.
+            Err(e) => {
+                eprintln!(
+                    "applockerd: fingerprint unusable ({e}) — not counting it \
+                     this time; face alone decides."
+                );
+                if face_matches(cfg, face) {
+                    return Outcome::Allowed;
+                }
+                // Face failed too: fall through to the prompt like any
+                // single-factor denial, rather than the strict refusal.
+                return prompt_loop(cfg, prompter, fallback);
+            }
         }
         // One of the two said no. Don't let the other stand in for it.
         if cfg.cross_denies {
@@ -195,6 +212,16 @@ pub fn run(
         }
     }
 
+    prompt_loop(cfg, prompter, fallback)
+}
+
+/// Tier 2: the PIN / password prompt, shared by the normal path and by the
+/// cross-check's "the reader dropped out" escape.
+fn prompt_loop(
+    cfg: &Config,
+    prompter: &mut dyn Prompter,
+    fallback: &dyn Fallback,
+) -> Outcome {
     // Tier 2: fallback. The always-one-fallback invariant: if neither is
     // configured we must not silently deny — that would be a lock-out. Treat it
     // as a misconfiguration and deny loudly (the installer guarantees a PIN, so
@@ -458,12 +485,10 @@ impl Fallback for SystemFallback {
         // the gallery" at the same seconds. libfprint knows the match was
         // rubbish; PAM just doesn't pass that on. So we ask the log.
         if ok && fprintd_disowned_recent_match() {
-            eprintln!(
-                "applockerd: REJECTING a fingerprint success — fprintd reports the \
-                 driver's match was not in the gallery (flaky reader). Falling \
-                 back to face / PIN."
-            );
-            return Ok(false);
+            // Err, not Ok(false): the reader is not *rejecting* anyone, it is
+            // malfunctioning. The difference matters when both factors are
+            // required — a broken reader must step aside, not lock you out.
+            return Err("fprintd disowned the driver's match (flaky reader)".to_string());
         }
         if ok {
             stamp_fingerprint();
@@ -514,8 +539,21 @@ mod tests {
     }
 
     /// Fallback with a reader attached; `touched` decides what it reports.
+    /// `broken` makes it report the hardware as unusable instead.
     struct FpFallback {
         touched: bool,
+    }
+
+    struct BrokenReader;
+    impl Fallback for BrokenReader {
+        fn pin_available(&self) -> bool { true }
+        fn sudo_available(&self) -> bool { false }
+        fn verify_pin(&self, s: &str) -> bool { s == "1234" }
+        fn verify_password(&self, _s: &str) -> Result<bool, String> { Ok(false) }
+        fn fingerprint_available(&self) -> bool { true }
+        fn verify_fingerprint(&self) -> Result<bool, String> {
+            Err("flaky reader".to_string())
+        }
     }
     impl Fallback for FpFallback {
         fn pin_available(&self) -> bool {
@@ -625,6 +663,33 @@ mod tests {
             run(&cross_cfg(), &mut face, &mut prompt, &FpFallback { touched: false }),
             Outcome::Allowed
         );
+    }
+
+    /// A reader that is broken (not rejecting) must step aside rather than
+    /// lock the owner out: face alone decides, and the PIN still works.
+    #[test]
+    fn broken_reader_does_not_block_the_owner() {
+        // Face matches → in, despite "both required".
+        let mut face = ScriptedFace { results: vec![true], idx: 0 };
+        let mut prompt = ScriptedPrompt { answers: vec![], idx: 0, seen_available: vec![] };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &BrokenReader),
+            Outcome::Allowed
+        );
+        assert!(prompt.seen_available.is_empty(), "no prompt needed");
+
+        // Face fails too → the ordinary prompt, not the strict refusal.
+        let mut face = ScriptedFace { results: vec![false; 3], idx: 0 };
+        let mut prompt = ScriptedPrompt {
+            answers: vec![entered(Method::Pin, "1234")],
+            idx: 0,
+            seen_available: vec![],
+        };
+        assert_eq!(
+            run(&cross_strict_cfg(), &mut face, &mut prompt, &BrokenReader),
+            Outcome::Allowed
+        );
+        assert_eq!(prompt.seen_available.len(), 1, "prompted, not refused");
     }
 
     /// For a locked app: both on, either fails → stays shut, and the user is
